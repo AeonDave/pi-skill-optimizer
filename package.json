@@ -1,0 +1,41 @@
+{
+  "name": "pi-skill-optimizer",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "A Pi extension that slims the system prompt before each request (strips the <available_skills> catalog and other configured blocks) to cut input-token cost.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "optimization",
+    "tokens",
+    "skills",
+    "system-prompt"
+  ],
+  "license": "MIT",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/skills.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts",
+    "measure": "node --import tsx scripts/measure.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  }
+}
