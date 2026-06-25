@@ -69,11 +69,27 @@ is lost.
 
 ## Install
 
+Install from GitHub (recommended):
+
 ```bash
-pi install pi-skill-optimizer
+pi install git:github.com/AeonDave/pi-skill-optimizer
 ```
 
-Pi provides the `@earendil-works/*` peer deps. Try one run: `pi -e pi-skill-optimizer`.
+To modify or test it, install from a local clone instead:
+
+```bash
+git clone https://github.com/AeonDave/pi-skill-optimizer
+cd pi-skill-optimizer
+npm install        # dev deps, for tests/bench
+pi install .       # or an absolute path to the clone
+```
+
+Pi supplies the `@earendil-works/*` peer deps at runtime. To try it for a single
+run without installing, use `-e`:
+
+```bash
+pi -e git:github.com/AeonDave/pi-skill-optimizer
+```
 
 ## Usage
 
