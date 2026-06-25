@@ -19,8 +19,9 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/skills.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts",
-    "measure": "node --import tsx scripts/measure.ts"
+    "test": "node --import tsx --test test/skills.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/config.test.ts test/fuzz.test.ts",
+    "measure": "node --import tsx scripts/measure.ts",
+    "bench": "node --import tsx scripts/bench.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

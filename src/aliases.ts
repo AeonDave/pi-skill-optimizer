@@ -20,6 +20,8 @@ export const CANDIDATE_QUERY_ALIASES: Readonly<Record<string, readonly string[]>
 	k8s: ["kubernetes", "container"],
 	ntlm: ["hash", "password", "smb", "windows"],
 	pcap: ["packet", "capture", "network"],
+	plugin: ["extension", "package"],
+	plugins: ["extension", "package"],
 	pr: ["pull", "request", "github"],
 	rsa: ["crypto", "cryptography", "key"],
 	smb: ["windows", "active", "directory"],
@@ -28,6 +30,16 @@ export const CANDIDATE_QUERY_ALIASES: Readonly<Record<string, readonly string[]>
 	typecheck: ["typescript", "tsc"],
 	web3: ["blockchain", "ethereum", "evm"],
 };
+
+const OVERBROAD_ALIAS_TARGETS = new Set([
+	"assessment",
+	"reference",
+	"security",
+	"technique",
+	"tool",
+	"tools",
+	"workflow",
+]);
 
 let userAliasCandidates: AliasRecord = {};
 
@@ -58,10 +70,6 @@ export function setUserAliasCandidates(value: unknown): AliasRecord {
 	return userAliasCandidates;
 }
 
-export function getUserAliasCandidates(): AliasRecord {
-	return userAliasCandidates;
-}
-
 export function buildCatalogAliases(hasTerm: (term: string) => boolean, extraCandidates: AliasRecord = {}): QueryAliasMap {
 	const aliases = new Map<string, readonly string[]>();
 	const merged = new Map<string, string[]>();
@@ -73,7 +81,7 @@ export function buildCatalogAliases(hasTerm: (term: string) => boolean, extraCan
 		merged.set(source, Array.from(new Set([...(merged.get(source) ?? []), ...targets])));
 	}
 	for (const [source, targets] of merged) {
-		const presentTargets = targets.filter(hasTerm);
+		const presentTargets = targets.filter((target) => hasTerm(target) && !OVERBROAD_ALIAS_TARGETS.has(target));
 		if (presentTargets.length > 0) aliases.set(source, presentTargets);
 	}
 	return aliases;

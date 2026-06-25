@@ -43,3 +43,170 @@ export function normalizeProfile(value: unknown): SkillOptimizerProfile {
 		negativeHints: normalizeStringArrayRecord(source.negativeHints),
 	};
 }
+
+function mergeAliasRecords(base: AliasRecord, override: AliasRecord): AliasRecord {
+	const out: AliasRecord = {};
+	for (const [key, targets] of Object.entries(base)) out[key] = [...targets];
+	for (const [key, targets] of Object.entries(override)) {
+		out[key] = Array.from(new Set([...(out[key] ?? []), ...targets]));
+	}
+	return out;
+}
+
+function mergeStringArrayRecords(base: Record<string, string[]>, override: Record<string, string[]>): Record<string, string[]> {
+	const out: Record<string, string[]> = {};
+	for (const [key, items] of Object.entries(base)) out[key] = [...items];
+	for (const [key, items] of Object.entries(override)) {
+		out[key] = Array.from(new Set([...(out[key] ?? []), ...items]));
+	}
+	return out;
+}
+
+/** Stable, dependency-free FNV-1a hash of a skill's identity (name + description). */
+export function hashSkill(name: string, description: string): string {
+	const input = `${name}\n${description}`;
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < input.length; i++) {
+		hash ^= input.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193);
+	}
+	return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+export interface SkillRef {
+	name: string;
+	description: string;
+}
+
+export interface SkillDiff {
+	/** New or modified skill names (need (re)processing). */
+	changed: string[];
+	/** Skill names present in the stored hashes but gone from the catalog. */
+	removed: string[];
+	/** Fresh hash map for the current catalog. */
+	hashes: Record<string, string>;
+}
+
+/** Compare the current catalog against stored per-skill hashes. */
+export function diffSkills(current: readonly SkillRef[], stored: Record<string, string>): SkillDiff {
+	const hashes: Record<string, string> = {};
+	const changed: string[] = [];
+	const present = new Set<string>();
+	for (const skill of current) {
+		present.add(skill.name);
+		const hash = hashSkill(skill.name, skill.description);
+		hashes[skill.name] = hash;
+		if (stored[skill.name] !== hash) changed.push(skill.name);
+	}
+	const removed = Object.keys(stored).filter((name) => !present.has(name));
+	return { changed, removed, hashes };
+}
+
+function omitKeys(record: Record<string, string[]>, drop: ReadonlySet<string>): Record<string, string[]> {
+	const out: Record<string, string[]> = {};
+	for (const [key, value] of Object.entries(record)) {
+		if (!drop.has(key)) out[key] = value;
+	}
+	return out;
+}
+
+/** Drop every reference to `removed` skills from name-keyed sections and cluster members. */
+export function pruneProfileNames(profile: SkillOptimizerProfile, removed: Iterable<string>): SkillOptimizerProfile {
+	const drop = new Set(removed);
+	if (drop.size === 0) return profile;
+	const clusters: Record<string, string[]> = {};
+	for (const [topic, members] of Object.entries(profile.clusters)) {
+		const kept = members.filter((m) => !drop.has(m));
+		if (kept.length > 0) clusters[topic] = kept;
+	}
+	return {
+		aliases: profile.aliases, // query-token routing, runtime-filtered against the live catalog
+		critical: profile.critical.filter((n) => !drop.has(n)),
+		queries: omitKeys(profile.queries, drop),
+		clusters,
+		negativeHints: omitKeys(profile.negativeHints, drop),
+	};
+}
+
+/**
+ * Merge a freshly generated `partial` profile (covering only `changed` skills)
+ * into `base`. For changed skills the partial wins; unchanged skills keep their
+ * base entries. Aliases/clusters accumulate (catalog-filtered at use).
+ */
+export function mergeIncrementalProfile(
+	base: SkillOptimizerProfile,
+	partial: SkillOptimizerProfile,
+	changed: Iterable<string>,
+): SkillOptimizerProfile {
+	const ch = new Set(changed);
+	return {
+		aliases: mergeAliasRecords(base.aliases, partial.aliases),
+		critical: Array.from(new Set([...base.critical.filter((n) => !ch.has(n)), ...partial.critical.filter((n) => ch.has(n))])),
+		queries: { ...omitKeys(base.queries, ch), ...partial.queries },
+		clusters: mergeStringArrayRecords(base.clusters, partial.clusters),
+		negativeHints: { ...omitKeys(base.negativeHints, ch), ...partial.negativeHints },
+	};
+}
+
+/** Merge two profiles; `override` (project) wins/extends over `base` (global). */
+export function mergeProfiles(base: SkillOptimizerProfile, override: SkillOptimizerProfile): SkillOptimizerProfile {
+	return {
+		aliases: mergeAliasRecords(base.aliases, override.aliases),
+		critical: Array.from(new Set([...base.critical, ...override.critical])),
+		queries: mergeStringArrayRecords(base.queries, override.queries),
+		clusters: mergeStringArrayRecords(base.clusters, override.clusters),
+		negativeHints: mergeStringArrayRecords(base.negativeHints, override.negativeHints),
+	};
+}
+
+function filterByNames(record: Record<string, string[]>, names: ReadonlySet<string>): Record<string, string[]> {
+	const out: Record<string, string[]> = {};
+	for (const [key, items] of Object.entries(record)) {
+		if (names.has(key)) out[key] = [...items];
+	}
+	return out;
+}
+
+function filterClustersByNames(clusters: Record<string, string[]>, names: ReadonlySet<string>): Record<string, string[]> {
+	const out: Record<string, string[]> = {};
+	for (const [topic, members] of Object.entries(clusters)) {
+		const kept = members.filter((m) => names.has(m));
+		if (kept.length > 0) out[topic] = kept;
+	}
+	return out;
+}
+
+/**
+ * Split a generated profile into the entries that reference `projectNames` and the rest.
+ * Aliases are query-token routing (catalog-filtered at use), so they stay in the global slice.
+ * Name-keyed sections (critical/queries/negativeHints) and cluster members are routed by scope.
+ */
+export function splitProfileByScope(
+	profile: SkillOptimizerProfile,
+	projectNames: ReadonlySet<string>,
+): { global: SkillOptimizerProfile; project: SkillOptimizerProfile } {
+	const globalCritical = profile.critical.filter((n) => !projectNames.has(n));
+	const projectCritical = profile.critical.filter((n) => projectNames.has(n));
+	const allNames = new Set([
+		...profile.critical,
+		...Object.keys(profile.queries),
+		...Object.keys(profile.negativeHints),
+	]);
+	const globalNames = new Set([...allNames].filter((n) => !projectNames.has(n)));
+	return {
+		global: {
+			aliases: profile.aliases,
+			critical: globalCritical,
+			queries: filterByNames(profile.queries, globalNames),
+			clusters: filterClustersByNames(profile.clusters, globalNames),
+			negativeHints: filterByNames(profile.negativeHints, globalNames),
+		},
+		project: {
+			aliases: {},
+			critical: projectCritical,
+			queries: filterByNames(profile.queries, projectNames),
+			clusters: filterClustersByNames(profile.clusters, projectNames),
+			negativeHints: filterByNames(profile.negativeHints, projectNames),
+		},
+	};
+}

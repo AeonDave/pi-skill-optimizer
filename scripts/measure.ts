@@ -28,7 +28,7 @@ const tok = (chars: number) => Math.round(chars / 4);
 const pct = (from: number, to: number) => `${Math.round((100 * (from - to)) / from)}%`;
 
 const OFF: OptimizeConfig = {
-	mode: "off", topK: 16, adaptiveTopK: true, minTopK: 8, maxTopK: 24, tailChars: 0, safeFallbackTailChars: 80, keepLocations: false, extraStripTags: [], dropAnchors: [],
+	mode: "off", topK: 20, tail: "name", alwaysFull: [], never: [],
 	toolsMode: "off", toolsDropPrefixes: [], toolsTopK: 24, toolsProtect: [],
 };
 

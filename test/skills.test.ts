@@ -9,7 +9,7 @@ import {
 	tokenize,
 	transformSkillsInText,
 } from "../src/skills.ts";
-import { EMPTY_PROFILE, normalizeProfile } from "../src/profile.ts";
+import { normalizeProfile } from "../src/profile.ts";
 
 function skillXml(name: string, description: string, location = `C:/skills/${name}/SKILL.md`): string {
 	return `  <skill>\n    <name>${name}</name>\n    <description>${description}</description>\n    <location>${location}</location>\n  </skill>`;
@@ -60,6 +60,32 @@ test("scoreSkills expands query aliases filtered by catalog terms", () => {
 	assert.ok(scores[0] > scores[1]);
 });
 
+test("scoreSkills maps plugin wording to extension skills", () => {
+	const skills = [
+		{ name: "pi-extension-creator", description: "Create and troubleshoot Pi coding-agent extensions and packages.", location: "" },
+		{ name: "python-testing", description: "Python test workflow.", location: "" },
+	];
+	const scores = scoreSkills(skills, tokenize("fix this plugin hook"));
+	assert.ok(scores[0] > scores[1]);
+});
+
+test("hybrid ignores overbroad profile alias targets", () => {
+	const text = catalog(
+		skillXml("web-exploit-technique", "Web impact validation technique for SSRF and SQLi. Long details that should remain only for the selected web skill."),
+		skillXml("active-directory-technique", "Active Directory Kerberos and LDAP assessment technique. Long unrelated AD details."),
+		skillXml("python-testing", "Python pytest workflow and fixtures. Long unrelated Python testing details."),
+	);
+	const out = transformSkillsInText(text, {
+		mode: "hybrid",
+		topK: 2,
+		tail: "name",
+		query: "web",
+		profile: normalizeProfile({ aliases: { web: ["web", "technique"] } }),
+	});
+	assert.ok(out.selected.includes("web-exploit-technique"));
+	assert.ok(!out.selected.includes("active-directory-technique"));
+});
+
 test("scoreSkills gives 0 to unrelated skills", () => {
 	const skills = SAMPLE.map(([name, description]) => ({ name, description, location: "" }));
 	const scores = scoreSkills(skills, tokenize("brew a cup of tea"));
@@ -86,48 +112,44 @@ test("compactDescription keeps the first sentence and caps length", () => {
 	assert.ok(capped.length <= 13);
 });
 
-test("hybrid: relevant skills stay full, the tail is compacted, all names survive", () => {
+test("hybrid: relevant stays full with location, tail is name-only, all names survive", () => {
 	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
 	const { text: out, removed, selected } = transformSkillsInText(text, {
 		mode: "hybrid",
 		topK: 1,
-		tailChars: 40,
-		keepLocations: false,
+		tail: "name",
 		query: "crack RSA key recovery",
 	});
 	assert.ok(removed > 0);
 	assert.deepEqual(selected, ["rsactftool"]);
-	// full skill keeps its full description + location
+	// full skill keeps its full description + explicit location
 	assert.ok(out.includes("Use when targeting RSA key recovery"));
 	assert.ok(out.includes("C:/skills/rsactftool/SKILL.md"));
 	// every name still present (discoverable)
 	for (const [n] of SAMPLE) assert.ok(out.includes(`<name>${n}</name>`), `name ${n} missing`);
-	// a tail skill is compacted (no location, trimmed description)
+	// tail location dropped (derivable) and replaced by a single path note
 	assert.ok(!out.includes("C:/skills/tcpdump/SKILL.md"));
+	assert.ok(out.includes("<skill_path_note>"));
+	assert.ok(out.includes("C:/skills"));
+	// tail is name-only: no hashcat description
+	assert.ok(!out.includes("password cracking"));
 });
 
-test("compact mode: every skill kept, all descriptions trimmed, no skill is full", () => {
+test("hybrid tail=intent keeps a short tail description but still drops the derivable location", () => {
 	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
-	const { text: out, selected } = transformSkillsInText(text, {
-		mode: "compact",
-		topK: 0,
-		tailChars: 60,
-		keepLocations: false,
-		query: "",
-	});
+	const { text: out } = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "intent", query: "RSA key recovery" });
+	assert.ok(out.includes("GPU-accelerated offline password cracking")); // tail intent description
+	assert.ok(!out.includes("C:/skills/hashcat/SKILL.md")); // location still dropped
+});
+
+test("compact renders every skill as a short intent tail with a path note", () => {
+	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
+	const { text: out, selected } = transformSkillsInText(text, { mode: "compact", topK: 0, tail: "name", query: "" });
 	assert.deepEqual(selected, []);
 	for (const [n] of SAMPLE) assert.ok(out.includes(`<name>${n}</name>`));
-	assert.ok(!out.includes("supporting many hash types")); // hashcat desc trimmed past first sentence boundary
-});
-
-test("hybrid tail=0: tail is name-only (no description), relevant stays full", () => {
-	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
-	const out = transformSkillsInText(text, { mode: "hybrid", topK: 1, tailChars: 0, keepLocations: false, query: "RSA key recovery", profile: EMPTY_PROFILE, pinnedSkills: [] });
-	// relevant skill keeps its description; tail skills keep only the name
-	assert.ok(out.text.includes("Use when targeting RSA key recovery"));
-	assert.ok(out.text.includes("<name>hashcat</name>"));
-	assert.ok(!out.text.includes("password cracking tool")); // hashcat description dropped (name-only)
-	for (const [n] of SAMPLE) assert.ok(out.text.includes(`<name>${n}</name>`));
+	assert.ok(out.includes("<skill_path_note>"));
+	assert.ok(!out.includes("C:/skills/tcpdump/SKILL.md")); // per-entry locations dropped
+	assert.ok(!out.includes("Use when reviewing Python")); // second sentence trimmed off the intent
 });
 
 test("hybrid keeps profile-critical and pinned skills full", () => {
@@ -135,8 +157,7 @@ test("hybrid keeps profile-critical and pinned skills full", () => {
 	const out = transformSkillsInText(text, {
 		mode: "hybrid",
 		topK: 1,
-		tailChars: 0,
-		keepLocations: false,
+		tail: "name",
 		query: "RSA key recovery",
 		profile: normalizeProfile({ critical: ["hashcat"] }),
 		pinnedSkills: ["tcpdump"],
@@ -146,62 +167,72 @@ test("hybrid keeps profile-critical and pinned skills full", () => {
 	assert.deepEqual(out.selected, ["rsactftool", "hashcat", "tcpdump"]);
 });
 
-test("hybrid safe fallback uses a short tail when scores are too weak", () => {
-	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
-	const out = transformSkillsInText(text, {
-		mode: "hybrid",
-		topK: 1,
-		tailChars: 0,
-		keepLocations: false,
-		query: "brew tea",
-		profile: EMPTY_PROFILE,
-		pinnedSkills: [],
-		safeFallbackTailChars: 48,
-	});
-	assert.ok(out.text.includes("<description>GPU-accelerated offline password cracking tool"));
-	assert.deepEqual(out.selected, []);
+test("name-only skills (no description) are preserved, not dropped", () => {
+	const text = catalog(
+		skillXml("rsactftool", "RSA recovery tool. Use when targeting RSA key recovery."),
+		`  <skill>\n    <name>1337</name>\n  </skill>`,
+	);
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "rsa key recovery" });
+	assert.ok(out.text.includes("<name>1337</name>")); // survives even without a description
 });
 
-test("transformSkillsInText keepLocations retains <location> on compacted entries", () => {
-	const text = catalog(skillXml("a", "Alpha skill does things. Extra detail."), skillXml("b", "Beta skill."));
-	const out = transformSkillsInText(text, { mode: "compact", topK: 0, tailChars: 40, keepLocations: true, query: "" });
-	assert.ok(out.text.includes("C:/skills/a/SKILL.md"));
-	assert.ok(out.text.includes("C:/skills/b/SKILL.md"));
+test("alwaysFull keeps a behavioural skill full even when the query has no overlap", () => {
+	const text = catalog(
+		...SAMPLE.map(([n, d]) => skillXml(n, d)),
+		skillXml("1337", "Mode: structured operator behaviour forcing explicit reasoning and verification."),
+	);
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "refactor a python module", alwaysFull: ["1337"] });
+	assert.ok(out.text.includes("structured operator behaviour")); // kept full despite zero query overlap
+	assert.ok(out.selected.includes("1337"));
+});
+
+test("alwaysFull forces a skill to stay full", () => {
+	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "RSA key recovery", alwaysFull: ["tcpdump"] });
+	assert.ok(out.text.includes("Command-line packet capture"));
+	assert.ok(out.selected.includes("tcpdump"));
+});
+
+test("never removes matching skills (exact name and prefix*)", () => {
+	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 4, tail: "name", query: "rsa", never: ["hashcat", "python-*"] });
+	assert.ok(!out.text.includes("<name>hashcat</name>"));
+	assert.ok(!out.text.includes("<name>python-patterns</name>"));
+	assert.ok(out.text.includes("<name>rsactftool</name>"));
+});
+
+test("tail keeps an explicit location when it is not derivable from the convention", () => {
+	const text = catalog(
+		skillXml("rsactftool", "RSA recovery tool. Use when targeting RSA key recovery."),
+		`  <skill>\n    <name>weird</name>\n    <description>A weird skill.</description>\n    <location>C:/odd/path/custom.md</location>\n  </skill>`,
+	);
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "rsa key recovery" });
+	assert.ok(out.text.includes("C:/odd/path/custom.md")); // irregular path kept explicitly
 });
 
 test("transformSkillsInText is identity when there is no catalog", () => {
 	const text = "no skills here";
-	const out = transformSkillsInText(text, { mode: "hybrid", topK: 5, tailChars: 80, keepLocations: false, query: "x" });
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 5, tail: "name", query: "x" });
 	assert.equal(out.text, text);
 	assert.equal(out.removed, 0);
 });
 
 test("transformSkillsInText skips rewrites that would not shrink a catalog block", () => {
-	const text = `<available_skills><skill><name>a</name><description>x.</description></skill></available_skills>`;
-	const out = transformSkillsInText(text, {
-		mode: "compact",
-		topK: 0,
-		tailChars: 80,
-		keepLocations: false,
-		query: "",
-	});
+	// already name-only and minimal: rebuilt cannot be smaller, so it is left untouched
+	const text = `<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>`;
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 0, tail: "name", query: "" });
 	assert.equal(out.text, text);
 	assert.equal(out.removed, 0);
 });
 
 test("transformSkillsInText rewrites every catalog in the text", () => {
-	const first = `<available_skills>\n${skillXml("a", "Alpha tool.")}\n</available_skills>`;
-	const second = `<available_skills>\n${skillXml("b", "Beta tool.")}\n</available_skills>`;
-	const out = transformSkillsInText(`${first}\nmid\n${second}`, {
-		mode: "compact",
-		topK: 0,
-		tailChars: 0,
-		keepLocations: false,
-		query: "",
-	});
-	assert.equal((out.text.match(/<description>/g) ?? []).length, 0);
-	assert.ok(out.text.includes("<name>a</name>"));
-	assert.ok(out.text.includes("<name>b</name>"));
+	const first = `<available_skills>\n${SAMPLE.map(([n, d]) => skillXml(n, d)).join("\n")}\n</available_skills>`;
+	const second = `<available_skills>\n${skillXml("alpha-skill", "Alpha skill does several things. Extra detail here.")}\n${skillXml("beta-skill", "Beta skill does other things. More detail here.")}\n</available_skills>`;
+	const out = transformSkillsInText(`${first}\nmid\n${second}`, { mode: "hybrid", topK: 0, tail: "name", query: "" });
+	assert.equal((out.text.match(/<description>/g) ?? []).length, 0); // name-only tail, no descriptions
+	assert.ok(out.text.includes("<name>rsactftool</name>"));
+	assert.ok(out.text.includes("<name>alpha-skill</name>"));
+	assert.ok(out.text.includes("<name>beta-skill</name>"));
 });
 
 test("extractQuery joins first (task) + last (current) user text, skipping tool results", () => {

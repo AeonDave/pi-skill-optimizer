@@ -29,29 +29,28 @@ export interface Skill {
 }
 
 /** What to do with the `<available_skills>` catalog. */
-export type SkillMode = "off" | "strip" | "compact" | "hybrid";
+export type SkillMode = "off" | "compact" | "hybrid";
+
+/** How non-selected (tail) skills are rendered in `hybrid` mode. */
+export type TailStyle = "name" | "intent";
 
 export interface SkillTransformOptions {
-	/** Only `compact` and `hybrid` are handled here; `off`/`strip` are handled by the caller. */
+	/** Only `compact` and `hybrid` are handled here; `off` is handled by the caller. */
 	mode: "compact" | "hybrid";
-	/** hybrid: how many relevant skills keep their full description. */
+	/** hybrid: how many relevant skills keep their full description + explicit location. */
 	topK: number;
-	/** Max chars for a compacted (tail) description. */
-	tailChars: number;
-	/** Keep `<location>` on compacted entries too (safer, larger). Full entries always keep it. */
-	keepLocations: boolean;
+	/** hybrid tail style: `name` (cheapest) or `intent` (name + short description). */
+	tail: TailStyle;
 	/** The request's query text, used to rank skills in `hybrid` mode. */
 	query: string;
 	/** User-specific init profile: aliases, synthetic queries, critical skills. */
 	profile?: SkillOptimizerProfile;
 	/** Usage-derived skills that should stay fully described. */
 	pinnedSkills?: readonly string[];
-	/** Use adaptive top-K selection around the requested topK. */
-	adaptiveTopK?: boolean;
-	minTopK?: number;
-	maxTopK?: number;
-	/** If ranking has no signal, keep this many chars of every tail description instead of name-only. */
-	safeFallbackTailChars?: number;
+	/** User allowlist: always render these skills full (name + description + location). */
+	alwaysFull?: readonly string[];
+	/** User denylist: drop these skills from the catalog entirely (exact name or `prefix*`). */
+	never?: readonly string[];
 }
 
 export interface SkillTransformResult {
@@ -63,7 +62,7 @@ export interface SkillTransformResult {
 
 const BLOCK_RE = /<available_skills>([\s\S]*?)<\/available_skills>/g;
 const SKILL_RE =
-	/<skill>\s*<name>([\s\S]*?)<\/name>\s*<description>([\s\S]*?)<\/description>\s*(?:<location>([\s\S]*?)<\/location>\s*)?<\/skill>/g;
+	/<skill>\s*<name>([\s\S]*?)<\/name>\s*(?:<description>([\s\S]*?)<\/description>\s*)?(?:<location>([\s\S]*?)<\/location>\s*)?<\/skill>/g;
 const MAX_CATALOG_CACHE_ENTRIES = 16;
 
 /** Minimal stopword set (EN + a few IT, since prompts may be Italian). IDF handles the rest. */
@@ -110,7 +109,7 @@ export function parseSkills(inner: string): Skill[] {
 	while ((match = SKILL_RE.exec(inner)) !== null) {
 		skills.push({
 			name: match[1].trim(),
-			description: match[2].trim(),
+			description: (match[2] ?? "").trim(),
 			location: (match[3] ?? "").trim(),
 		});
 	}
@@ -227,65 +226,126 @@ export function compactDescription(description: string, maxChars: number): strin
 	return result;
 }
 
-function renderSkill(skill: Skill, full: boolean, tailChars: number, keepLocations: boolean): string {
-	const lines = [`  <skill>`, `    <name>${skill.name}</name>`];
-	if (full) {
-		lines.push(`    <description>${skill.description}</description>`);
-	} else if (tailChars > 0) {
-		lines.push(`    <description>${compactDescription(skill.description, tailChars)}</description>`);
-	} // tailChars === 0 → name-only (the name itself declares intent)
-	if ((full || keepLocations) && skill.location) lines.push(`    <location>${skill.location}</location>`);
-	lines.push(`  </skill>`);
+/** Tail descriptions cap (internal): a short intent line, not the full text. */
+const INTENT_CHARS = 80;
+
+/** True if `name` matches any pattern: exact, or `prefix*` wildcard. */
+function nameMatches(name: string, patterns: readonly string[]): boolean {
+	for (const pattern of patterns) {
+		if (pattern.endsWith("*")) {
+			if (name.startsWith(pattern.slice(0, -1))) return true;
+		} else if (name === pattern) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/** Root dir of a location iff it follows the `<root>/<name>/SKILL.md` convention, else null. */
+function derivableRoot(location: string, name: string): string | null {
+	const match = location.match(/^(.*)[\\/]([^\\/]+)[\\/]SKILL\.md$/i);
+	if (!match || match[2] !== name) return null;
+	return match[1];
+}
+
+function renderFull(skill: Skill): string {
+	const lines = ["  <skill>", `    <name>${skill.name}</name>`];
+	if (skill.description) lines.push(`    <description>${skill.description}</description>`);
+	if (skill.location) lines.push(`    <location>${skill.location}</location>`);
+	lines.push("  </skill>");
 	return lines.join("\n");
+}
+
+/**
+ * Render a tail skill. Drops the `<location>` when it is derivable from the
+ * `<root>/<name>/SKILL.md` convention (the path note declares the roots), but
+ * keeps an explicit `<location>` for irregular paths so the skill stays loadable.
+ */
+function renderTail(skill: Skill, tail: TailStyle): { text: string; droppedRoot: string | null } {
+	const lines = ["  <skill>", `    <name>${skill.name}</name>`];
+	if (tail === "intent" && skill.description) lines.push(`    <description>${compactDescription(skill.description, INTENT_CHARS)}</description>`);
+	let droppedRoot: string | null = null;
+	if (skill.location) {
+		const root = derivableRoot(skill.location, skill.name);
+		if (root) droppedRoot = root;
+		else lines.push(`    <location>${skill.location}</location>`);
+	}
+	lines.push("  </skill>");
+	return { text: lines.join("\n"), droppedRoot };
+}
+
+/** One-line note so the model can load a tail skill whose location was dropped. */
+function pathNote(roots: readonly string[]): string {
+	return `  <skill_path_note>Skills listed without a <location> are stored at {root}/{name}/SKILL.md (roots: ${roots.join(" | ")}). Read that file to load one, or run /skill:name.</skill_path_note>`;
 }
 
 /**
  * Rewrite the `<available_skills>` block inside `text` per the options. Returns
  * the original text (and `removed: 0`) when there is no catalog or no skills.
- * In `hybrid` mode the top-K query-relevant skills keep their full description
- * and the rest are compacted; every skill keeps its `<name>`, so nothing becomes
- * undiscoverable.
+ *
+ * `hybrid` keeps the top-K query-relevant skills (plus critical/pinned/alwaysFull)
+ * at full description + explicit location, and renders the rest as the `tail`
+ * style with the location replaced by a single path note — so every surviving
+ * skill stays loadable. `compact` renders every skill as a short intent tail.
+ * Skills matched by `never` are dropped entirely.
  */
 export function transformSkillsInText(text: string, opts: SkillTransformOptions): SkillTransformResult {
 	let changed = false;
 	const selected: string[] = [];
 	const profile = opts.profile ?? EMPTY_PROFILE;
-	const pinnedNames = new Set(opts.pinnedSkills ?? []);
-	const criticalNames = new Set(profile.critical);
+	const pinned = new Set(opts.pinnedSkills ?? []);
+	const critical = new Set(profile.critical);
+	const always = new Set(opts.alwaysFull ?? []);
+	const never = opts.never ?? [];
 	BLOCK_RE.lastIndex = 0;
 	const next = text.replace(BLOCK_RE, (block, inner: string) => {
 		const analysis = analyzeCatalog(inner, profile);
 		const skills = analysis.skills;
 		if (skills.length === 0) return block;
 
-		let fullSet: Set<number>;
-		let indices: number[] = [];
-		let renderTailChars = opts.tailChars;
+		const excluded = skills.map((skill) => never.length > 0 && nameMatches(skill.name, never));
+		const fullSet = new Set<number>();
+		const orderedFull: number[] = [];
+		const markFull = (i: number): void => {
+			if (excluded[i] || fullSet.has(i)) return;
+			fullSet.add(i);
+			orderedFull.push(i);
+		};
 		if (opts.mode === "hybrid") {
-			indices = selectRelevant(scoreAnalysis(analysis, tokenize(opts.query)), {
+			const ranked = selectRelevant(scoreAnalysis(analysis, tokenize(opts.query)), {
 				targetTopK: opts.topK,
-				minTopK: opts.minTopK,
-				maxTopK: opts.maxTopK,
-				adaptive: opts.adaptiveTopK,
+				minTopK: opts.topK,
+				maxTopK: Math.ceil(opts.topK * 1.5),
+				adaptive: true,
 			});
-			fullSet = new Set(indices);
-			if (indices.length === 0 && (opts.safeFallbackTailChars ?? 0) > renderTailChars) {
-				renderTailChars = opts.safeFallbackTailChars ?? renderTailChars;
-			}
-			skills.forEach((skill, i) => {
-				if (criticalNames.has(skill.name) || pinnedNames.has(skill.name)) {
-					fullSet.add(i);
-					if (!indices.includes(i)) indices.push(i);
-				}
-			});
-		} else {
-			fullSet = new Set(); // compact: none kept full
+			for (const i of ranked) markFull(i);
 		}
+		skills.forEach((skill, i) => {
+			if (critical.has(skill.name) || pinned.has(skill.name) || always.has(skill.name)) markFull(i);
+		});
 
-		const entries = skills.map((skill, i) => renderSkill(skill, fullSet.has(i), renderTailChars, opts.keepLocations));
-		const rebuilt = `<available_skills>\n${entries.join("\n")}\n</available_skills>`;
+		const tailStyle: TailStyle = opts.mode === "compact" ? "intent" : opts.tail;
+		const usedRoots: string[] = [];
+		const seenRoots = new Set<string>();
+		const entries: string[] = [];
+		skills.forEach((skill, i) => {
+			if (excluded[i]) return;
+			if (fullSet.has(i)) {
+				entries.push(renderFull(skill));
+				return;
+			}
+			const { text: entry, droppedRoot } = renderTail(skill, tailStyle);
+			if (droppedRoot && !seenRoots.has(droppedRoot)) {
+				seenRoots.add(droppedRoot);
+				usedRoots.push(droppedRoot);
+			}
+			entries.push(entry);
+		});
+
+		const header = usedRoots.length > 0 ? `${pathNote(usedRoots)}\n` : "";
+		const rebuilt = `<available_skills>\n${header}${entries.join("\n")}\n</available_skills>`;
 		if (rebuilt.length >= block.length) return block;
-		selected.push(...indices.map((i) => skills[i].name));
+		selected.push(...orderedFull.map((i) => skills[i].name));
 		changed = true;
 		return rebuilt;
 	});

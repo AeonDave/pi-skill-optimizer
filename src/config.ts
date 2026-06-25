@@ -1,51 +1,63 @@
 /**
- * Environment-driven configuration for the skill optimizer. All optional.
+ * Configuration for the skill optimizer.
  *
- * | Env var | Default | Purpose |
- * |---------|---------|---------|
- * | `PI_SKILL_OPTIMIZER_DISABLE`       | _(off)_  | Any non-empty value turns the optimizer off entirely. |
- * | `PI_SKILL_OPTIMIZER_MODE`          | `hybrid` | `off` \| `strip` \| `compact` \| `hybrid` — what to do with `<available_skills>`. |
- * | `PI_SKILL_OPTIMIZER_TOP_K`         | `16`     | hybrid: relevant skills kept at full description. |
- * | `PI_SKILL_OPTIMIZER_ADAPTIVE`      | `1`      | adapt top-K upward for ambiguous close scores. |
- * | `PI_SKILL_OPTIMIZER_MIN_TOP_K`     | `8`      | adaptive: minimum relevant skills kept full. |
- * | `PI_SKILL_OPTIMIZER_MAX_TOP_K`     | `24`     | adaptive: maximum relevant skills kept full. |
- * | `PI_SKILL_OPTIMIZER_TAIL_CHARS`    | `0`      | max chars for a compacted description (`0` = name-only). |
- * | `PI_SKILL_OPTIMIZER_FALLBACK_TAIL` | `80`     | weak query: short tail descriptions instead of name-only. |
- * | `PI_SKILL_OPTIMIZER_KEEP_LOCATIONS`| _(off)_  | keep `<location>` on compacted entries too (safer, larger). |
- * | `PI_SKILL_OPTIMIZER_STRIP`         | `[]`     | JSON array of extra XML tag blocks to remove. |
- * | `PI_SKILL_OPTIMIZER_ANCHORS`       | `[]`     | JSON array of substrings; drop whole paragraphs containing one. |
- * | `PI_SKILL_OPTIMIZER_PROVIDERS`     | _(all)_  | Comma list of `model.provider` ids to scope to. |
- * | `PI_SKILL_OPTIMIZER_PROFILE`       | `./.pi-skill-optimizer.profile.json` | Path for generated retrieval profile. |
- * | `PI_SKILL_OPTIMIZER_USAGE`         | `./.pi-skill-optimizer.usage.json` | Path for pinned skill usage stats. |
- * | `PI_SKILL_OPTIMIZER_PINNED_TOP_K`  | `8`      | usage-derived skills always kept full. |
+ * Primary source is a `config.json` file; an env var overrides it for one-off
+ * runs. Resolution order for every setting:
+ *   env var > project `config.json` > global `config.json` > built-in default.
  *
- * Tools array (opt-in — removing a tool has NO fallback; off by default):
- * | `PI_SKILL_OPTIMIZER_TOOLS_MODE`    | `off`    | `off` \| `drop` \| `relevance`. |
- * | `PI_SKILL_OPTIMIZER_TOOLS_DROP`    | `[]`     | drop mode: JSON array of tool name prefixes to remove (e.g. `["htb_","mcpwn_"]`). |
- * | `PI_SKILL_OPTIMIZER_TOOLS_TOP_K`   | `24`     | relevance mode: non-core tools to keep. |
- * | `PI_SKILL_OPTIMIZER_TOOLS_PROTECT` | `[]`     | extra protected tool names/prefixes. |
+ * Files mirror Pi's skill layout:
+ *   - global: `<agentDir>/skill-optimizer/`     (e.g. `~/.pi/agent/skill-optimizer/`)
+ *   - project: `<cwd>/.pi/skill-optimizer/`     (merged over global, project wins)
+ *
+ * config.json keys (see `defaultConfigJson`): disable, mode, topK, tail,
+ * alwaysFull, never, providers, pinnedTopK, toolsMode, toolsDrop, toolsTopK,
+ * toolsProtect.
+ *
+ * Matching env vars: PI_SKILL_OPTIMIZER_{DISABLE, MODE, TOP_K, TAIL, ALWAYS_FULL,
+ * NEVER, PROVIDERS, PINNED_TOP_K, TOOLS_MODE, TOOLS_DROP, TOOLS_TOP_K,
+ * TOOLS_PROTECT}. PI_SKILL_OPTIMIZER_PROFILE / PI_SKILL_OPTIMIZER_USAGE override
+ * the generated profile / usage file paths.
  */
 
 import type { OptimizeConfig } from "./optimize.ts";
-import type { SkillMode } from "./skills.ts";
+import type { SkillMode, TailStyle } from "./skills.ts";
 import type { ToolsMode } from "./tools.ts";
 import { join } from "node:path";
+import { homedir } from "node:os";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
-const MODES: readonly SkillMode[] = ["off", "strip", "compact", "hybrid"];
+/** Subdir name under the agent dir and the project `.pi` dir where optimizer state lives. */
+const STATE_SUBDIR = "skill-optimizer";
+const PROFILE_FILE = "profile.json";
+const USAGE_FILE = "usage.json";
+const CONFIG_FILE = "config.json";
+
+/** Global per-user state dir (mirrors where Pi keeps global skills: ~/.pi/agent/skills). */
+function globalStateDir(): string {
+	try {
+		return join(getAgentDir(), STATE_SUBDIR);
+	} catch {
+		return join(homedir(), CONFIG_DIR_NAME || ".pi", "agent", STATE_SUBDIR);
+	}
+}
+
+/** Project-local state dir (mirrors where Pi keeps project skills: <cwd>/.pi/skills). */
+function projectStateDir(cwd: string): string {
+	return join(cwd, CONFIG_DIR_NAME || ".pi", STATE_SUBDIR);
+}
+
+const MODES: readonly SkillMode[] = ["off", "compact", "hybrid"];
+const TAILS: readonly TailStyle[] = ["name", "intent"];
 const TOOLS_MODES: readonly ToolsMode[] = ["off", "drop", "relevance"];
 
 export const DEFAULTS = {
 	mode: "hybrid" as SkillMode,
-	topK: 16,
-	adaptiveTopK: true,
-	minTopK: 8,
-	maxTopK: 24,
-	// 0 = name-only tail (a skill name already declares intent, and relevance is
-	// scored on the FULL descriptions, so a relevant skill is promoted to full
-	// regardless). Raise it to keep a short intent line on the tail too.
-	tailChars: 0,
-	safeFallbackTailChars: 80,
-	keepLocations: false,
+	topK: 20,
+	// Tail skills render as name-only and their derivable location is replaced by a
+	// single path note, so every skill stays loadable at minimal token cost. Use
+	// `intent` to also keep a short description on the tail (more discovery, more tokens).
+	tail: "name" as TailStyle,
 	pinnedTopK: 8,
 };
 
@@ -57,100 +69,228 @@ function warn(message: string): void {
 	}
 }
 
-function parseStringArray(envName: string): string[] {
-	const raw = process.env[envName]?.trim();
-	if (!raw) return [];
+// ----------------------------------------------------------------------------
+// File config (config.json): global `<agentDir>/skill-optimizer/config.json`
+// overridden by project `<cwd>/.pi/skill-optimizer/config.json`. Resolution
+// order for every setting: env var > project config.json > global config.json >
+// built-in default.
+// ----------------------------------------------------------------------------
+
+type FileConfig = Record<string, unknown>;
+
+let fileConfigCache: { key: string; value: FileConfig } | undefined;
+
+function fileSignature(path: string): string {
 	try {
-		const parsed = JSON.parse(raw);
-		if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string")) return parsed;
-		warn(`${envName}: expected a JSON array of strings`);
-	} catch (err) {
-		warn(`${envName}: invalid JSON (${(err as Error).message})`);
+		const s = statSync(path);
+		return `${s.size}:${s.mtimeMs}`;
+	} catch {
+		return "none";
 	}
+}
+
+function readConfigFile(path: string): FileConfig {
+	try {
+		if (!existsSync(path)) return {};
+		const parsed = JSON.parse(readFileSync(path, "utf8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as FileConfig;
+		warn(`${path}: expected a JSON object`);
+	} catch (err) {
+		warn(`${path}: invalid JSON (${(err as Error).message})`);
+	}
+	return {};
+}
+
+/** Load + merge global then project config.json (project keys win). Cached by mtime. */
+function loadFileConfig(cwd: string): FileConfig {
+	const { global, project } = getConfigPaths(cwd);
+	const key = `${global}|${fileSignature(global)}|${project}|${fileSignature(project)}`;
+	if (fileConfigCache?.key === key) return fileConfigCache.value;
+	const merged: FileConfig = { ...readConfigFile(global), ...(project === global ? {} : readConfigFile(project)) };
+	fileConfigCache = { key, value: merged };
+	return merged;
+}
+
+function pickInt(envName: string, fileVal: unknown, fallback: number): number {
+	const raw = process.env[envName]?.trim();
+	if (raw) {
+		const n = Number(raw);
+		if (Number.isInteger(n) && n >= 0) return n;
+		warn(`${envName}: expected a non-negative integer`);
+	}
+	if (typeof fileVal === "number" && Number.isInteger(fileVal) && fileVal >= 0) return fileVal;
+	if (fileVal !== undefined && fileVal !== null) warn(`config "${envName}": expected a non-negative integer`);
+	return fallback;
+}
+
+function pickStringArray(envName: string, fileVal: unknown): string[] {
+	const raw = process.env[envName]?.trim();
+	if (raw) {
+		try {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string")) return parsed;
+			warn(`${envName}: expected a JSON array of strings`);
+		} catch (err) {
+			warn(`${envName}: invalid JSON (${(err as Error).message})`);
+		}
+	}
+	if (Array.isArray(fileVal) && fileVal.every((v) => typeof v === "string")) return fileVal as string[];
+	if (fileVal !== undefined && fileVal !== null) warn(`config "${envName}": expected an array of strings`);
 	return [];
 }
 
-function parseInt0(envName: string, fallback: number): number {
-	const raw = process.env[envName]?.trim();
-	if (!raw) return fallback;
-	const n = Number(raw);
-	if (Number.isInteger(n) && n >= 0) return n;
-	warn(`${envName}: expected a non-negative integer`);
-	return fallback;
-}
-
-function parseBool(envName: string, fallback: boolean): boolean {
-	const raw = process.env[envName]?.trim().toLowerCase();
-	if (!raw) return fallback;
-	if (["1", "true", "yes", "on"].includes(raw)) return true;
-	if (["0", "false", "no", "off"].includes(raw)) return false;
-	warn(`${envName}: expected boolean (1/0, true/false, yes/no, on/off)`);
-	return fallback;
-}
-
-function parseMode(): SkillMode {
+function pickMode(fileVal: unknown): SkillMode {
 	const raw = process.env.PI_SKILL_OPTIMIZER_MODE?.trim().toLowerCase();
-	if (!raw) return DEFAULTS.mode;
-	if ((MODES as readonly string[]).includes(raw)) return raw as SkillMode;
-	warn(`PI_SKILL_OPTIMIZER_MODE: unknown mode "${raw}" (use off|strip|compact|hybrid)`);
+	if (raw) {
+		if ((MODES as readonly string[]).includes(raw)) return raw as SkillMode;
+		warn(`PI_SKILL_OPTIMIZER_MODE: unknown mode "${raw}" (use off|compact|hybrid)`);
+	}
+	if (typeof fileVal === "string" && (MODES as readonly string[]).includes(fileVal.toLowerCase())) {
+		return fileVal.toLowerCase() as SkillMode;
+	}
+	if (fileVal !== undefined && fileVal !== null) warn(`config "mode": expected off|compact|hybrid`);
 	return DEFAULTS.mode;
 }
 
-function parseToolsMode(): ToolsMode {
+function pickToolsMode(fileVal: unknown): ToolsMode {
 	const raw = process.env.PI_SKILL_OPTIMIZER_TOOLS_MODE?.trim().toLowerCase();
-	if (!raw) return "off";
-	if ((TOOLS_MODES as readonly string[]).includes(raw)) return raw as ToolsMode;
-	warn(`PI_SKILL_OPTIMIZER_TOOLS_MODE: unknown mode "${raw}" (use off|drop|relevance)`);
+	if (raw) {
+		if ((TOOLS_MODES as readonly string[]).includes(raw)) return raw as ToolsMode;
+		warn(`PI_SKILL_OPTIMIZER_TOOLS_MODE: unknown mode "${raw}" (use off|drop|relevance)`);
+	}
+	if (typeof fileVal === "string" && (TOOLS_MODES as readonly string[]).includes(fileVal.toLowerCase())) {
+		return fileVal.toLowerCase() as ToolsMode;
+	}
+	if (fileVal !== undefined && fileVal !== null) warn(`config "toolsMode": expected off|drop|relevance`);
 	return "off";
 }
 
-/** True when the user has switched the optimizer off entirely. */
-export function isDisabled(): boolean {
-	return !!process.env.PI_SKILL_OPTIMIZER_DISABLE?.trim();
+function pickTail(fileVal: unknown): TailStyle {
+	const raw = process.env.PI_SKILL_OPTIMIZER_TAIL?.trim().toLowerCase();
+	if (raw) {
+		if ((TAILS as readonly string[]).includes(raw)) return raw as TailStyle;
+		warn(`PI_SKILL_OPTIMIZER_TAIL: unknown style "${raw}" (use name|intent)`);
+	}
+	if (typeof fileVal === "string" && (TAILS as readonly string[]).includes(fileVal.toLowerCase())) {
+		return fileVal.toLowerCase() as TailStyle;
+	}
+	if (fileVal !== undefined && fileVal !== null) warn(`config "tail": expected name|intent`);
+	return DEFAULTS.tail;
 }
 
-/** The full optimizer configuration: env overrides, else defaults. */
-export function getConfig(): OptimizeConfig {
+/** True when the user has switched the optimizer off entirely (env or config.json). */
+export function isDisabled(cwd = process.cwd()): boolean {
+	if (process.env.PI_SKILL_OPTIMIZER_DISABLE?.trim()) return true;
+	return loadFileConfig(cwd).disable === true;
+}
+
+/** The full optimizer configuration: env > project config.json > global config.json > defaults. */
+export function getConfig(cwd = process.cwd()): OptimizeConfig {
+	const file = loadFileConfig(cwd);
 	return {
-		mode: parseMode(),
-		topK: parseInt0("PI_SKILL_OPTIMIZER_TOP_K", DEFAULTS.topK),
-		adaptiveTopK: parseBool("PI_SKILL_OPTIMIZER_ADAPTIVE", DEFAULTS.adaptiveTopK),
-		minTopK: parseInt0("PI_SKILL_OPTIMIZER_MIN_TOP_K", DEFAULTS.minTopK),
-		maxTopK: parseInt0("PI_SKILL_OPTIMIZER_MAX_TOP_K", DEFAULTS.maxTopK),
-		tailChars: parseInt0("PI_SKILL_OPTIMIZER_TAIL_CHARS", DEFAULTS.tailChars),
-		safeFallbackTailChars: parseInt0("PI_SKILL_OPTIMIZER_FALLBACK_TAIL", DEFAULTS.safeFallbackTailChars),
-		keepLocations: !!process.env.PI_SKILL_OPTIMIZER_KEEP_LOCATIONS?.trim(),
-		extraStripTags: parseStringArray("PI_SKILL_OPTIMIZER_STRIP"),
-		dropAnchors: parseStringArray("PI_SKILL_OPTIMIZER_ANCHORS"),
-		toolsMode: parseToolsMode(),
-		toolsDropPrefixes: parseStringArray("PI_SKILL_OPTIMIZER_TOOLS_DROP"),
-		toolsTopK: parseInt0("PI_SKILL_OPTIMIZER_TOOLS_TOP_K", 24),
-		toolsProtect: parseStringArray("PI_SKILL_OPTIMIZER_TOOLS_PROTECT"),
+		mode: pickMode(file.mode),
+		topK: pickInt("PI_SKILL_OPTIMIZER_TOP_K", file.topK, DEFAULTS.topK),
+		tail: pickTail(file.tail),
+		alwaysFull: pickStringArray("PI_SKILL_OPTIMIZER_ALWAYS_FULL", file.alwaysFull),
+		never: pickStringArray("PI_SKILL_OPTIMIZER_NEVER", file.never),
+		toolsMode: pickToolsMode(file.toolsMode),
+		toolsDropPrefixes: pickStringArray("PI_SKILL_OPTIMIZER_TOOLS_DROP", file.toolsDrop),
+		toolsTopK: pickInt("PI_SKILL_OPTIMIZER_TOOLS_TOP_K", file.toolsTopK, 24),
+		toolsProtect: pickStringArray("PI_SKILL_OPTIMIZER_TOOLS_PROTECT", file.toolsProtect),
 	};
 }
 
-/** Provider ids to scope to, or `undefined` for every provider. */
-export function getScopeProviders(): string[] | undefined {
+/** Provider ids to scope to, or `undefined` for every provider (env or config.json). */
+export function getScopeProviders(cwd = process.cwd()): string[] | undefined {
 	const raw = process.env.PI_SKILL_OPTIMIZER_PROVIDERS?.trim();
-	if (!raw) return undefined;
-	const ids = raw.split(",").map((id) => id.trim()).filter(Boolean);
-	return ids.length > 0 ? ids : undefined;
+	if (raw) {
+		const ids = raw.split(",").map((id) => id.trim()).filter(Boolean);
+		return ids.length > 0 ? ids : undefined;
+	}
+	const fileVal = loadFileConfig(cwd).providers;
+	if (Array.isArray(fileVal)) {
+		const ids = fileVal.filter((v): v is string => typeof v === "string").map((id) => id.trim()).filter(Boolean);
+		return ids.length > 0 ? ids : undefined;
+	}
+	return undefined;
 }
 
-/** User profile file path. Relative env values are resolved from Pi's cwd. */
-export function getProfileFilePath(cwd: string): string {
-	const raw = process.env.PI_SKILL_OPTIMIZER_PROFILE?.trim() || process.env.PI_SKILL_OPTIMIZER_ALIASES?.trim();
-	if (!raw) return join(cwd, ".pi-skill-optimizer.profile.json");
-	return raw.match(/^[a-zA-Z]:[\\/]|^[/\\]/) ? raw : join(cwd, raw);
+function isAbsolutePath(value: string): boolean {
+	return /^[a-zA-Z]:[\\/]|^[/\\]/.test(value);
 }
 
-/** Usage stats file path. Relative env values are resolved from Pi's cwd. */
+/**
+ * Global + project config.json paths. Both are loaded and merged at runtime
+ * (project keys override global). Layout mirrors Pi's skill dirs.
+ */
+export function getConfigPaths(cwd: string): { global: string; project: string } {
+	return {
+		global: join(globalStateDir(), CONFIG_FILE),
+		project: join(projectStateDir(cwd), CONFIG_FILE),
+	};
+}
+
+/** A documented default config.json template users can edit. */
+export function defaultConfigJson(): string {
+	const template = {
+		disable: false,
+		mode: DEFAULTS.mode, // off | compact | hybrid
+		topK: DEFAULTS.topK, // hybrid: skills kept full (name + description + location)
+		tail: DEFAULTS.tail, // name | intent (how the rest are rendered)
+		alwaysFull: [] as string[], // skill names to always keep full
+		never: [] as string[], // skill names/prefix* to hide entirely
+		providers: [] as string[], // model.provider ids to scope to; [] = all
+		pinnedTopK: DEFAULTS.pinnedTopK, // usage-derived skills kept full
+		toolsMode: "off", // off | drop | relevance
+		toolsDrop: [] as string[], // drop: tool name prefixes to remove
+		toolsTopK: 24, // relevance: non-core tools to keep
+		toolsProtect: [] as string[], // extra protected tool names/prefixes
+	};
+	return `${JSON.stringify(template, null, 2)}\n`;
+}
+
+/**
+ * Write the global config.json template if it does not exist yet, so users have
+ * a discoverable, editable file. Never overwrites an existing config. Returns the
+ * path when created, otherwise `undefined`.
+ */
+export function ensureGlobalConfigTemplate(): string | undefined {
+	const path = getConfigPaths(process.cwd()).global;
+	if (existsSync(path)) return undefined;
+	try {
+		mkdirSync(join(path, ".."), { recursive: true });
+		writeFileSync(path, defaultConfigJson(), "utf8");
+		return path;
+	} catch (err) {
+		warn(`failed to write default config (${(err as Error).message})`);
+		return undefined;
+	}
+}
+
+/**
+ * Global + project profile file paths, mirroring how Pi loads skills:
+ * global from `<agentDir>/skill-optimizer/`, project from `<cwd>/.pi/skill-optimizer/`.
+ * An explicit `PI_SKILL_OPTIMIZER_PROFILE` collapses both onto that single file.
+ */
+export function getProfilePaths(cwd: string): { global: string; project: string } {
+	const raw = process.env.PI_SKILL_OPTIMIZER_PROFILE?.trim();
+	if (raw) {
+		const resolved = isAbsolutePath(raw) ? raw : join(cwd, raw);
+		return { global: resolved, project: resolved };
+	}
+	return {
+		global: join(globalStateDir(), PROFILE_FILE),
+		project: join(projectStateDir(cwd), PROFILE_FILE),
+	};
+}
+
+/** Usage stats path (global only). Overridable with `PI_SKILL_OPTIMIZER_USAGE`. */
 export function getUsageFilePath(cwd: string): string {
 	const raw = process.env.PI_SKILL_OPTIMIZER_USAGE?.trim();
-	if (!raw) return join(cwd, ".pi-skill-optimizer.usage.json");
-	return raw.match(/^[a-zA-Z]:[\\/]|^[/\\]/) ? raw : join(cwd, raw);
+	if (raw) return isAbsolutePath(raw) ? raw : join(cwd, raw);
+	return join(globalStateDir(), USAGE_FILE);
 }
 
-export function getPinnedTopK(): number {
-	return parseInt0("PI_SKILL_OPTIMIZER_PINNED_TOP_K", DEFAULTS.pinnedTopK);
+export function getPinnedTopK(cwd = process.cwd()): number {
+	return pickInt("PI_SKILL_OPTIMIZER_PINNED_TOP_K", loadFileConfig(cwd).pinnedTopK, DEFAULTS.pinnedTopK);
 }

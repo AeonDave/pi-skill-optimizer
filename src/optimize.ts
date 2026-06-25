@@ -1,34 +1,26 @@
 /**
  * Pure orchestration of system-prompt slimming — no Pi imports, unit-testable.
  *
- * Applies, to every system text block AND every tool description in an
- * Anthropic-style request body:
- *   1. the skill-catalog rewrite (off / strip / compact / hybrid — see skills.ts);
- *   2. removal of any extra configured `<tag>…</tag>` blocks; and
- *   3. removal of blank-line-separated paragraphs containing a configured anchor.
+ * Applies the skill-catalog rewrite (off / compact / hybrid — see skills.ts) to
+ * every system text block AND every tool description in an Anthropic-style
+ * request body, then optionally slims the `tools` array.
  *
  * The `<available_skills>` catalog can live in the system prompt or inside a
  * tool's description depending on the harness, so both are scanned. Only content
  * is removed/compacted; surviving text is never reordered or rewritten.
  */
 
-import { extractQuery, type SkillMode, transformSkillsInText } from "./skills.ts";
+import { extractQuery, type SkillMode, type TailStyle, transformSkillsInText } from "./skills.ts";
 import { collectUsedToolNames, optimizeTools, type ToolsMode } from "./tools.ts";
 import { type SkillOptimizerProfile } from "./profile.ts";
 
 export interface OptimizeConfig {
-	/** What to do with the `<available_skills>` catalog. */
+	/** What to do with the `<available_skills>` catalog: `off` | `compact` | `hybrid`. */
 	mode: SkillMode;
-	/** hybrid: relevant skills kept at full description. */
+	/** hybrid: relevant skills kept at full description + explicit location. */
 	topK: number;
-	/** Max chars for compacted descriptions. */
-	tailChars: number;
-	/** Keep `<location>` on compacted entries too. */
-	keepLocations: boolean;
-	/** Extra XML tag names whose whole block is removed (besides skills). */
-	extraStripTags: readonly string[];
-	/** Substrings; drop whole paragraphs containing one. */
-	dropAnchors: readonly string[];
+	/** hybrid tail style for non-selected skills: `name` or `intent`. */
+	tail: TailStyle;
 	/** What to do with the `tools` array (off by default — removing a tool has no fallback). */
 	toolsMode: ToolsMode;
 	/** drop mode: tool name prefixes to remove (e.g. `htb_`, `mcpwn_`). */
@@ -41,12 +33,10 @@ export interface OptimizeConfig {
 	profile?: SkillOptimizerProfile;
 	/** Usage-derived skills that should stay fully described. */
 	pinnedSkills?: readonly string[];
-	/** Adaptive top-K guardrails. */
-	adaptiveTopK?: boolean;
-	minTopK?: number;
-	maxTopK?: number;
-	/** Weak-query fallback: keep short tail descriptions instead of name-only. */
-	safeFallbackTailChars?: number;
+	/** User allowlist: always render these skills full. */
+	alwaysFull?: readonly string[];
+	/** User denylist: drop these skills from the catalog (exact name or `prefix*`). */
+	never?: readonly string[];
 }
 
 export interface OptimizeResult {
@@ -107,59 +97,24 @@ function restoreSystem(system: unknown, normalized: NormalizedSystem, blocks: un
 	return system;
 }
 
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function stripTagBlock(text: string, tag: string): string {
-	if (!tag || !text.includes(`<${tag}`)) return text;
-	const block = new RegExp(`<${escapeRegExp(tag)}\\b[\\s\\S]*?</${escapeRegExp(tag)}>\\s*`, "g");
-	return text.replace(block, "");
-}
-
-function dropParagraphs(text: string, anchors: readonly string[]): string {
-	if (anchors.length === 0 || !anchors.some((a) => text.includes(a))) return text;
-	return text
-		.split(/\n\n+/)
-		.filter((paragraph) => !anchors.some((a) => paragraph.includes(a)))
-		.join("\n\n");
-}
-
-/** Apply all rules to one text string. Returns the new text and the names selected (hybrid). */
+/** Apply the skill-catalog rewrite to one text string. Returns the new text and the names kept full (hybrid). */
 function transformText(text: string, query: string, config: OptimizeConfig): { text: string; selected: string[] } {
-	let result = text;
-	let selected: string[] = [];
-	if (config.mode === "strip") {
-		result = stripTagBlock(result, "available_skills");
-	} else if (config.mode === "compact" || config.mode === "hybrid") {
-		const r = transformSkillsInText(result, {
-			mode: config.mode,
-			topK: config.topK,
-			tailChars: config.tailChars,
-			keepLocations: config.keepLocations,
-			query,
-			profile: config.profile,
-			pinnedSkills: config.pinnedSkills,
-			adaptiveTopK: config.adaptiveTopK,
-			minTopK: config.minTopK,
-			maxTopK: config.maxTopK,
-			safeFallbackTailChars: config.safeFallbackTailChars,
-		});
-		result = r.text;
-		if (r.selected.length > 0) selected = r.selected;
-	}
-	for (const tag of config.extraStripTags) result = stripTagBlock(result, tag);
-	result = dropParagraphs(result, config.dropAnchors);
-	return { text: result, selected };
+	if (config.mode === "off") return { text, selected: [] };
+	const r = transformSkillsInText(text, {
+		mode: config.mode,
+		topK: config.topK,
+		tail: config.tail,
+		query,
+		profile: config.profile,
+		pinnedSkills: config.pinnedSkills,
+		alwaysFull: config.alwaysFull,
+		never: config.never,
+	});
+	return { text: r.text, selected: r.selected };
 }
 
 function hasWork(config: OptimizeConfig): boolean {
-	return (
-		config.mode !== "off" ||
-		config.toolsMode !== "off" ||
-		config.extraStripTags.length > 0 ||
-		config.dropAnchors.length > 0
-	);
+	return config.mode !== "off" || config.toolsMode !== "off";
 }
 
 /**

@@ -5,10 +5,7 @@ import { optimize, type OptimizeConfig } from "../src/optimize.ts";
 const BASE: OptimizeConfig = {
 	mode: "hybrid",
 	topK: 1,
-	tailChars: 40,
-	keepLocations: false,
-	extraStripTags: [],
-	dropAnchors: [],
+	tail: "name",
 	toolsMode: "off",
 	toolsDropPrefixes: [],
 	toolsTopK: 24,
@@ -52,16 +49,6 @@ test("hybrid: trims the system catalog, reports removed + selected, keeps the re
 	assert.equal(next.system[0].text, "You are Claude Code."); // untouched
 });
 
-test("strip mode removes the whole catalog", () => {
-	const { next, removed } = optimize(payloadWithCatalogInSystem(), { ...BASE, mode: "strip" }) as {
-		next: { system: Array<{ text: string }> };
-		removed: number;
-	};
-	assert.ok(removed > 0);
-	assert.ok(!next.system[1].text.includes("<available_skills>"));
-	assert.ok(!next.system[1].text.includes("<skill>"));
-});
-
 test("off mode with no extra rules is an identity no-op (same reference)", () => {
 	const payload = payloadWithCatalogInSystem();
 	const { next, removed } = optimize(payload, { ...BASE, mode: "off" });
@@ -87,7 +74,13 @@ test("the catalog is also handled inside a tool description", () => {
 		messages: [{ role: "user", content: "crack a password hash" }],
 		tools: [
 			{ name: "Bash", description: "Run commands." },
-			{ name: "Skill", description: `Execute a skill.\n<available_skills>\n${skillXml("hashcat", "GPU password cracking tool. Many hashes.")}\n${skillXml("tcpdump", "Packet capture.")}\n</available_skills>` },
+			{ name: "Skill", description: `Execute a skill.\n<available_skills>\n${[
+				skillXml("hashcat", "GPU password cracking tool supporting many hash types."),
+				skillXml("tcpdump", "Packet capture and network traffic analysis on the wire."),
+				skillXml("nmap", "Network port scanner for host discovery and service detection."),
+				skillXml("sqlmap", "Automated SQL injection detection and exploitation tool."),
+				skillXml("ffuf", "Fast web fuzzer for content and parameter discovery."),
+			].join("\n")}\n</available_skills>` },
 		],
 	};
 	const { next, removed, selected } = optimize(payload, { ...BASE, topK: 1 }) as {
@@ -104,9 +97,19 @@ test("the catalog is also handled inside a tool description", () => {
 test("selected diagnostics aggregate names across system and tool catalogs", () => {
 	const payload = {
 		messages: [{ role: "user", content: "recover RSA and crack hashcat passwords" }],
-		system: `sys\n<available_skills>\n${skillXml("rsactftool", "RSA recovery tool.")}\n${skillXml("tcpdump", "Packet capture.")}\n</available_skills>`,
+		system: `sys\n<available_skills>\n${[
+			skillXml("rsactftool", "RSA recovery tool for weak public keys and ciphertext."),
+			skillXml("tcpdump", "Packet capture and network traffic analysis on the wire."),
+			skillXml("nmap", "Network port scanner for host discovery and service detection."),
+			skillXml("ffuf", "Fast web fuzzer for content and parameter discovery."),
+		].join("\n")}\n</available_skills>`,
 		tools: [
-			{ name: "Skill", description: `Skill tool.\n<available_skills>\n${skillXml("hashcat", "Password hash cracking with GPU.")}\n${skillXml("apktool", "Android APK reverse engineering.")}\n</available_skills>` },
+			{ name: "Skill", description: `Skill tool.\n<available_skills>\n${[
+				skillXml("hashcat", "Password hash cracking with the GPU across many formats."),
+				skillXml("apktool", "Android APK decoding and reverse engineering toolkit."),
+				skillXml("jadx", "Android dex-to-Java decompiler for app analysis."),
+				skillXml("frida", "Dynamic instrumentation toolkit for app hooking."),
+			].join("\n")}\n</available_skills>` },
 		],
 	};
 	const { selected } = optimize(payload, { ...BASE, topK: 1 }) as { selected: string[] };
@@ -120,7 +123,12 @@ test("Pi-style Skill tool fixture is optimized while preserving payload shapes",
 		tools: [
 			{
 				name: "Skill",
-				description: `Loads skills.\n<available_skills>\n${skillXml("mobile-technique", "Android application assessment workflow.")}\n${skillXml("python-testing", "Python testing workflow.")}\n</available_skills>`,
+				description: `Loads skills.\n<available_skills>\n${[
+					skillXml("mobile-technique", "Android application assessment and reverse engineering workflow."),
+					skillXml("python-testing", "Python testing workflow with pytest fixtures and coverage."),
+					skillXml("golang-testing", "Go testing patterns for unit and table-driven tests."),
+					skillXml("rust-testing", "Rust testing patterns for unit, integration, and doc tests."),
+				].join("\n")}\n</available_skills>`,
 				input_schema: { type: "object" },
 			},
 		],
@@ -136,23 +144,6 @@ test("Pi-style Skill tool fixture is optimized while preserving payload shapes",
 	assert.ok(next.tools[0].input_schema);
 	assert.ok(next.tools[0].description.includes("<name>python-testing</name>"));
 	assert.deepEqual(selected, ["mobile-technique"]);
-});
-
-test("extraStripTags and dropAnchors are also applied", () => {
-	const payload = {
-		messages: [],
-		system: "keep\n\n<junk>noise</junk>\n\nPi documentation block here\n\nkeep too",
-	};
-	const { next } = optimize(payload, {
-		...BASE,
-		mode: "off",
-		extraStripTags: ["junk"],
-		dropAnchors: ["Pi documentation"],
-	}) as { next: { system: string } };
-	const text = next.system;
-	assert.ok(!text.includes("<junk>"));
-	assert.ok(!text.includes("Pi documentation"));
-	assert.ok(text.includes("keep") && text.includes("keep too"));
 });
 
 test("tools drop mode removes prefixed tools but keeps core, used, and protected", () => {
@@ -179,6 +170,24 @@ test("tools drop mode removes prefixed tools but keeps core, used, and protected
 	assert.ok(kept.includes("Read")); // core
 	assert.ok(kept.includes("tavily_search")); // used in conversation
 	assert.deepEqual(droppedTools.sort(), ["ctx_index", "htb_app_whoami", "mcpwn_run"]);
+});
+
+test("alwaysFull and never are threaded into the skill catalog rewrite", () => {
+	const payload = {
+		messages: [{ role: "user", content: "recover an RSA key" }],
+		system: [
+			{ type: "text", text: catalogText() },
+		],
+	};
+	const { next, selected } = optimize(payload, { ...BASE, topK: 1, alwaysFull: ["tcpdump"], never: ["hashcat"] }) as {
+		next: { system: Array<{ text: string }> };
+		selected: string[];
+	};
+	const cat = next.system[0].text;
+	assert.ok(!cat.includes("<name>hashcat</name>")); // never → removed entirely
+	assert.ok(cat.includes("Packet capture")); // alwaysFull tcpdump kept full
+	assert.ok(selected.includes("rsactftool")); // ranked
+	assert.ok(selected.includes("tcpdump")); // alwaysFull
 });
 
 test("tools relevance mode keeps core + top-K relevant of the rest", () => {

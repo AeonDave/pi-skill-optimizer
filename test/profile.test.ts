@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { normalizeProfile } from "../src/profile.ts";
+import { diffSkills, hashSkill, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope } from "../src/profile.ts";
 import { normalizeUsageFile, recordSkillUsage, selectPinnedSkills, selectUsageRecordSkills, toUsageFile, usageRecordSignature } from "../src/usage.ts";
 
 test("normalizeProfile accepts enhanced init output and drops malformed fields", () => {
@@ -16,6 +16,111 @@ test("normalizeProfile accepts enhanced init output and drops malformed fields",
 	assert.deepEqual(profile.queries.hashcat, ["crack ntlm", "offline password recovery"]);
 	assert.deepEqual(profile.clusters.crypto, ["rsactftool", "openssl"]);
 	assert.deepEqual(profile.negativeHints.tcpdump, ["python tests"]);
+});
+
+test("mergeProfiles unions aliases, critical, and name-keyed records (project extends global)", () => {
+	const global = normalizeProfile({
+		aliases: { apk: ["android"] },
+		critical: ["test-driven-development"],
+		queries: { hashcat: ["crack ntlm"] },
+		clusters: { crypto: ["openssl"] },
+		negativeHints: { tcpdump: ["python tests"] },
+	});
+	const project = normalizeProfile({
+		aliases: { apk: ["mobile"], deploy: ["release"] },
+		critical: ["my-project-skill"],
+		queries: { "my-project-skill": ["run the project pipeline"] },
+		clusters: { crypto: ["rsactftool"] },
+	});
+	const merged = mergeProfiles(global, project);
+	assert.deepEqual(merged.aliases.apk.sort(), ["android", "mobile"]);
+	assert.deepEqual(merged.aliases.deploy, ["release"]);
+	assert.deepEqual(merged.critical.sort(), ["my-project-skill", "test-driven-development"]);
+	assert.deepEqual(merged.queries["my-project-skill"], ["run the project pipeline"]);
+	assert.deepEqual(merged.clusters.crypto.sort(), ["openssl", "rsactftool"]);
+});
+
+test("splitProfileByScope routes project-skill entries to the project slice, keeps aliases global", () => {
+	const profile = normalizeProfile({
+		aliases: { apk: ["android"] },
+		critical: ["test-driven-development", "my-project-skill"],
+		queries: { hashcat: ["crack ntlm"], "my-project-skill": ["deploy demo"] },
+		clusters: { mix: ["hashcat", "my-project-skill"] },
+		negativeHints: { "my-project-skill": ["unrelated"] },
+	});
+	const { global, project } = splitProfileByScope(profile, new Set(["my-project-skill"]));
+
+	assert.deepEqual(global.aliases.apk, ["android"]);
+	assert.deepEqual(global.critical, ["test-driven-development"]);
+	assert.ok("hashcat" in global.queries);
+	assert.ok(!("my-project-skill" in global.queries));
+	assert.deepEqual(global.clusters.mix, ["hashcat"]);
+
+	assert.deepEqual(project.aliases, {});
+	assert.deepEqual(project.critical, ["my-project-skill"]);
+	assert.deepEqual(project.queries["my-project-skill"], ["deploy demo"]);
+	assert.deepEqual(project.clusters.mix, ["my-project-skill"]);
+	assert.deepEqual(project.negativeHints["my-project-skill"], ["unrelated"]);
+});
+
+test("hashSkill is stable for same input and changes when description changes", () => {
+	const a = hashSkill("rsactftool", "RSA recovery tool.");
+	assert.equal(a, hashSkill("rsactftool", "RSA recovery tool."));
+	assert.notEqual(a, hashSkill("rsactftool", "RSA recovery tool. Updated."));
+});
+
+test("diffSkills detects new, modified, and removed skills", () => {
+	const stored = {
+		rsactftool: hashSkill("rsactftool", "RSA recovery tool."),
+		hashcat: hashSkill("hashcat", "GPU cracking."),
+	};
+	const current = [
+		{ name: "rsactftool", description: "RSA recovery tool." }, // unchanged
+		{ name: "hashcat", description: "GPU cracking. Now with more formats." }, // modified
+		{ name: "nmap", description: "Port scanner." }, // new
+	];
+	const { changed, removed, hashes } = diffSkills(current, stored);
+	assert.deepEqual(changed.sort(), ["hashcat", "nmap"]);
+	assert.deepEqual(removed, []);
+	assert.equal(Object.keys(hashes).length, 3);
+
+	// dropping hashcat from the catalog marks it removed
+	const { removed: removed2 } = diffSkills([{ name: "rsactftool", description: "RSA recovery tool." }], stored);
+	assert.deepEqual(removed2, ["hashcat"]);
+});
+
+test("pruneProfileNames strips removed skills from critical, queries, clusters, hints", () => {
+	const profile = normalizeProfile({
+		aliases: { apk: ["android"] },
+		critical: ["a", "b"],
+		queries: { a: ["qa"], b: ["qb"] },
+		clusters: { topic: ["a", "b"] },
+		negativeHints: { b: ["nb"] },
+	});
+	const out = pruneProfileNames(profile, ["b"]);
+	assert.deepEqual(out.critical, ["a"]);
+	assert.ok(!("b" in out.queries));
+	assert.deepEqual(out.clusters.topic, ["a"]);
+	assert.ok(!("b" in out.negativeHints));
+	assert.deepEqual(out.aliases.apk, ["android"]); // aliases left (runtime-filtered)
+});
+
+test("mergeIncrementalProfile replaces changed skills and keeps the rest", () => {
+	const base = normalizeProfile({
+		critical: ["keep", "was"],
+		queries: { keep: ["old keep"], was: ["old was"] },
+		negativeHints: { was: ["old hint"] },
+	});
+	const partial = normalizeProfile({
+		critical: [], // 'was' is changed and the model no longer marks it critical
+		queries: { was: ["new was"] },
+	});
+	const out = mergeIncrementalProfile(base, partial, ["was"]);
+	assert.deepEqual(out.queries.keep, ["old keep"]); // unchanged kept
+	assert.deepEqual(out.queries.was, ["new was"]); // changed replaced
+	assert.ok(out.critical.includes("keep")); // unchanged critical kept
+	assert.ok(!out.critical.includes("was")); // changed skill demoted per partial
+	assert.ok(!("was" in out.negativeHints)); // changed skill's stale hint dropped (none in partial)
 });
 
 test("usage stats record and select pinned skills by frequency plus recency", () => {
