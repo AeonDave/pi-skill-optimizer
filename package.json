@@ -1,21 +1,37 @@
 {
   "name": "pi-skill-optimizer",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": false,
   "type": "module",
-  "description": "A Pi extension that slims the system prompt before each request (strips the <available_skills> catalog and other configured blocks) to cut input-token cost.",
+  "description": "A Pi extension that cuts input-token cost every request — slims the <available_skills> catalog, the tools array, and noisy tool output — without hiding your skills. Provider-agnostic, config-driven, cross-OS.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "optimization",
     "tokens",
     "skills",
-    "system-prompt"
+    "system-prompt",
+    "tool-output",
+    "mcp"
   ],
   "license": "MIT",
+  "author": "AeonDave",
+  "homepage": "https://github.com/AeonDave/pi-skill-optimizer#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AeonDave/pi-skill-optimizer.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AeonDave/pi-skill-optimizer/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
