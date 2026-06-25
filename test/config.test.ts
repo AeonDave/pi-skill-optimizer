@@ -116,6 +116,7 @@ test("output reduction defaults to smart-on, overridable via config/env", () => 
 		assert.equal(def.maxLines, 400);
 		assert.equal(def.model, ""); // empty -> selected model
 		assert.ok(def.extractExclude.includes("cat")); // pure-dump default excluded from extract
+		assert.equal(def.disableWithRtk, true); // auto-coexist with rtk by default
 		process.env.PI_SKILL_OPTIMIZER_OUTPUT = "off";
 		assert.equal(getOutputConfig(cwd).mode, "off");
 		process.env.PI_SKILL_OPTIMIZER_OUTPUT = "extract";

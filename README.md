@@ -57,7 +57,8 @@ is lost.
   "outputMaxLines": 400,       // only reduce results larger than this
   "outputTools": ["bash"],     // which tools' results to reduce
   "outputModel": "",           // extract: "provider/id" or empty = selected model
-  "outputExtractExclude": ["cat","ls","head","tail","tree","find","dir","type"]
+  "outputExtractExclude": ["cat","ls","head","tail","tree","find","dir","type"],
+  "outputDisableWithRtk": true  // auto-off if an rtk extension is loaded
 }
 ```
 
@@ -66,6 +67,25 @@ is lost.
 - **`extract`** asks a model to return only the **verbatim lines relevant to the
   originating request** (no prose). Errors stay verbatim; fails open to `smart`;
   pure data-dump commands (`outputExtractExclude`) stay on `smart`.
+
+### Compatibility with `rtk`-style extensions (auto-deactivation)
+
+**Declared compatible with any `rtk`-named extension** — e.g.
+[`pi-rtk-optimizer`](https://github.com/MasuRii/pi-rtk-optimizer) (which wraps the
+[`rtk`](https://github.com/rtk-ai/rtk) CLI). Detection is **generic**: any loaded
+extension whose registered command name/path/source contains `rtk` is recognized.
+
+When one is present, this plugin **automatically deactivates only its tool-output
+reduction** (that extension does its own output compaction), avoiding
+double-processing. The **skills catalog and tools-array slimming stay active** —
+they don't overlap with rtk. Override with `outputDisableWithRtk: false` to run
+both output reducers anyway. The `/skill-optimizer` diagnostics shows when output
+is auto-disabled due to a detected rtk extension.
+
+**Recommended combo:** they optimize different axes and stack cleanly — this
+plugin slims the **system prompt** (skills catalog + tools array, every turn),
+rtk slims **command output** (git/test/grep/…, per command). Run both; output
+reduction here steps aside automatically.
 
 ## Install
 
@@ -138,7 +158,8 @@ it (project wins). **Resolution: env var > project file > global file > default.
   "outputMaxLines": 400,
   "outputTools": ["bash"],
   "outputModel": "",
-  "outputExtractExclude": ["cat","ls","head","tail","tree","find","dir","type"]
+  "outputExtractExclude": ["cat","ls","head","tail","tree","find","dir","type"],
+  "outputDisableWithRtk": true
 }
 ```
 

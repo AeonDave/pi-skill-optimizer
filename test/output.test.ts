@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildExtractPrompt, commandProgram, isExcludedCommand, mergeExtracted, reduceOutput, signalLines } from "../src/output.ts";
+import { buildExtractPrompt, commandProgram, isExcludedCommand, isRtkSource, mergeExtracted, reduceOutput, signalLines } from "../src/output.ts";
 
 test("small output is returned unchanged", () => {
 	const text = "line1\nline2\nline3";
@@ -53,6 +53,14 @@ test("reduction is a no-op when it would not actually shrink", () => {
 	const r = reduceOutput(text, { maxLines: 1, maxBytes: 1, headLines: 0, tailLines: 0 });
 	assert.equal(r.reduced, false);
 	assert.equal(r.text, text);
+});
+
+test("isRtkSource detects an rtk extension by path/source/name, not unrelated ones", () => {
+	assert.equal(isRtkSource("rtk", "C:/Users/x/.pi/agent/extensions/pi-rtk-optimizer/index.ts", ""), true);
+	assert.equal(isRtkSource("", "", "npm:pi-rtk-optimizer"), true);
+	assert.equal(isRtkSource("rtk", "", ""), true);
+	assert.equal(isRtkSource("skill-optimizer", "/x/pi-skill-optimizer/index.ts", ""), false);
+	assert.equal(isRtkSource("network", "", ""), false); // 'rtk' not a standalone word
 });
 
 test("commandProgram resolves the program name (env assigns, sudo, paths, .exe)", () => {

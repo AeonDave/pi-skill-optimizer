@@ -25,7 +25,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { setUserAliasCandidates } from "./aliases.ts";
 import { ensureGlobalConfigTemplate, getConfig, getConfigPaths, getOutputConfig, getPinnedTopK, getProfilePaths, getScopeProviders, getStatsFilePath, getUsageFilePath, isDisabled } from "./config.ts";
-import { buildExtractPrompt, isExcludedCommand, mergeExtracted, reduceOutput, signalLines } from "./output.ts";
+import { buildExtractPrompt, isExcludedCommand, isRtkSource, mergeExtracted, reduceOutput, signalLines } from "./output.ts";
 import { optimize } from "./optimize.ts";
 import { diffSkills, EMPTY_PROFILE, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope, type SkillOptimizerProfile } from "./profile.ts";
 import { normalizeUsageFile, recordSkillUsage, selectPinnedSkills, selectUsageRecordSkills, toUsageFile, usageRecordSignature, type SkillUsageStats } from "./usage.ts";
@@ -447,6 +447,21 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	// query-aware "intelligent grep" via a weak same-provider model (fails open to
 	// `smart`). Errors stay verbatim and the full output is saved to a temp file.
 	// Off by default; opt in via config `outputMode`.
+	// Detect a coexisting `rtk`-named extension (it has its own output compaction).
+	let rtkPresence: boolean | undefined;
+	const rtkExtensionPresent = (): boolean => {
+		if (rtkPresence !== undefined) return rtkPresence;
+		rtkPresence = false;
+		try {
+			const getCommands = (pi as { getCommands?: () => Array<{ name?: string; source?: string; sourceInfo?: { path?: string; source?: string } }> }).getCommands;
+			const commands = typeof getCommands === "function" ? getCommands.call(pi) : [];
+			rtkPresence = commands.some((c) => isRtkSource(c.name ?? "", c.sourceInfo?.path ?? "", c.sourceInfo?.source ?? c.source ?? ""));
+		} catch {
+			rtkPresence = false;
+		}
+		return rtkPresence;
+	};
+
 	const saveFullOutput = (text: string): string => {
 		try {
 			const file = join(tmpdir(), `sko-output-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
@@ -461,6 +476,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		if (isDisabled(ctx.cwd)) return;
 		const outCfg = getOutputConfig(ctx.cwd);
 		if (outCfg.mode === "off") return;
+		// Coexist with rtk: it already compacts tool output, so skip ours to avoid double-processing.
+		if (outCfg.disableWithRtk && rtkExtensionPresent()) return;
 		const toolName = String(event.toolName ?? "").toLowerCase();
 		if (!outCfg.tools.some((t) => t.toLowerCase() === toolName)) return;
 		const evt = event as { content?: unknown; input?: unknown };
@@ -535,7 +552,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				`  config:         ${configLocations}`,
 				`  skills mode:    ${config.mode}${config.mode === "hybrid" ? ` (top ${config.topK}, tail ${config.tail})` : ""}`,
 				`  tools mode:     ${config.toolsMode}${config.toolsMode === "drop" ? ` (${config.toolsDropPrefixes.join(", ") || "no prefixes set"})` : config.toolsMode === "relevance" ? ` (top ${config.toolsTopK} + core + used)` : ""}`,
-				`  output mode:    ${(() => { const o = getOutputConfig(ctx.cwd); return o.mode === "off" ? "off" : `${o.mode} (>${o.maxLines} lines; tools: ${o.tools.join(", ")})`; })()}`,
+				`  output mode:    ${(() => { const o = getOutputConfig(ctx.cwd); if (o.mode === "off") return "off"; if (o.disableWithRtk && rtkExtensionPresent()) return `off (rtk extension detected; set outputDisableWithRtk:false to override)`; return `${o.mode} (>${o.maxLines} lines; tools: ${o.tools.join(", ")})`; })()}`,
 				`  scope:          ${providers ? providers.join(", ") : "all providers"}`,
 				`  profile:        ${profileSummary(activeProfile)} (${profileLocations})`,
 				`  pinned:         ${selectPinnedSkills(usageStats, getPinnedTopK(ctx.cwd)).join(", ") || "none"} (${usageCount(usageStats)} tracked, ${usagePath})`,

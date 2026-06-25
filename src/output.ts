@@ -53,6 +53,11 @@ export const DEFAULT_OUTPUT_OPTIONS: OutputReduceOptions = {
 	patterns: DEFAULT_OUTPUT_PATTERNS,
 };
 
+/** True when a registered command looks like it comes from an `rtk` extension (name/path/source). */
+export function isRtkSource(name: string, path: string, source: string): boolean {
+	return /rtk/i.test(path) || /rtk/i.test(source) || /\brtk\b/i.test(name);
+}
+
 /** Best-effort program name of a shell command (strips env assigns, sudo/env/time, path, .exe). */
 export function commandProgram(command: string): string {
 	let s = command.trim();

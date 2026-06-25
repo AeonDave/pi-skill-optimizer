@@ -74,6 +74,9 @@ export const DEFAULTS = {
 	// `extract` mode: commands whose program name is in this list use deterministic
 	// `smart` instead of the model — for pure data dumps you want kept verbatim.
 	outputExtractExclude: ["cat", "ls", "head", "tail", "tree", "find", "dir", "type"] as readonly string[],
+	// Auto-disable tool-output reduction when another loaded extension named like
+	// `rtk` is present (it has its own output compaction) to avoid double-processing.
+	outputDisableWithRtk: true,
 };
 
 export interface OutputConfig {
@@ -84,6 +87,8 @@ export interface OutputConfig {
 	model: string;
 	/** `extract` mode: program names that downgrade to deterministic `smart`. */
 	extractExclude: readonly string[];
+	/** Auto-disable output reduction when an `rtk`-named extension is also loaded. */
+	disableWithRtk: boolean;
 }
 
 function warn(message: string): void {
@@ -242,12 +247,17 @@ export function getOutputConfig(cwd = process.cwd()): OutputConfig {
 	const modelEnv = process.env.PI_SKILL_OPTIMIZER_OUTPUT_MODEL?.trim();
 	const model = modelEnv || (typeof file.outputModel === "string" ? file.outputModel.trim() : "");
 	const exclude = pickStringArray("PI_SKILL_OPTIMIZER_OUTPUT_EXCLUDE", file.outputExtractExclude);
+	const rawDwr = process.env.PI_SKILL_OPTIMIZER_OUTPUT_DISABLE_WITH_RTK?.trim().toLowerCase();
+	let disableWithRtk = DEFAULTS.outputDisableWithRtk;
+	if (rawDwr) disableWithRtk = ["1", "true", "yes", "on"].includes(rawDwr);
+	else if (typeof file.outputDisableWithRtk === "boolean") disableWithRtk = file.outputDisableWithRtk;
 	return {
 		mode,
 		maxLines: pickInt("PI_SKILL_OPTIMIZER_OUTPUT_MAX_LINES", file.outputMaxLines, DEFAULTS.outputMaxLines),
 		tools: tools.length > 0 ? tools : DEFAULTS.outputTools,
 		model,
 		extractExclude: exclude.length > 0 ? exclude : DEFAULTS.outputExtractExclude,
+		disableWithRtk,
 	};
 }
 
@@ -301,6 +311,7 @@ export function defaultConfigJson(): string {
 		outputTools: DEFAULTS.outputTools as string[], // which tool results to reduce
 		outputModel: DEFAULTS.outputModel, // extract mode: weak model id ("provider/id" or bare id)
 		outputExtractExclude: DEFAULTS.outputExtractExclude as string[], // extract: program names kept on deterministic smart
+		outputDisableWithRtk: DEFAULTS.outputDisableWithRtk, // auto-off output reduction if an rtk extension is loaded
 	};
 	return `${JSON.stringify(template, null, 2)}\n`;
 }
