@@ -41,8 +41,12 @@ export interface OptimizeConfig {
 
 export interface OptimizeResult {
 	next: unknown;
-	/** Net characters removed across system + tools. */
+	/** Net characters removed total (skills catalog + tools array). */
 	removed: number;
+	/** Chars removed by the skills-catalog rewrite (system / systemInstruction / instructions / messages / tool descriptions). */
+	removedSkills: number;
+	/** Chars removed by slimming the `tools` array. */
+	removedTools: number;
 	/** Skill names kept at full description on the last system/tool block processed. */
 	selected: string[];
 	/** Tool names dropped from the `tools` array. */
@@ -51,10 +55,16 @@ export interface OptimizeResult {
 
 interface RequestBody {
 	system?: unknown;
+	/** Google Gemini system prompt location. */
+	systemInstruction?: unknown;
+	/** OpenAI Responses system prompt location. */
+	instructions?: unknown;
 	tools?: unknown;
 	messages?: unknown;
 	[key: string]: unknown;
 }
+
+const SYSTEM_ROLES = new Set(["system", "developer"]);
 
 interface SystemTextBlock {
 	type: "text";
@@ -118,58 +128,122 @@ function hasWork(config: OptimizeConfig): boolean {
 }
 
 /**
- * Slim the system prompt + tool descriptions of an Anthropic-style request body.
- * Returns the original reference (and `removed: 0`) when nothing changed.
- * Pure and idempotent.
+ * Slim the skills catalog + tool descriptions + `tools` array of a request body.
+ * Provider-agnostic: scans the Anthropic `system`, the Gemini `systemInstruction`,
+ * the OpenAI Responses `instructions`, and any `messages` entry with a system or
+ * developer role, plus tool descriptions. Returns the original reference (and
+ * `removed: 0`) when nothing changed. Pure and idempotent.
  */
 export function optimize(payload: unknown, config: OptimizeConfig): OptimizeResult {
 	if (!payload || typeof payload !== "object" || !hasWork(config)) {
-		return { next: payload, removed: 0, selected: [], droppedTools: [] };
+		return { next: payload, removed: 0, removedSkills: 0, removedTools: 0, selected: [], droppedTools: [] };
 	}
 	const typed = payload as RequestBody;
 	const query = config.mode === "hybrid" || config.toolsMode === "relevance" ? extractQuery(typed.messages) : "";
 
-	let removed = 0;
+	let removedSkills = 0;
+	let removedTools = 0;
 	let changed = false;
-	let selected: string[] = [];
 	let droppedTools: string[] = [];
+	const selected: string[] = [];
 	const addSelected = (names: readonly string[]): void => {
 		for (const name of names) {
 			if (!selected.includes(name)) selected.push(name);
 		}
 	};
-
-	const normalizedSystem = normalizeSystem(typed.system);
-	let systemChanged = false;
-	const newSystemBlocks = normalizedSystem.blocks.map((block) => {
-		if (!isSystemTextBlock(block)) return block;
-		const r = transformText(block.text, query, config);
-		if (r.text === block.text) return block;
-		removed += block.text.length - r.text.length;
+	/** Rewrite a plain string field; returns the new string (or the same when unchanged). */
+	const rewriteString = (value: string): string => {
+		const r = transformText(value, query, config);
+		if (r.text === value) return value;
+		removedSkills += value.length - r.text.length;
 		addSelected(r.selected);
 		changed = true;
-		systemChanged = true;
-		return { ...block, text: r.text };
-	});
+		return r.text;
+	};
 
-	// 1) rewrite the skills catalog where it lives in a tool description
+	const next: RequestBody = { ...typed };
+
+	// Anthropic `system` (string | text block | array of text blocks)
+	const normalizedSystem = normalizeSystem(typed.system);
+	if (normalizedSystem.shape !== "none") {
+		let systemChanged = false;
+		const blocks = normalizedSystem.blocks.map((block) => {
+			if (!isSystemTextBlock(block)) return block;
+			const text = rewriteString(block.text);
+			if (text === block.text) return block;
+			systemChanged = true;
+			return { ...block, text };
+		});
+		if (systemChanged) next.system = restoreSystem(typed.system, normalizedSystem, blocks);
+	}
+
+	// Gemini `systemInstruction` (string | { parts: [{ text }] })
+	if (typeof typed.systemInstruction === "string") {
+		next.systemInstruction = rewriteString(typed.systemInstruction);
+	} else if (typed.systemInstruction && typeof typed.systemInstruction === "object") {
+		const si = typed.systemInstruction as { parts?: unknown };
+		if (Array.isArray(si.parts)) {
+			let partsChanged = false;
+			const parts = si.parts.map((p) => {
+				if (!p || typeof p !== "object" || typeof (p as { text?: unknown }).text !== "string") return p;
+				const pt = p as { text: string };
+				const text = rewriteString(pt.text);
+				if (text === pt.text) return p;
+				partsChanged = true;
+				return { ...pt, text };
+			});
+			if (partsChanged) next.systemInstruction = { ...si, parts };
+		}
+	}
+
+	// OpenAI Responses `instructions` (string)
+	if (typeof typed.instructions === "string") {
+		next.instructions = rewriteString(typed.instructions);
+	}
+
+	// OpenAI / Mistral system|developer messages
+	if (Array.isArray(typed.messages)) {
+		let messagesChanged = false;
+		const messages = typed.messages.map((m) => {
+			if (!m || typeof m !== "object") return m;
+			const msg = m as { role?: unknown; content?: unknown };
+			if (typeof msg.role !== "string" || !SYSTEM_ROLES.has(msg.role)) return m;
+			if (typeof msg.content === "string") {
+				const content = rewriteString(msg.content);
+				if (content === msg.content) return m;
+				messagesChanged = true;
+				return { ...msg, content };
+			}
+			if (Array.isArray(msg.content)) {
+				let blockChanged = false;
+				const content = msg.content.map((b) => {
+					if (!b || typeof b !== "object" || typeof (b as { text?: unknown }).text !== "string") return b;
+					const bt = b as { text: string };
+					const text = rewriteString(bt.text);
+					if (text === bt.text) return b;
+					blockChanged = true;
+					return { ...bt, text };
+				});
+				if (!blockChanged) return m;
+				messagesChanged = true;
+				return { ...msg, content };
+			}
+			return m;
+		});
+		if (messagesChanged) next.messages = messages;
+	}
+
+	// Skills catalog inside a tool description, then slim the tools array itself
 	let newTools: unknown = typed.tools;
 	if (Array.isArray(typed.tools)) {
 		newTools = typed.tools.map((tool) => {
-			if (!tool || typeof tool !== "object" || typeof (tool as { description?: unknown }).description !== "string") {
-				return tool;
-			}
+			if (!tool || typeof tool !== "object" || typeof (tool as { description?: unknown }).description !== "string") return tool;
 			const t = tool as { description: string };
-			const r = transformText(t.description, query, config);
-			if (r.text === t.description) return tool;
-			removed += t.description.length - r.text.length;
-			addSelected(r.selected);
-			changed = true;
-			return { ...t, description: r.text };
+			const description = rewriteString(t.description);
+			if (description === t.description) return tool;
+			return { ...t, description };
 		});
 	}
-
-	// 2) slim the tools array itself (drop / relevance), guarded by core + used
 	if (config.toolsMode !== "off" && Array.isArray(newTools)) {
 		const result = optimizeTools(newTools, {
 			mode: config.toolsMode,
@@ -181,14 +255,13 @@ export function optimize(payload: unknown, config: OptimizeConfig): OptimizeResu
 		});
 		if (result.dropped.length > 0) {
 			newTools = result.tools;
-			removed += result.removed;
+			removedTools += result.removed;
 			droppedTools = result.dropped;
 			changed = true;
 		}
 	}
+	if (newTools !== typed.tools) next.tools = newTools;
 
-	if (!changed) return { next: payload, removed: 0, selected: [], droppedTools: [] };
-	const next = { ...typed, tools: newTools };
-	if (systemChanged) next.system = restoreSystem(typed.system, normalizedSystem, newSystemBlocks);
-	return { next, removed, selected, droppedTools };
+	if (!changed) return { next: payload, removed: 0, removedSkills: 0, removedTools: 0, selected: [], droppedTools: [] };
+	return { next, removed: removedSkills + removedTools, removedSkills, removedTools, selected, droppedTools };
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULTS, defaultConfigJson, getConfig, getConfigPaths, getProfilePaths, getUsageFilePath, isDisabled } from "../src/config.ts";
+import { DEFAULTS, defaultConfigJson, getConfig, getConfigPaths, getOutputConfig, getProfilePaths, getUsageFilePath, isDisabled } from "../src/config.ts";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -95,6 +95,44 @@ test("config.json: project overrides global, env overrides both", () => {
 	}
 });
 
+test("output reduction defaults to smart-on, overridable via config/env", () => {
+	// Isolate the agent dir so the developer's real global config.json is not read.
+	const agentDir = mkdtempSync(join(tmpdir(), "sko-agent-"));
+	const saved = {
+		dir: process.env.PI_CODING_AGENT_DIR,
+		m: process.env.PI_SKILL_OPTIMIZER_OUTPUT,
+		l: process.env.PI_SKILL_OPTIMIZER_OUTPUT_MAX_LINES,
+		t: process.env.PI_SKILL_OPTIMIZER_OUTPUT_TOOLS,
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	delete process.env.PI_SKILL_OPTIMIZER_OUTPUT;
+	delete process.env.PI_SKILL_OPTIMIZER_OUTPUT_MAX_LINES;
+	delete process.env.PI_SKILL_OPTIMIZER_OUTPUT_TOOLS;
+	const cwd = mkdtempSync(join(tmpdir(), "sko-cwd-"));
+	try {
+		const def = getOutputConfig(cwd);
+		assert.equal(def.mode, "smart"); // default ON (deterministic, free)
+		assert.deepEqual(def.tools, ["bash"]);
+		assert.equal(def.maxLines, 400);
+		assert.equal(def.model, ""); // empty -> selected model
+		assert.ok(def.extractExclude.includes("cat")); // pure-dump default excluded from extract
+		process.env.PI_SKILL_OPTIMIZER_OUTPUT = "off";
+		assert.equal(getOutputConfig(cwd).mode, "off");
+		process.env.PI_SKILL_OPTIMIZER_OUTPUT = "extract";
+		process.env.PI_SKILL_OPTIMIZER_OUTPUT_TOOLS = '["bash","hypa_shell"]';
+		const on = getOutputConfig(cwd);
+		assert.equal(on.mode, "extract");
+		assert.deepEqual(on.tools, ["bash", "hypa_shell"]);
+	} finally {
+		if (saved.dir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = saved.dir;
+		if (saved.m === undefined) delete process.env.PI_SKILL_OPTIMIZER_OUTPUT; else process.env.PI_SKILL_OPTIMIZER_OUTPUT = saved.m;
+		if (saved.l === undefined) delete process.env.PI_SKILL_OPTIMIZER_OUTPUT_MAX_LINES; else process.env.PI_SKILL_OPTIMIZER_OUTPUT_MAX_LINES = saved.l;
+		if (saved.t === undefined) delete process.env.PI_SKILL_OPTIMIZER_OUTPUT_TOOLS; else process.env.PI_SKILL_OPTIMIZER_OUTPUT_TOOLS = saved.t;
+		rmSync(agentDir, { recursive: true, force: true });
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("defaultConfigJson is valid JSON carrying the safe defaults", () => {
 	const parsed = JSON.parse(defaultConfigJson());
 	assert.equal(parsed.mode, DEFAULTS.mode);
@@ -103,4 +141,8 @@ test("defaultConfigJson is valid JSON carrying the safe defaults", () => {
 	assert.equal(parsed.disable, false);
 	assert.deepEqual(parsed.alwaysFull, []);
 	assert.deepEqual(parsed.never, []);
+	assert.equal(parsed.outputMode, "smart");
+	assert.deepEqual(parsed.outputTools, ["bash"]);
+	assert.equal(parsed.outputModel, "");
+	assert.ok(Array.isArray(parsed.outputExtractExclude));
 });

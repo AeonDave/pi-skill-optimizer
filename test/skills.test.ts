@@ -112,6 +112,19 @@ test("compactDescription keeps the first sentence and caps length", () => {
 	assert.ok(capped.length <= 13);
 });
 
+test("compactDescription appends the routing clause when the first sentence lacks one (#4a)", () => {
+	// first sentence has no routing signal -> append the 'Use when ...' sentence
+	const r = compactDescription("Does a thing with many words. A middle sentence to drop. Use when targeting the X case.", 200);
+	assert.ok(r.includes("Does a thing with many words."));
+	assert.ok(r.includes("Use when targeting the X case."));
+	assert.ok(!r.includes("A middle sentence to drop"));
+	// first sentence already carries routing -> no duplication
+	const r2 = compactDescription("Use when reviewing Python code. Extra detail here.", 200);
+	assert.equal(r2, "Use when reviewing Python code.");
+	// no routing clause at all -> just the first sentence
+	assert.equal(compactDescription("Plain first sentence. Second.", 200), "Plain first sentence.");
+});
+
 test("hybrid: relevant stays full with location, tail is name-only, all names survive", () => {
 	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
 	const { text: out, removed, selected } = transformSkillsInText(text, {
@@ -135,21 +148,35 @@ test("hybrid: relevant stays full with location, tail is name-only, all names su
 	assert.ok(!out.includes("password cracking"));
 });
 
-test("hybrid tail=intent keeps a short tail description but still drops the derivable location", () => {
-	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
+test("hybrid tail=intent keeps first sentence + routing clause, drops the derivable location", () => {
+	const long = (lead: string, route: string): string => `${lead}. A long middle sentence with plenty of extra detail that the intent tail must drop to actually save tokens here. ${route}`;
+	const text = catalog(
+		skillXml("rsactftool", "RSA testing automation tool for weak public keys. Use when targeting RSA key recovery."),
+		skillXml("hashcat", long("GPU-accelerated offline password cracking", "Use when cracking captured password hashes.")),
+		skillXml("nmap", long("Network port scanner and host discovery utility", "Use when mapping a network.")),
+		skillXml("sqlmap", long("Automated SQL injection detection and exploitation", "Use when testing SQL injection.")),
+		skillXml("ffuf", long("Fast web fuzzer for content discovery", "Use when fuzzing endpoints.")),
+	);
 	const { text: out } = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "intent", query: "RSA key recovery" });
-	assert.ok(out.includes("GPU-accelerated offline password cracking")); // tail intent description
+	assert.ok(out.includes("GPU-accelerated offline password cracking")); // first sentence kept
+	assert.ok(out.includes("Use when cracking captured password hashes")); // routing clause kept (#4a)
+	assert.ok(!out.includes("A long middle sentence with plenty of extra detail")); // middle sentence dropped
 	assert.ok(!out.includes("C:/skills/hashcat/SKILL.md")); // location still dropped
 });
 
-test("compact renders every skill as a short intent tail with a path note", () => {
-	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
+test("compact renders every skill as a short intent tail with a path note, keeping routing clauses", () => {
+	const text = catalog(
+		skillXml("python-patterns", "Pythonic patterns and best practices for writing readable Python code across many files. A long extra sentence of detail that compact should drop from the middle. Use when reviewing Python."),
+		skillXml("tcpdump", "Command-line packet capture and network traffic analysis with assorted long extra detail to make this description clearly longer than its compact intent form."),
+	);
 	const { text: out, selected } = transformSkillsInText(text, { mode: "compact", topK: 0, tail: "name", query: "" });
 	assert.deepEqual(selected, []);
-	for (const [n] of SAMPLE) assert.ok(out.includes(`<name>${n}</name>`));
+	assert.ok(out.includes("<name>python-patterns</name>"));
+	assert.ok(out.includes("<name>tcpdump</name>"));
 	assert.ok(out.includes("<skill_path_note>"));
 	assert.ok(!out.includes("C:/skills/tcpdump/SKILL.md")); // per-entry locations dropped
-	assert.ok(!out.includes("Use when reviewing Python")); // second sentence trimmed off the intent
+	assert.ok(out.includes("Use when reviewing Python")); // routing clause kept (#4a)
+	assert.ok(!out.includes("long extra sentence of detail")); // middle sentence dropped
 });
 
 test("hybrid keeps profile-critical and pinned skills full", () => {

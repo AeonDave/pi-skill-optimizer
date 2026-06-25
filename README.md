@@ -1,204 +1,115 @@
 # pi-skill-optimizer
 
-A [Pi](https://github.com/earendil-works/pi-mono) extension that **slims the
-system prompt** before every request to cut input-token cost — without hiding
-your skills from the model.
+A [Pi](https://github.com/earendil-works/pi-mono) extension that cuts
+**input-token cost** every request — slimming the `<available_skills>` catalog,
+the `tools` array, and noisy tool output — **without hiding your skills** from
+the model.
 
 ## Why
 
-Pi inlines an `<available_skills>` catalog into the system prompt of every
-request — one `<skill>` entry (name, description, location) per installed skill.
-This is the Level-1 *discovery* layer of [Anthropic's progressive-disclosure
-design](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills):
-enough for the model to know a skill exists, without loading its body. With a
-large install (a few hundred skills) it is the single biggest input-token cost
-and it repeats **every turn** — often tens of thousands of tokens and the
-majority of the system prompt.
+Pi inlines an `<available_skills>` catalog (name, description, location per skill)
+into the system prompt of **every** request. With a few hundred skills that is
+tens of thousands of tokens, repeated each turn — usually the biggest input cost.
+This extension rewrites it intelligently instead of nuking it, and adds two more
+token levers (tools array, tool output).
 
-Instead of nuking the catalog (and losing skill discovery), this extension
-**rewrites it intelligently**.
+## Optimizations at a glance
 
-## What it does (modes)
+| Optimization | Gain | Loss / risk | Resilience | Notes |
+|---|---|---|---|---|
+| **Skills — `hybrid`** (default) | **~67%** of catalog | none — every skill stays discoverable **and** loadable | fuzz 3k queries: **0 dropped, 100% loadable**, deterministic; critical/pinned/alwaysFull always full | BM25 rank over full descriptions; top-K full, rest name-only + **one shared path note** |
+| **Skills — `compact`** | ~20% | none | query-independent → **cache-stable** | every skill kept, trimmed to intent + routing clause |
+| **Tools array — `drop` / `relevance`** (opt-in) | most remaining MCP tool tokens | a dropped tool isn't callable this turn | core tools + already-used tools **never** dropped | off by default; `drop` is deterministic/cache-stable |
+| **Tool output — `smart`** (default) | **~73–88%** on noisy output | none — full output saved to a temp file | errors/stack/exit-code always kept; **no silent loss** (counted elision); deterministic | free, cache-stable, cross-OS, CRLF-safe |
+| **Tool output — `extract`** (opt-in) | **~90–99%** on big *data*, request-ready | latency + tokens, non-deterministic | **fails open to `smart`**; errors verbatim; full output on temp file; data-dump cmds excluded | LLM "intelligent grep" via the selected model |
 
-On `before_provider_request`, for the `<available_skills>` catalog (in the system
-prompt *or* a tool description):
+Supporting: **provider-agnostic** (works on Anthropic / Gemini / OpenAI / Mistral
+payloads), **granular savings telemetry** (`/skill-optimizer`), and an
+**incremental `init`**. Reproduce with `npm run bench`.
 
-| `mode` | Behaviour | Discovery |
-|--------|-----------|-----------|
-| `hybrid` (default) | BM25-rank skills against the request query; keep relevant, pinned, critical, and `alwaysFull` skills at full description + explicit `<location>`; render the rest as the `tail` style with the location replaced by one shared path note. | Full + loadable — every skill stays loadable |
-| `compact` | Keep **every** skill, trim each description to its intent sentence; locations replaced by the shared path note. | Full + short intent |
-| `off` | Leave the catalog untouched. | Full |
+## Discovery is never lost
 
-The ranking (`hybrid`) is dependency-free BM25 lexical retrieval over the catalog
-itself, with name-match boosts and catalog-filtered aliases. **Scoring runs over
-the full descriptions**, so a relevant skill is promoted to full even when the
-rendered tail is name-only. Selection is adaptive: ambiguous close-score queries
-keep a few more full descriptions. Pinned skills (local usage), critical skills
-(`/skill-optimizer init`), and your `alwaysFull` list also stay full.
+- **`hybrid`/`compact` keep every skill name.** Tail skills drop only their
+  derivable `<location>`, replaced by one `<skill_path_note>` declaring the roots
+  (`<root>/<name>/SKILL.md`) — the model can still load any of them. Irregular
+  paths keep an explicit `<location>`.
+- **`/skill:name` is unaffected** — Pi expands it from the on-disk registry,
+  independent of the catalog.
+- **`never`** removes skills you don't want; **`off`** leaves the catalog untouched.
 
 ### Behavioural / always-on skills
 
-Some skills are *behavioural*: operator-mode or discipline skills that should
-apply in **every** session (planning, verification, evidence, code guidelines, an
-operator mode that "forces explicit reasoning"). Relevance ranking can never
-surface them from a task query — they share no keywords with the task. This is
-handled **at `init` time**: the model classifies always-on behavioural skills
-into `critical`, which is always rendered full. Opt-in/triggered modes (e.g. a
-`/vault` mode that assumes an external app) are deliberately excluded. `alwaysFull`
-is only a manual user override on top of that, not the mechanism for behavioural
-skills.
+Operator-mode and discipline skills (planning, verification, "forces explicit
+reasoning") never match a task query by keyword. `init` classifies these into
+`critical` (always rendered full); opt-in/triggered modes are excluded.
+`alwaysFull` is a manual override on top.
 
-### Why the default is `tail: name` and there is no `keepLocations` toggle
+## Tool-output reduction
 
-The catalog cost splits roughly into **descriptions ~60%, locations ~24%, names
-~9%**. A tail skill (one the ranker judged irrelevant for this query) needs a
-name to stay discoverable, but its *full path* is pure repetition: every skill
-lives at `<root>/<name>/SKILL.md` under a handful of roots. So instead of a
-`keepLocations` boolean (which created an incoherent "described but unloadable"
-state), the optimizer:
+Shrinks noisy tool output (e.g. long `bash` stdout) **transparently** at
+`tool_result` time — no native binary, no tool calls, pure TS, cross-OS. The
+**full output is always saved to a temp file** and referenced inline, so nothing
+is lost.
 
-- keeps the **explicit `<location>`** on full (selected) skills, and
-- drops the derivable location on tail skills, replacing all of them with **one
-  `<skill_path_note>`** that declares the roots — so every tail skill is still
-  loadable (the model derives the path), at ~100 tokens instead of ~6K.
+```jsonc
+{
+  "outputMode": "smart",       // off | smart | extract
+  "outputMaxLines": 400,       // only reduce results larger than this
+  "outputTools": ["bash"],     // which tools' results to reduce
+  "outputModel": "",           // extract: "provider/id" or empty = selected model
+  "outputExtractExclude": ["cat","ls","head","tail","tree","find","dir","type"]
+}
+```
 
-Irregular paths that don't match the convention keep their explicit `<location>`.
-Net: name-only tail + path note is both the cheapest **and** a fully-loadable,
-consistent layout.
-
-> [!NOTE]
-> Pi has **no `Skill` tool**: the model discovers a skill from the
-> `<available_skills>` catalog and loads it by `read`-ing its `<location>` path.
-> **Explicit `/skill:name` invocation is unaffected** — Pi expands it from the
-> on-disk registry before the request is built, independent of the catalog.
-> Skills listed in `never` are removed from the catalog entirely.
-
-## Measured savings
-
-Reproducible, machine-independent numbers from `npm run bench` (a synthetic
-~280-skill catalog; descriptions dominate the cost, locations are next):
-
-| config | saved | selection quality | discovery |
-|--------|------:|-------------------|-----------|
-| `off` | 0% | — | full |
-| `compact` | ~40% | n/a (no ranking) | every skill + short intent + path note |
-| `hybrid` `tail: intent` | ~35% | P=100%, recall full | top-K full + intent tail + path note |
-| **`hybrid` `tail: name` (default)** | **~67%** | **P=100%, recall full** | **top-K full + name-only tail + path note (all loadable)** |
-
-Across a 3000-query fuzz pass: **0** skills ever dropped, **100%** of skills stay
-loadable, behavioural/critical skills are kept full every time, output is
-deterministic, and average savings are ~70%. Run `npm run bench` to reproduce,
-or `npm run measure <capture.json>` for exact numbers on a captured real request.
-
-### `tail: name` vs `tail: intent`
-
-The `tail` style only changes how **non-selected** skills are rendered — it does
-**not** change which skills are selected (scoring always runs over the full
-descriptions). In the benchmark both styles give the **same selection quality**
-(P=100%, full recall) but `name` saves roughly **twice** as many tokens. So
-`name` is the default: same discovery quality, lower cost. Use `tail: intent`
-only if you want the model to read a short description for *every* skill (richer
-breadcrumbs for the long tail) and can afford ~half the savings.
-
-## Tools array (opt-in)
-
-The `tools` array (built-in + MCP tool definitions) is often *larger* than the
-skills catalog — with several MCP servers connected it can run to tens of
-thousands of tokens, most of it irrelevant to any single task.
-
-> [!WARNING]
-> **Tools are riskier than skills.** A skill removed from the catalog is still
-> invokable by name; a tool removed from `tools` is **not callable at all** — no
-> fallback within the turn. So tool slimming is **off by default** and heavily
-> guarded: core tools are never dropped, and any tool already **used in the
-> conversation** is kept (so nothing vanishes mid-task).
-
-`PI_SKILL_OPTIMIZER_TOOLS_MODE`:
-
-- `drop` (recommended): remove only the server prefixes you list — deterministic,
-  predictable, cache-stable.
-- `relevance`: keep core + used + the top-K query-relevant of the rest (dynamic;
-  a relevance miss means a tool the model wanted isn't available — use a generous
-  `TOP_K`).
-
-Combined, slimming skills (`hybrid`) and tools (`drop`/`relevance`) compounds:
-skills typically save the majority of the catalog, and dropping unused MCP server
-prefixes removes most of the remaining tool tokens. Tool relevance is targeted —
-for a "search the web and index docs" query the
-web-search and indexing MCP tools score highest and are kept, while unrelated
-servers' tools are dropped; for a task no MCP server matches, only core tools and
-skills remain.
+- **`smart`** keeps head + tail + every error/warning/stack/exit line, elides the
+  middle with a counted marker. Free, deterministic.
+- **`extract`** asks a model to return only the **verbatim lines relevant to the
+  originating request** (no prose). Errors stay verbatim; fails open to `smart`;
+  pure data-dump commands (`outputExtractExclude`) stay on `smart`.
 
 ## Install
 
 ```bash
 pi install pi-skill-optimizer
-pi list
 ```
 
-Pi provides the `@earendil-works/*` peer deps; `npm install` is only for
-development. Try it for one run: `pi -e pi-skill-optimizer`.
+Pi provides the `@earendil-works/*` peer deps. Try one run: `pi -e pi-skill-optimizer`.
 
 ## Usage
 
-Install it — it runs automatically (default `hybrid`). The footer shows
-`✂ −Nk tok` when it trims a request; `/skill-optimizer` prints diagnostics
-(mode, last savings, which skills were kept full).
+Runs automatically (default `hybrid` + output `smart`). The footer shows
+`✂ −Nk tok`; **`/skill-optimizer`** prints diagnostics and **granular telemetry**
+— tokens saved this session and lifetime, split by **skills / tools / output**
+(persisted to `~/.pi/agent/skill-optimizer/stats.json`).
 
-Optional retrieval-profile initialization:
+### `init` (optional retrieval profile)
 
 ```bash
 /skill-optimizer init
 ```
 
-This asks the current model to generate a compact retrieval profile from the
-skills loaded in this Pi session. It is then **split by skill scope**, mirroring
-how Pi loads skills:
+Generates a compact retrieval profile (aliases, synthetic queries, critical
+skills, clusters, negative hints) from the loaded skills, **split by scope**:
+global skills → `~/.pi/agent/skill-optimizer/profile.json`, project skills →
+`<cwd>/.pi/skill-optimizer/profile.json` (merged at runtime, project wins).
+Normal requests never call the model — they only load these files.
 
-- skills from the global install (`~/.pi/agent/skills`) → `~/.pi/agent/skill-optimizer/profile.json`
-- skills from the project (`<cwd>/.pi/skills`) → `<cwd>/.pi/skill-optimizer/profile.json` (only written when the project has its own skills)
-
-At runtime both files are loaded and **merged** (project extends global), then
-filtered against the active catalog. The profile contains aliases, synthetic
-user queries, critical skills, clusters, and negative hints. Normal requests do
-not call the model; they only load these local files. A global
-`~/.pi/agent/skill-optimizer/usage.json` tracks conservative usage signals
-(explicit skill mentions or real skill-tool activations, deduplicated per
-prompt) so frequently useful skills can stay full without letting the ranker
-reinforce itself. Override the layout with `PI_SKILL_OPTIMIZER_PROFILE` /
-`PI_SKILL_OPTIMIZER_USAGE` (an explicit path collapses the split onto a single
-file).
-
-### Incremental re-runs
-
-`init` is **incremental**. Each skill is hashed (name + description) and the
-hashes are stored in the profile. Re-running `/skill-optimizer init`:
-
-- sends only **new or modified** skills to the model,
-- **prunes** skills that disappeared from the catalog,
-- and is a **no-op** (no model call) when nothing changed.
-
-When the optimizer itself is upgraded and its init logic changes (an internal
-`initVersion` bump), the next `init` does a **full regeneration** automatically,
-ignoring the cached hashes — so profile semantics never drift across versions.
+`init` is **incremental** (hashes each skill): re-running processes only new/
+changed skills, prunes removed ones, and is a no-op when nothing changed. An
+internal `initVersion` bump forces a full regeneration after an upgrade.
 
 ## Configuration
 
-The primary way to configure the optimizer is a **`config.json`** file. On first
-run it auto-creates a documented template at
-`~/.pi/agent/skill-optimizer/config.json` (global). Edit it to change behaviour —
-no env vars required.
-
-For a single project, drop a `config.json` in `<project>/.pi/skill-optimizer/`;
-it is merged over the global one (**project keys win**).
+A **`config.json`** is auto-created at `~/.pi/agent/skill-optimizer/config.json`
+on first run. A project `config.json` in `<cwd>/.pi/skill-optimizer/` merges over
+it (project wins). **Resolution: env var > project file > global file > default.**
 
 ```jsonc
-// ~/.pi/agent/skill-optimizer/config.json
 {
   "disable": false,
   "mode": "hybrid",       // off | compact | hybrid
-  "topK": 20,             // hybrid: skills kept full (name + description + location)
-  "tail": "name",         // name | intent  (how the rest are rendered)
+  "topK": 20,             // hybrid: skills kept full
+  "tail": "name",         // name | intent  (how non-selected skills render)
   "alwaysFull": [],       // skill names to always keep full
   "never": [],            // skill names / "prefix*" to hide entirely
   "providers": [],        // scope to model.provider ids; [] = all
@@ -206,66 +117,45 @@ it is merged over the global one (**project keys win**).
   "toolsMode": "off",     // off | drop | relevance
   "toolsDrop": [],        // drop: tool name prefixes to remove
   "toolsTopK": 24,        // relevance: non-core tools to keep
-  "toolsProtect": []      // extra protected tool names/prefixes
+  "toolsProtect": [],     // extra protected tool names/prefixes
+  "outputMode": "smart",  // off | smart | extract
+  "outputMaxLines": 400,
+  "outputTools": ["bash"],
+  "outputModel": "",
+  "outputExtractExclude": ["cat","ls","head","tail","tree","find","dir","type"]
 }
 ```
 
-**Resolution order for every setting:** env var > project `config.json` > global
-`config.json` > built-in default. The env vars below still work and override the
-files (handy for one-off runs).
+Every key has an env override: `PI_SKILL_OPTIMIZER_<KEY>` (e.g. `MODE`, `TOP_K`,
+`TAIL`, `ALWAYS_FULL`, `NEVER`, `PROVIDERS`, `TOOLS_MODE`, `TOOLS_DROP`,
+`OUTPUT`, `OUTPUT_MODEL`, `OUTPUT_EXCLUDE`). Path overrides:
+`PI_SKILL_OPTIMIZER_{PROFILE,USAGE,STATS}`. `PI_SKILL_OPTIMIZER_DISABLE` turns it
+off entirely.
 
-| Env var | Default | Purpose |
-|---------|---------|---------|
-| `PI_SKILL_OPTIMIZER_DISABLE` | _(off)_ | Any non-empty value turns it off. |
-| `PI_SKILL_OPTIMIZER_MODE` | `hybrid` | `off` \| `compact` \| `hybrid`. |
-| `PI_SKILL_OPTIMIZER_TOP_K` | `20` | hybrid: skills kept full (name + description + location). |
-| `PI_SKILL_OPTIMIZER_TAIL` | `name` | `name` \| `intent` — how non-selected skills render. |
-| `PI_SKILL_OPTIMIZER_ALWAYS_FULL` | `[]` | JSON array of skill names to always keep full. |
-| `PI_SKILL_OPTIMIZER_NEVER` | `[]` | JSON array of skill names / `"prefix*"` to hide entirely. |
-| `PI_SKILL_OPTIMIZER_PROVIDERS` | _(all)_ | Comma list of `model.provider` ids to scope to. |
-| `PI_SKILL_OPTIMIZER_PROFILE` | `<agentDir>/skill-optimizer/profile.json` + `<cwd>/.pi/skill-optimizer/profile.json` | Override path (collapses the global/project split onto one file). |
-| `PI_SKILL_OPTIMIZER_USAGE` | `<agentDir>/skill-optimizer/usage.json` | Override path for pinned skill usage stats (global). |
-| `PI_SKILL_OPTIMIZER_PINNED_TOP_K` | `8` | Usage-derived skills always kept full. |
-| `PI_SKILL_OPTIMIZER_TOOLS_MODE` | `off` | `off` \| `drop` \| `relevance` (see Tools array above). |
-| `PI_SKILL_OPTIMIZER_TOOLS_DROP` | `[]` | `drop` mode: JSON array of tool name prefixes to remove (e.g. `["serverA_","serverB_"]`). |
-| `PI_SKILL_OPTIMIZER_TOOLS_TOP_K` | `24` | `relevance` mode: non-core tools to keep. |
-| `PI_SKILL_OPTIMIZER_TOOLS_PROTECT` | `[]` | Extra protected tool names/prefixes (on top of the core set + used tools). |
+> Tools slimming is **off by default**: a dropped tool can't be called this turn
+> (skills always can). `drop <prefixes>` is the safe, deterministic choice.
 
-```bash
-PI_SKILL_OPTIMIZER_TAIL=intent pi          # keep a short description on tail skills too
-PI_SKILL_OPTIMIZER_TOP_K=28 pi             # more full promoted skills
-PI_SKILL_OPTIMIZER_MODE=compact pi         # keep all skills at intent, cache-stable
-PI_SKILL_OPTIMIZER_PROVIDERS=claude-pro-max-native pi  # only the Claude provider
-```
-
-### Caching note
-
-`hybrid` rebuilds the catalog from the query, so the system prompt's cached
-prefix is preserved only up to the catalog; the catalog itself is recomputed per
-turn. Because the catalog shrinks ~80%, the non-cacheable segment is far smaller.
-For maximum cache stability use `compact` (query-independent) or `off`.
+> `hybrid` recomputes the catalog per query, so the cached prefix holds only up
+> to the catalog; since it shrinks ~80% the non-cacheable part is small. Use
+> `compact` or `off` for maximum cache stability.
 
 ## Development
 
 ```bash
-npm install
+npm test           # node --test, pure modules + fuzz invariants
 npm run typecheck
-npm test           # node --test on the pure modules (incl. fuzz invariants)
 npm run bench      # reproducible synthetic benchmark (savings, invariants, fuzz)
-npm run measure    # exact numbers on a captured real request
+npm run measure <capture.json>   # exact numbers on a captured real request
 ```
 
-`src/skills.ts` and `src/optimize.ts` are pure (no Pi imports) and unit-tested.
-See [AGENTS.md](AGENTS.md) for architecture.
+Pure, unit-tested modules (no Pi imports): `optimize`, `skills`, `tools`,
+`profile`, `output`, `stats`, `aliases`, `usage`, `config`. See
+[AGENTS.md](AGENTS.md) for architecture.
 
 ## Roadmap
 
-- **Embeddings** for semantic ranking (beyond lexical) — better recall on
-  paraphrased queries.
-- **SQLite FTS5/BM25 index** for very large catalogs. The current in-memory BM25
-  path is simpler and has no dependency; SQLite may be worthwhile for 1K+ skills.
-- **On-demand `search_skills` tool** (RAG-MCP style): strip the catalog to ~0 and
-  let the model retrieve skills by calling a tool — maximum upfront savings.
+- Embeddings / SQLite FTS5 ranking for very large (1K+) catalogs.
+- On-demand `search_skills` tool (RAG-MCP) to strip the catalog to ~0.
 
 ## License
 

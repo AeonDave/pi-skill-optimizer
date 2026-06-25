@@ -220,3 +220,54 @@ test("ignores non-object payloads", () => {
 	assert.equal(optimize(undefined, BASE).next, undefined);
 	assert.equal(optimize("nope", BASE).next, "nope");
 });
+
+test("reports removedSkills and removedTools separately", () => {
+	const payload = {
+		messages: [
+			{ role: "user", content: "recover RSA" },
+			{ role: "assistant", content: [{ type: "tool_use", name: "keep_me" }] },
+		],
+		system: catalogText(),
+		tools: [
+			{ name: "Read", description: "read" },
+			{ name: "drop_me", description: "x" },
+			{ name: "keep_me", description: "y" },
+		],
+	};
+	const r = optimize(payload, { ...BASE, toolsMode: "drop", toolsDropPrefixes: ["drop_"] }) as {
+		removed: number; removedSkills: number; removedTools: number; droppedTools: string[];
+	};
+	assert.ok(r.removedSkills > 0); // catalog rewrite
+	assert.ok(r.removedTools > 0); // dropped tool definition
+	assert.equal(r.removed, r.removedSkills + r.removedTools);
+	assert.deepEqual(r.droppedTools, ["drop_me"]);
+});
+
+test("rewrites the catalog in Gemini systemInstruction (string)", () => {
+	const payload = { messages: [{ role: "user", content: "recover RSA" }], systemInstruction: catalogText() };
+	const { next, removedSkills } = optimize(payload, BASE) as { next: { systemInstruction: string }; removedSkills: number };
+	assert.ok(removedSkills > 0);
+	assert.equal(typeof next.systemInstruction, "string");
+	assert.ok(next.systemInstruction.includes("<name>rsactftool</name>"));
+	assert.ok(next.systemInstruction.includes("Use when recovering RSA keys")); // relevant kept full
+});
+
+test("rewrites the catalog in OpenAI Responses instructions (string)", () => {
+	const payload = { messages: [{ role: "user", content: "recover RSA" }], instructions: catalogText() };
+	const { next, removedSkills } = optimize(payload, BASE) as { next: { instructions: string }; removedSkills: number };
+	assert.ok(removedSkills > 0);
+	assert.ok(next.instructions.includes("<available_skills>") === false || next.instructions.includes("<name>rsactftool</name>"));
+});
+
+test("rewrites the catalog in an OpenAI/Mistral system-role message", () => {
+	const payload = {
+		messages: [
+			{ role: "system", content: catalogText() },
+			{ role: "user", content: "recover RSA" },
+		],
+	};
+	const { next, removedSkills } = optimize(payload, BASE) as { next: { messages: Array<{ role: string; content: string }> }; removedSkills: number };
+	assert.ok(removedSkills > 0);
+	assert.ok(next.messages[0].content.includes("<name>rsactftool</name>"));
+	assert.equal(next.messages[1].content, "recover RSA"); // user message untouched
+});

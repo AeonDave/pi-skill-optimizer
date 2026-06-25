@@ -21,12 +21,15 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
 import { setUserAliasCandidates } from "./aliases.ts";
-import { ensureGlobalConfigTemplate, getConfig, getConfigPaths, getPinnedTopK, getProfilePaths, getScopeProviders, getUsageFilePath, isDisabled } from "./config.ts";
+import { ensureGlobalConfigTemplate, getConfig, getConfigPaths, getOutputConfig, getPinnedTopK, getProfilePaths, getScopeProviders, getStatsFilePath, getUsageFilePath, isDisabled } from "./config.ts";
+import { buildExtractPrompt, isExcludedCommand, mergeExtracted, reduceOutput, signalLines } from "./output.ts";
 import { optimize } from "./optimize.ts";
 import { diffSkills, EMPTY_PROFILE, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope, type SkillOptimizerProfile } from "./profile.ts";
 import { normalizeUsageFile, recordSkillUsage, selectPinnedSkills, selectUsageRecordSkills, toUsageFile, usageRecordSignature, type SkillUsageStats } from "./usage.ts";
+import { addSavings, EMPTY_SAVINGS, normalizeStatsFile, type SavingsByArea, toStatsFile, totalSavings } from "./stats.ts";
 
 const STATUS_KEY = "skill-optimizer";
 
@@ -54,6 +57,73 @@ function responseText(response: { content?: Array<{ type?: string; text?: string
 		.filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
 		.map((c) => c.text)
 		.join("\n");
+}
+
+/** Latest user request text on the active branch (for `extract` mode). Best-effort. */
+function latestUserText(ctx: ExtensionContext): string {
+	try {
+		const branch = ctx.sessionManager.getBranch() as Array<{ type?: string; message?: { role?: string; content?: unknown } }>;
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+			const c = entry.message.content;
+			if (typeof c === "string") return c.slice(0, 2000);
+			if (Array.isArray(c)) {
+				const t = c
+					.filter((b): b is { type: "text"; text: string } => !!b && (b as { type?: unknown }).type === "text" && typeof (b as { text?: unknown }).text === "string")
+					.map((b) => b.text)
+					.join(" ")
+					.trim();
+				if (t) return t.slice(0, 2000);
+			}
+		}
+	} catch {
+		// best-effort
+	}
+	return "";
+}
+
+/** Resolve the `extract` model spec ("provider/id" or bare id) against the registry. */
+function resolveOutputModel(ctx: ExtensionContext, spec: string): unknown {
+	try {
+		// No explicit model -> use the currently selected model.
+		if (!spec) return ctx.model ?? undefined;
+		const reg = ctx.modelRegistry as { find?: (provider: string, id: string) => unknown };
+		if (typeof reg?.find !== "function") return ctx.model ?? undefined;
+		if (spec.includes("/")) {
+			const i = spec.indexOf("/");
+			return reg.find(spec.slice(0, i), spec.slice(i + 1)) ?? ctx.model ?? undefined;
+		}
+		const provider = ctx.model?.provider;
+		if (!provider) return undefined;
+		return reg.find(provider, spec) ?? ctx.model ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Intelligent-grep extraction via a weak model. Returns undefined on any failure (fail-open). */
+async function tryExtractOutput(ctx: ExtensionContext, spec: string, request: string, command: string, text: string): Promise<string | undefined> {
+	try {
+		const model = resolveOutputModel(ctx, spec);
+		if (!model) return undefined;
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as Parameters<typeof ctx.modelRegistry.getApiKeyAndHeaders>[0]);
+		if (!auth.ok || !auth.apiKey) return undefined;
+		const { system, user } = buildExtractPrompt(request, command, text);
+		const message: UserMessage = { role: "user", content: [{ type: "text", text: user }], timestamp: Date.now() };
+		const response = await complete(
+			model as Parameters<typeof complete>[0],
+			{ systemPrompt: system, messages: [message] },
+			{ apiKey: auth.apiKey, headers: auth.headers },
+		);
+		const extracted = responseText(response).trim();
+		if (!extracted) return undefined;
+		const merged = mergeExtracted(extracted, signalLines(text));
+		if (!merged || merged.length >= text.length) return undefined;
+		return merged;
+	} catch {
+		return undefined;
+	}
 }
 
 function stripCodeFences(text: string): string {
@@ -161,6 +231,33 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	let activeProfile: SkillOptimizerProfile = EMPTY_PROFILE;
 	let usageStats: SkillUsageStats = {};
 	let lastUsageRecordSignature = "";
+
+	// Granular savings telemetry (chars removed per area).
+	let sessionSaved: SavingsByArea = { ...EMPTY_SAVINGS };
+	let baseLifetime: SavingsByArea = { ...EMPTY_SAVINGS };
+	let loadedStatsPath: string | undefined;
+	let lastFlushAt = 0;
+	const ensureStatsLoaded = (ctx: ExtensionContext): string => {
+		const path = getStatsFilePath(ctx.cwd);
+		if (path !== loadedStatsPath) {
+			try {
+				baseLifetime = existsSync(path) ? normalizeStatsFile(JSON.parse(readFileSync(path, "utf8"))) : { ...EMPTY_SAVINGS };
+			} catch {
+				baseLifetime = { ...EMPTY_SAVINGS };
+			}
+			loadedStatsPath = path;
+		}
+		return path;
+	};
+	const flushStats = (): void => {
+		if (!loadedStatsPath || totalSavings(sessionSaved) === 0) return;
+		try {
+			mkdirSync(dirname(loadedStatsPath), { recursive: true });
+			writeFileSync(loadedStatsPath, `${JSON.stringify(toStatsFile(addSavings(baseLifetime, sessionSaved)), null, 2)}\n`, "utf8");
+		} catch {
+			// telemetry is best-effort; never disrupt the session
+		}
+	};
 
 	const ensureStateLoaded = (ctx: ExtensionContext): void => {
 		const profilePaths = getProfilePaths(ctx.cwd);
@@ -315,12 +412,20 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			profile: activeProfile,
 			pinnedSkills: selectPinnedSkills(usageStats, getPinnedTopK(ctx.cwd)),
 		};
-		const { next, removed, selected, droppedTools } = optimize(event.payload, config);
+		ensureStatsLoaded(ctx);
+		const { next, removed, removedSkills, removedTools, selected, droppedTools } = optimize(event.payload, config);
 		if (removed > 0) {
 			lastRemovedChars = removed;
 			lastSelected = selected;
 			lastDroppedTools = droppedTools.length;
+			sessionSaved.skills += removedSkills;
+			sessionSaved.tools += removedTools;
 			setStatus(ctx, `✂ −${approxK(removed)} tok`);
+		}
+		// Persist telemetry periodically so it survives even without a clean shutdown.
+		if (Date.now() - lastFlushAt > 15_000 && totalSavings(sessionSaved) > 0) {
+			lastFlushAt = Date.now();
+			flushStats();
 		}
 		const messages = (event.payload as { messages?: unknown })?.messages;
 		const recordable = selectUsageRecordSkills(messages, selected);
@@ -337,7 +442,70 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		return next === event.payload ? undefined : next;
 	});
 
+	// Transparent tool-output reduction: shrink noisy tool results (e.g. bash) once,
+	// at production time. `smart` = deterministic head/tail/error keep; `extract` =
+	// query-aware "intelligent grep" via a weak same-provider model (fails open to
+	// `smart`). Errors stay verbatim and the full output is saved to a temp file.
+	// Off by default; opt in via config `outputMode`.
+	const saveFullOutput = (text: string): string => {
+		try {
+			const file = join(tmpdir(), `sko-output-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
+			writeFileSync(file, text, "utf8");
+			return `; full output: ${file}`;
+		} catch {
+			return "";
+		}
+	};
+
+	pi.on("tool_result", async (event, ctx) => {
+		if (isDisabled(ctx.cwd)) return;
+		const outCfg = getOutputConfig(ctx.cwd);
+		if (outCfg.mode === "off") return;
+		const toolName = String(event.toolName ?? "").toLowerCase();
+		if (!outCfg.tools.some((t) => t.toLowerCase() === toolName)) return;
+		const evt = event as { content?: unknown; input?: unknown };
+		const content = evt.content;
+		if (!Array.isArray(content)) return;
+
+		const rawInput = evt.input;
+		const command = rawInput && typeof rawInput === "object" && typeof (rawInput as { command?: unknown }).command === "string"
+			? (rawInput as { command: string }).command
+			: "";
+		const request = outCfg.mode === "extract" ? latestUserText(ctx) : "";
+		ensureStatsLoaded(ctx);
+
+		let changed = false;
+		const next: typeof content = [];
+		for (const block of content) {
+			if (!block || typeof block !== "object") { next.push(block); continue; }
+			const b = block as { type?: unknown; text?: unknown };
+			if (b.type !== "text" || typeof b.text !== "string") { next.push(block); continue; }
+			const text = b.text;
+			if (text.split(/\r?\n/).length <= outCfg.maxLines && text.length <= 16_000) { next.push(block); continue; }
+
+			let body: string | undefined;
+			let how = "reduced";
+			if (outCfg.mode === "extract" && !isExcludedCommand(command, outCfg.extractExclude)) {
+				const extracted = await tryExtractOutput(ctx, outCfg.model, request, command, text);
+				if (extracted) { body = extracted; how = "extracted"; }
+			}
+			if (body === undefined) {
+				const r = reduceOutput(text, { maxLines: outCfg.maxLines });
+				if (!r.reduced) { next.push(block); continue; }
+				body = r.text;
+			}
+			changed = true;
+			if (text.length > body.length) sessionSaved.output += text.length - body.length;
+			const fromLines = text.split(/\r?\n/).length;
+			const note = `${how} ${fromLines}\u2192${body.split(/\r?\n/).length} lines (${approxK(text.length)}\u2192${approxK(body.length)} tok)${saveFullOutput(text)}`;
+			next.push({ ...b, text: `${body}\n[skill-optimizer: ${note}]` });
+		}
+		if (!changed) return;
+		return { content: next };
+	});
+
 	pi.on("session_shutdown", (_event, ctx) => {
+		flushStats();
 		setStatus(ctx, undefined);
 	});
 
@@ -358,17 +526,24 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			const configPaths = getConfigPaths(ctx.cwd);
 			const configLocations = `${existsSync(configPaths.global) ? configPaths.global : `${configPaths.global} (missing)`}${existsSync(configPaths.project) ? `, project ${configPaths.project}` : ""}`;
 			const usagePath = getUsageFilePath(ctx.cwd);
+			ensureStatsLoaded(ctx);
+			const lifetime = addSavings(baseLifetime, sessionSaved);
+			const byArea = (s: SavingsByArea): string => `skills ~${approxK(s.skills)}, tools ~${approxK(s.tools)}, output ~${approxK(s.output)} (total ~${approxK(totalSavings(s))})`;
 			const lines = [
 				"pi-skill-optimizer",
 				`  enabled:        ${isDisabled(ctx.cwd) ? "no (disabled)" : "yes"}`,
 				`  config:         ${configLocations}`,
 				`  skills mode:    ${config.mode}${config.mode === "hybrid" ? ` (top ${config.topK}, tail ${config.tail})` : ""}`,
 				`  tools mode:     ${config.toolsMode}${config.toolsMode === "drop" ? ` (${config.toolsDropPrefixes.join(", ") || "no prefixes set"})` : config.toolsMode === "relevance" ? ` (top ${config.toolsTopK} + core + used)` : ""}`,
+				`  output mode:    ${(() => { const o = getOutputConfig(ctx.cwd); return o.mode === "off" ? "off" : `${o.mode} (>${o.maxLines} lines; tools: ${o.tools.join(", ")})`; })()}`,
 				`  scope:          ${providers ? providers.join(", ") : "all providers"}`,
 				`  profile:        ${profileSummary(activeProfile)} (${profileLocations})`,
 				`  pinned:         ${selectPinnedSkills(usageStats, getPinnedTopK(ctx.cwd)).join(", ") || "none"} (${usageCount(usageStats)} tracked, ${usagePath})`,
+				`  saved (session): ${byArea(sessionSaved)}`,
+				`  saved (lifetime):${byArea(lifetime)}`,
 				`  last request:   −${approxK(lastRemovedChars)} tokens (${lastRemovedChars} chars), ${lastDroppedTools} tools dropped`,
 			];
+			flushStats();
 			if (config.alwaysFull && config.alwaysFull.length > 0) lines.push(`  always full:    ${config.alwaysFull.join(", ")}`);
 			if (config.never && config.never.length > 0) lines.push(`  never:          ${config.never.join(", ")}`);
 			if (lastSelected.length > 0) lines.push(`  last relevant:  ${lastSelected.join(", ")}`);

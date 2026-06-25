@@ -11,7 +11,7 @@
  *
  * config.json keys (see `defaultConfigJson`): disable, mode, topK, tail,
  * alwaysFull, never, providers, pinnedTopK, toolsMode, toolsDrop, toolsTopK,
- * toolsProtect.
+ * toolsProtect, outputMode, outputMaxLines, outputTools, outputModel, outputExtractExclude.
  *
  * Matching env vars: PI_SKILL_OPTIMIZER_{DISABLE, MODE, TOP_K, TAIL, ALWAYS_FULL,
  * NEVER, PROVIDERS, PINNED_TOP_K, TOOLS_MODE, TOOLS_DROP, TOOLS_TOP_K,
@@ -48,8 +48,11 @@ function projectStateDir(cwd: string): string {
 }
 
 const MODES: readonly SkillMode[] = ["off", "compact", "hybrid"];
+const OUTPUT_MODES: readonly OutputMode[] = ["off", "smart", "extract"];
 const TAILS: readonly TailStyle[] = ["name", "intent"];
 const TOOLS_MODES: readonly ToolsMode[] = ["off", "drop", "relevance"];
+
+export type OutputMode = "off" | "smart" | "extract";
 
 export const DEFAULTS = {
 	mode: "hybrid" as SkillMode,
@@ -59,7 +62,29 @@ export const DEFAULTS = {
 	// `intent` to also keep a short description on the tail (more discovery, more tokens).
 	tail: "name" as TailStyle,
 	pinnedTopK: 8,
+	// Transparent tool-output reduction. Default ON in `smart` mode: large tool
+	// outputs are deterministically reduced (head + tail + error lines, free), with
+	// the full output saved to a temp file referenced inline. `extract` (opt-in)
+	// instead turns big output into request-ready data via a model. `off` disables.
+	outputMode: "smart" as OutputMode,
+	outputMaxLines: 400,
+	outputTools: ["bash"] as readonly string[],
+	// `extract` mode: model spec "provider/id" or bare id. Empty → use selected model.
+	outputModel: "",
+	// `extract` mode: commands whose program name is in this list use deterministic
+	// `smart` instead of the model — for pure data dumps you want kept verbatim.
+	outputExtractExclude: ["cat", "ls", "head", "tail", "tree", "find", "dir", "type"] as readonly string[],
 };
+
+export interface OutputConfig {
+	mode: OutputMode;
+	maxLines: number;
+	tools: readonly string[];
+	/** `extract` mode: model spec ("provider/id" or bare id). Empty → extract falls back to smart. */
+	model: string;
+	/** `extract` mode: program names that downgrade to deterministic `smart`. */
+	extractExclude: readonly string[];
+}
 
 function warn(message: string): void {
 	try {
@@ -200,6 +225,32 @@ export function getConfig(cwd = process.cwd()): OptimizeConfig {
 	};
 }
 
+/** Tool-output reduction config: env > project config.json > global config.json > defaults. */
+export function getOutputConfig(cwd = process.cwd()): OutputConfig {
+	const file = loadFileConfig(cwd);
+	const rawMode = process.env.PI_SKILL_OPTIMIZER_OUTPUT?.trim().toLowerCase();
+	let mode: OutputMode = DEFAULTS.outputMode;
+	if (rawMode) {
+		if ((OUTPUT_MODES as readonly string[]).includes(rawMode)) mode = rawMode as OutputMode;
+		else warn(`PI_SKILL_OPTIMIZER_OUTPUT: unknown mode "${rawMode}" (use off|smart|extract)`);
+	} else if (typeof file.outputMode === "string" && (OUTPUT_MODES as readonly string[]).includes(file.outputMode.toLowerCase())) {
+		mode = file.outputMode.toLowerCase() as OutputMode;
+	} else if (file.outputMode !== undefined && file.outputMode !== null) {
+		warn(`config "outputMode": expected off|smart|extract`);
+	}
+	const tools = pickStringArray("PI_SKILL_OPTIMIZER_OUTPUT_TOOLS", file.outputTools);
+	const modelEnv = process.env.PI_SKILL_OPTIMIZER_OUTPUT_MODEL?.trim();
+	const model = modelEnv || (typeof file.outputModel === "string" ? file.outputModel.trim() : "");
+	const exclude = pickStringArray("PI_SKILL_OPTIMIZER_OUTPUT_EXCLUDE", file.outputExtractExclude);
+	return {
+		mode,
+		maxLines: pickInt("PI_SKILL_OPTIMIZER_OUTPUT_MAX_LINES", file.outputMaxLines, DEFAULTS.outputMaxLines),
+		tools: tools.length > 0 ? tools : DEFAULTS.outputTools,
+		model,
+		extractExclude: exclude.length > 0 ? exclude : DEFAULTS.outputExtractExclude,
+	};
+}
+
 /** Provider ids to scope to, or `undefined` for every provider (env or config.json). */
 export function getScopeProviders(cwd = process.cwd()): string[] | undefined {
 	const raw = process.env.PI_SKILL_OPTIMIZER_PROVIDERS?.trim();
@@ -245,6 +296,11 @@ export function defaultConfigJson(): string {
 		toolsDrop: [] as string[], // drop: tool name prefixes to remove
 		toolsTopK: 24, // relevance: non-core tools to keep
 		toolsProtect: [] as string[], // extra protected tool names/prefixes
+		outputMode: DEFAULTS.outputMode, // off | smart | extract
+		outputMaxLines: DEFAULTS.outputMaxLines, // reduce a tool result only above this many lines
+		outputTools: DEFAULTS.outputTools as string[], // which tool results to reduce
+		outputModel: DEFAULTS.outputModel, // extract mode: weak model id ("provider/id" or bare id)
+		outputExtractExclude: DEFAULTS.outputExtractExclude as string[], // extract: program names kept on deterministic smart
 	};
 	return `${JSON.stringify(template, null, 2)}\n`;
 }
@@ -289,6 +345,13 @@ export function getUsageFilePath(cwd: string): string {
 	const raw = process.env.PI_SKILL_OPTIMIZER_USAGE?.trim();
 	if (raw) return isAbsolutePath(raw) ? raw : join(cwd, raw);
 	return join(globalStateDir(), USAGE_FILE);
+}
+
+/** Telemetry stats path (global only). Overridable with `PI_SKILL_OPTIMIZER_STATS`. */
+export function getStatsFilePath(cwd: string): string {
+	const raw = process.env.PI_SKILL_OPTIMIZER_STATS?.trim();
+	if (raw) return isAbsolutePath(raw) ? raw : join(cwd, raw);
+	return join(globalStateDir(), "stats.json");
 }
 
 export function getPinnedTopK(cwd = process.cwd()): number {

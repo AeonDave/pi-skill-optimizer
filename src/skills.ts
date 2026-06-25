@@ -215,13 +215,27 @@ export function selectRelevant(scores: readonly number[], options: number | Sele
 	return ranked.slice(0, keep).map((x) => x.i);
 }
 
-/** Trim a description to its first sentence, capped at maxChars on a word boundary. */
+/** Routing-signal keywords: the "when to use this skill" clause is the strongest tail signal. */
+const ROUTING_KEYWORDS = /\b(use (this )?(skill )?when|use when|use for|use to|trigger on|invoke when|activate (when|for)|use after|use before)\b/i;
+const ROUTING_SENTENCE = /([^.!?\n]*\b(use (this )?(skill )?when|use when|use for|use to|trigger on|invoke when|activate (when|for)|use after|use before)\b[^.!?\n]*[.!?]?)/i;
+
+/**
+ * Trim a description to its first sentence (capped at maxChars on a word boundary),
+ * then append the routing clause ("Use when …") if the first sentence lacks one —
+ * the routing signal is what makes a tail skill discoverable. Additive and lossless:
+ * never replaces the first sentence, only adds the routing signal when present.
+ */
 export function compactDescription(description: string, maxChars: number): string {
 	const trimmed = description.trim();
-	const sentence = trimmed.match(/^([\s\S]*?[.!?])(\s|$)/);
-	let result = sentence ? sentence[1] : trimmed;
-	if (result.length > maxChars) {
-		result = `${result.slice(0, maxChars).replace(/\s+\S*$/, "")}…`;
+	const cap = (s: string): string => (s.length > maxChars ? `${s.slice(0, maxChars).replace(/\s+\S*$/, "")}…` : s);
+	const firstMatch = trimmed.match(/^([\s\S]*?[.!?])(\s|$)/);
+	let result = cap(firstMatch ? firstMatch[1] : trimmed);
+	if (!ROUTING_KEYWORDS.test(result)) {
+		const routing = trimmed.match(ROUTING_SENTENCE);
+		if (routing) {
+			const clause = cap(routing[1].trim());
+			if (clause && !result.includes(clause)) result = `${result} ${clause}`;
+		}
 	}
 	return result;
 }
