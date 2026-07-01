@@ -20,6 +20,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
+import { generateProfileInBatches, interpretBatchResponse, responseText } from "./generate.ts";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -27,7 +28,7 @@ import { setUserAliasCandidates } from "./aliases.ts";
 import { ensureGlobalConfigTemplate, getConfig, getConfigPaths, getOutputConfig, getPinnedTopK, getProfilePaths, getScopeProviders, getStatsFilePath, getUsageFilePath, isDisabled } from "./config.ts";
 import { buildExtractPrompt, isExcludedCommand, isRtkSource, mergeExtracted, reduceOutput, signalLines } from "./output.ts";
 import { optimize } from "./optimize.ts";
-import { diffSkills, EMPTY_PROFILE, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope, type SkillOptimizerProfile } from "./profile.ts";
+import { computeFinalHashes, diffSkills, EMPTY_PROFILE, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope, type SkillOptimizerProfile } from "./profile.ts";
 import { normalizeUsageFile, recordSkillUsage, selectPinnedSkills, selectUsageRecordSkills, toUsageFile, usageRecordSignature, type SkillUsageStats } from "./usage.ts";
 import { addSavings, EMPTY_SAVINGS, normalizeStatsFile, type SavingsByArea, toStatsFile, totalSavings } from "./stats.ts";
 
@@ -38,6 +39,14 @@ const STATUS_KEY = "skill-optimizer";
  * a full regeneration instead of an incremental (hash-based) update.
  */
 const INIT_VERSION = 3;
+
+/**
+ * Skills per profile-generation request. A full init on a large catalog (hundreds of
+ * skills) is split into batches: one oversized request tends to come back with
+ * `stopReason: "error"` (or truncated), which previously took down the whole init and
+ * left no profile written. Batching bounds each request and isolates failures.
+ */
+const INIT_BATCH_SIZE = 80;
 
 /** Approximate tokens from a char count (~4 chars/token), rounded to 0.1k. */
 function approxK(chars: number): string {
@@ -50,13 +59,6 @@ function setStatus(ctx: ExtensionContext, text: string | undefined): void {
 	} catch {
 		// Status badge is cosmetic — never let it break the session.
 	}
-}
-
-function responseText(response: { content?: Array<{ type?: string; text?: string }> }): string {
-	return (response.content ?? [])
-		.filter((c): c is { type: "text"; text: string } => c.type === "text" && typeof c.text === "string")
-		.map((c) => c.text)
-		.join("\n");
 }
 
 /** Latest user request text on the active branch (for `extract` mode). Best-effort. */
@@ -124,31 +126,6 @@ async function tryExtractOutput(ctx: ExtensionContext, spec: string, request: st
 	} catch {
 		return undefined;
 	}
-}
-
-function stripCodeFences(text: string): string {
-	const fenced = text.match(/^```(?:json)?\s*\n?([\s\S]*?)```\s*$/i);
-	if (fenced) return fenced[1];
-	return text;
-}
-
-/** Parse the model's JSON profile, tolerating code fences, comments, and trailing commas. */
-function parseJsonObject(text: string): unknown {
-	let cleaned = stripCodeFences(text).trim();
-	// collapse multi-line strings into single lines (newlines are not valid JSON string chars)
-	cleaned = cleaned.replace(/"((?:[^"\\]|\\.)*)"/g, (m) =>
-		m.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t"),
-	);
-	// strip // line comments
-	cleaned = cleaned.replace(/\/\/.*$/gm, "");
-	// strip /* */ block comments
-	cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, "");
-	// remove trailing commas before } or ]
-	cleaned = cleaned.replace(/,(\s*[}\]])/g, "$1");
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) throw new Error("model response did not contain a JSON object");
-	return JSON.parse(cleaned.slice(start, end + 1));
 }
 
 function profileSummary(profile: SkillOptimizerProfile): string {
@@ -290,6 +267,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			ctx.ui.notify("skill-optimizer: no model selected", "error");
 			return;
 		}
+		// Capture the (now non-null) model so the batch callback keeps the narrowed type
+		// across its closure boundary.
+		const model = ctx.model;
 		const skills = ctx.getSystemPromptOptions().skills ?? [];
 		if (skills.length === 0) {
 			ctx.ui.notify("skill-optimizer: no skills available in current prompt options", "warning");
@@ -318,6 +298,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 
 		let partial: SkillOptimizerProfile = EMPTY_PROFILE;
+		let appliedChanged: string[] = [];
+		let failedChanged: string[] = [];
 		if (changed.length > 0) {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
 			if (!auth.ok || !auth.apiKey) {
@@ -326,9 +308,6 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			}
 			const changedSet = new Set(changed);
 			const targetSkills = skills.filter((skill) => changedSet.has(skill.name));
-			const skillLines = targetSkills
-				.map((skill) => `- ${skill.name}: ${skill.description.slice(0, 240)}`)
-				.join("\n");
 			const systemPrompt = [
 				"You generate a compact JSON retrieval profile for lexical skill retrieval.",
 				"Return only JSON. No markdown.",
@@ -345,26 +324,53 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				"Keep output compact: at most 140 aliases, 16 critical skills, and 140 skills with query examples.",
 				...(forceFull ? [] : ["These skills are NEW or MODIFIED in an existing setup. Output entries ONLY for them, using the same schema."]),
 			].join("\n");
-			const userMessage: UserMessage = {
-				role: "user",
-				content: [{ type: "text", text: `Skills:\n${skillLines}` }],
-				timestamp: Date.now(),
-			};
-			ctx.ui.notify(`skill-optimizer: ${forceFull ? "regenerating" : "updating"} profile for ${targetSkills.length} skill(s) with ${ctx.model.id}...`, "info");
-			const response = await complete(
-				ctx.model,
-				{ systemPrompt, messages: [userMessage] },
-				{ apiKey: auth.apiKey, headers: auth.headers },
-			);
-			if (response.stopReason !== "stop") {
-				ctx.ui.notify(`skill-optimizer: profile generation stopped with ${response.stopReason}`, "warning");
+			const batchCount = Math.max(1, Math.ceil(targetSkills.length / INIT_BATCH_SIZE));
+			ctx.ui.notify(`skill-optimizer: ${forceFull ? "regenerating" : "updating"} profile for ${targetSkills.length} skill(s) in ${batchCount} batch(es) with ${model.id}...`, "info");
+			const result = await generateProfileInBatches(targetSkills, INIT_BATCH_SIZE, async (batch, i, total) => {
+				const label = total > 1 ? `batch ${i + 1}/${total}` : "profile generation";
+				const skillLines = batch
+					.map((skill) => `- ${skill.name}: ${skill.description.slice(0, 240)}`)
+					.join("\n");
+				const userMessage: UserMessage = {
+					role: "user",
+					content: [{ type: "text", text: `Skills:\n${skillLines}` }],
+					timestamp: Date.now(),
+				};
+				let response: Awaited<ReturnType<typeof complete>>;
+				try {
+					response = await complete(
+						model,
+						{ systemPrompt, messages: [userMessage] },
+						{ apiKey: auth.apiKey, headers: auth.headers },
+					);
+				} catch (err) {
+					ctx.ui.notify(`skill-optimizer: ${label} request failed (${(err as Error).message})`, "warning");
+					return undefined;
+				}
+				const outcome = interpretBatchResponse(response);
+				if (outcome.status === "failed") {
+					ctx.ui.notify(`skill-optimizer: ${label} ${outcome.reason}`, "warning");
+					return undefined;
+				}
+				if (outcome.truncated) {
+					ctx.ui.notify(`skill-optimizer: ${label} output was truncated (length limit); using what was returned`, "warning");
+				}
+				return outcome.profile;
+			});
+			if (!result) {
+				ctx.ui.notify(`skill-optimizer: profile generation failed for all ${batchCount} batch(es); no changes written`, "error");
+				return;
 			}
-			partial = normalizeProfile(parseJsonObject(responseText(response)));
+			partial = result.partial;
+			appliedChanged = changed.filter((name) => result.applied.has(name));
+			failedChanged = changed.filter((name) => !result.applied.has(name));
 		}
 
-		const profile = mergeIncrementalProfile(pruneProfileNames(forceFull ? EMPTY_PROFILE : baseProfile, removed), partial, changed);
-		const newCount = changed.filter((name) => !(name in storedHashes)).length;
-		const summary = `${forceFull ? "full" : "incremental"}: +${newCount} new, ~${changed.length - newCount} changed, -${removed.length} removed`;
+		// Failed batches keep their hashes dropped so the next init retries only them.
+		const finalHashes = computeFinalHashes(hashes, failedChanged);
+		const profile = mergeIncrementalProfile(pruneProfileNames(forceFull ? EMPTY_PROFILE : baseProfile, removed), partial, appliedChanged);
+		const newCount = appliedChanged.filter((name) => !(name in storedHashes)).length;
+		const summary = `${forceFull ? "full" : "incremental"}: +${newCount} new, ~${appliedChanged.length - newCount} changed, -${removed.length} removed${failedChanged.length > 0 ? `, ${failedChanged.length} failed (will retry)` : ""}`;
 		const projectNames = new Set(
 			skills
 				.filter((skill) => (skill as { sourceInfo?: { scope?: string } }).sourceInfo?.scope === "project")
@@ -373,7 +379,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const splitEnabled = paths.project !== paths.global && projectNames.size > 0;
 
 		if (!splitEnabled) {
-			writeProfileFile(paths.global, profile, skills.length, hashes);
+			writeProfileFile(paths.global, profile, skills.length, finalHashes);
 			activeProfile = profile;
 			setUserAliasCandidates(profile.aliases);
 			loadedProfilePath = `${paths.global}::${paths.project}`;
@@ -382,8 +388,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 
 		const { global: globalProfile, project: projectProfile } = splitProfileByScope(profile, projectNames);
-		const globalHashes = pickKeys(hashes, (name) => !projectNames.has(name));
-		const projectHashes = pickKeys(hashes, (name) => projectNames.has(name));
+		const globalHashes = pickKeys(finalHashes, (name) => !projectNames.has(name));
+		const projectHashes = pickKeys(finalHashes, (name) => projectNames.has(name));
 		writeProfileFile(paths.global, globalProfile, Object.keys(globalHashes).length, globalHashes);
 		writeProfileFile(paths.project, projectProfile, Object.keys(projectHashes).length, projectHashes);
 		activeProfile = mergeProfiles(globalProfile, projectProfile);

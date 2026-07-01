@@ -1,6 +1,6 @@
 {
   "name": "pi-skill-optimizer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": false,
   "type": "module",
   "description": "A Pi extension that cuts input-token cost every request — slims the <available_skills> catalog, the tools array, and noisy tool output — without hiding your skills. Provider-agnostic, config-driven, cross-OS.",
@@ -35,7 +35,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/skills.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts",
+    "test": "node --import tsx --test test/skills.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/generate.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts",
     "measure": "node --import tsx scripts/measure.ts",
     "bench": "node --import tsx scripts/bench.ts"
   },

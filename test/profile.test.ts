@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { diffSkills, hashSkill, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope } from "../src/profile.ts";
+import { computeFinalHashes, diffSkills, hashSkill, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope } from "../src/profile.ts";
 import { normalizeUsageFile, recordSkillUsage, selectPinnedSkills, selectUsageRecordSkills, toUsageFile, usageRecordSignature } from "../src/usage.ts";
 
 test("normalizeProfile accepts enhanced init output and drops malformed fields", () => {
@@ -87,6 +87,15 @@ test("diffSkills detects new, modified, and removed skills", () => {
 	// dropping hashcat from the catalog marks it removed
 	const { removed: removed2 } = diffSkills([{ name: "rsactftool", description: "RSA recovery tool." }], stored);
 	assert.deepEqual(removed2, ["hashcat"]);
+});
+
+test("computeFinalHashes drops failed skills so they re-run, keeps the rest, and no-ops on empty", () => {
+	const hashes = { a: "h1", b: "h2", c: "h3" };
+	const pruned = computeFinalHashes(hashes, ["b"]);
+	assert.deepEqual(pruned, { a: "h1", c: "h3" });
+	assert.ok(!("b" in pruned)); // next diffSkills sees 'b' as changed -> retried
+	assert.equal(computeFinalHashes(hashes, []), hashes); // same ref when nothing failed
+	assert.deepEqual(computeFinalHashes(hashes, ["x", "y"]), hashes); // unknown names are ignored
 });
 
 test("pruneProfileNames strips removed skills from critical, queries, clusters, hints", () => {

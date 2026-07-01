@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## 1.0.1 - 2026-07-01
+
+### Fixed
+- `init` on a fresh machine with a large catalog no longer crashes the extension.
+  A full generation is now split into batches of `INIT_BATCH_SIZE` (80) skills
+  instead of one oversized request that came back `stopReason: "error"` and then
+  threw `"model response did not contain a JSON object"`, leaving no profile file
+  written. Per-batch `error`/`aborted`/`length`/non-JSON responses are reported and
+  skipped; a partial profile is still written and the skills from failed batches keep
+  their hashes dropped so the next `init` retries only them.
+
+### Internal
+- Extracted the fragile profile-generation helpers out of `index.ts` into a pure,
+  unit-tested `src/generate.ts` (`responseText`, `stripCodeFences`, `parseJsonObject`,
+  `chunk`, `interpretBatchResponse`, `generateProfileInBatches`) and moved the
+  failed-batch hash bookkeeping into `profile.ts` as `computeFinalHashes`. Adds
+  `test/generate.test.ts` and a `computeFinalHashes` case in `test/profile.test.ts`.
+
 ## 1.0.0
 
 First stable release.

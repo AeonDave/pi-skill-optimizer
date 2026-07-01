@@ -102,6 +102,21 @@ export function diffSkills(current: readonly SkillRef[], stored: Record<string, 
 	return { changed, removed, hashes };
 }
 
+/**
+ * Drop the `failed` skills from a fresh hash map so the next `init` re-detects them
+ * as changed and retries only them (a batch that errored must not be recorded as
+ * already profiled). Returns the same reference when there is nothing to drop.
+ */
+export function computeFinalHashes(hashes: Record<string, string>, failed: Iterable<string>): Record<string, string> {
+	const drop = new Set(failed);
+	if (drop.size === 0) return hashes;
+	const out: Record<string, string> = {};
+	for (const [name, hash] of Object.entries(hashes)) {
+		if (!drop.has(name)) out[name] = hash;
+	}
+	return out;
+}
+
 function omitKeys(record: Record<string, string[]>, drop: ReadonlySet<string>): Record<string, string[]> {
 	const out: Record<string, string[]> = {};
 	for (const [key, value] of Object.entries(record)) {
