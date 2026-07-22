@@ -16,6 +16,8 @@ export const EMPTY_PROFILE: SkillOptimizerProfile = {
 	negativeHints: {},
 };
 
+const STRUCTURED_PROFILE_KEYS = ["aliases", "critical", "queries", "clusters", "negativeHints"] as const;
+
 function normalizeNameList(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return Array.from(new Set(value.filter((v): v is string => typeof v === "string").map((v) => v.trim()).filter(Boolean)));
@@ -35,8 +37,9 @@ function normalizeStringArrayRecord(value: unknown): Record<string, string[]> {
 
 export function normalizeProfile(value: unknown): SkillOptimizerProfile {
 	const source = value && typeof value === "object" ? value as Record<string, unknown> : {};
+	const structured = STRUCTURED_PROFILE_KEYS.some((key) => Object.prototype.hasOwnProperty.call(source, key));
 	return {
-		aliases: normalizeAliasRecord(source.aliases ?? source),
+		aliases: normalizeAliasRecord(structured ? source.aliases : source),
 		critical: normalizeNameList(source.critical),
 		queries: normalizeStringArrayRecord(source.queries),
 		clusters: normalizeStringArrayRecord(source.clusters),
@@ -146,7 +149,8 @@ export function pruneProfileNames(profile: SkillOptimizerProfile, removed: Itera
 /**
  * Merge a freshly generated `partial` profile (covering only `changed` skills)
  * into `base`. For changed skills the partial wins; unchanged skills keep their
- * base entries. Aliases/clusters accumulate (catalog-filtered at use).
+ * base entries. Aliases accumulate because they are catalog-filtered at use;
+ * every name-bound field, including cluster membership, is replaced.
  */
 export function mergeIncrementalProfile(
 	base: SkillOptimizerProfile,
@@ -154,12 +158,17 @@ export function mergeIncrementalProfile(
 	changed: Iterable<string>,
 ): SkillOptimizerProfile {
 	const ch = new Set(changed);
+	const baseClusters: Record<string, string[]> = {};
+	for (const [topic, members] of Object.entries(base.clusters)) {
+		const unchanged = members.filter((name) => !ch.has(name));
+		if (unchanged.length > 0) baseClusters[topic] = unchanged;
+	}
 	return {
 		aliases: mergeAliasRecords(base.aliases, partial.aliases),
 		critical: Array.from(new Set([...base.critical.filter((n) => !ch.has(n)), ...partial.critical.filter((n) => ch.has(n))])),
-		queries: { ...omitKeys(base.queries, ch), ...partial.queries },
-		clusters: mergeStringArrayRecords(base.clusters, partial.clusters),
-		negativeHints: { ...omitKeys(base.negativeHints, ch), ...partial.negativeHints },
+		queries: { ...omitKeys(base.queries, ch), ...filterByNames(partial.queries, ch) },
+		clusters: mergeStringArrayRecords(baseClusters, filterClustersByNames(partial.clusters, ch)),
+		negativeHints: { ...omitKeys(base.negativeHints, ch), ...filterByNames(partial.negativeHints, ch) },
 	};
 }
 
@@ -207,6 +216,9 @@ export function splitProfileByScope(
 		...Object.keys(profile.queries),
 		...Object.keys(profile.negativeHints),
 	]);
+	for (const members of Object.values(profile.clusters)) {
+		for (const name of members) allNames.add(name);
+	}
 	const globalNames = new Set([...allNames].filter((n) => !projectNames.has(n)));
 	return {
 		global: {

@@ -6,6 +6,7 @@ const BASE: OptimizeConfig = {
 	mode: "hybrid",
 	topK: 1,
 	tail: "name",
+	fullRenderBudgetChars: 12_000,
 	toolsMode: "off",
 	toolsDropPrefixes: [],
 	toolsTopK: 24,
@@ -35,13 +36,13 @@ function payloadWithCatalogInSystem() {
 	};
 }
 
-test("hybrid: trims the system catalog, reports removed + selected, keeps the relevant skill full", () => {
-	const { next, removed, selected } = optimize(payloadWithCatalogInSystem(), BASE) as {
+test("hybrid: trims the system catalog, reports removedChars + selected, keeps the relevant skill full", () => {
+	const { next, removedChars, selected } = optimize(payloadWithCatalogInSystem(), BASE) as {
 		next: { system: Array<{ text: string }> };
-		removed: number;
+		removedChars: number;
 		selected: string[];
 	};
-	assert.ok(removed > 0);
+	assert.ok(removedChars > 0);
 	assert.deepEqual(selected, ["rsactftool"]);
 	const cat = next.system[1].text;
 	assert.ok(cat.includes("Use when recovering RSA keys")); // relevant kept full
@@ -51,20 +52,20 @@ test("hybrid: trims the system catalog, reports removed + selected, keeps the re
 
 test("off mode with no extra rules is an identity no-op (same reference)", () => {
 	const payload = payloadWithCatalogInSystem();
-	const { next, removed } = optimize(payload, { ...BASE, mode: "off" });
+	const { next, removedChars } = optimize(payload, { ...BASE, mode: "off" });
 	assert.equal(next, payload);
-	assert.equal(removed, 0);
+	assert.equal(removedChars, 0);
 });
 
 test("preserves the original system payload shape when changed", () => {
 	const stringPayload = { messages: [{ role: "user", content: "recover RSA" }], system: catalogText() };
-	const stringOut = optimize(stringPayload, BASE) as { next: { system: string }; removed: number };
-	assert.ok(stringOut.removed > 0);
+	const stringOut = optimize(stringPayload, BASE) as { next: { system: string }; removedChars: number };
+	assert.ok(stringOut.removedChars > 0);
 	assert.equal(typeof stringOut.next.system, "string");
 
 	const blockPayload = { messages: [{ role: "user", content: "recover RSA" }], system: { type: "text", text: catalogText() } };
-	const blockOut = optimize(blockPayload, BASE) as { next: { system: { type: "text"; text: string } }; removed: number };
-	assert.ok(blockOut.removed > 0);
+	const blockOut = optimize(blockPayload, BASE) as { next: { system: { type: "text"; text: string } }; removedChars: number };
+	assert.ok(blockOut.removedChars > 0);
 	assert.equal(blockOut.next.system.type, "text");
 	assert.equal(typeof blockOut.next.system.text, "string");
 });
@@ -83,12 +84,12 @@ test("the catalog is also handled inside a tool description", () => {
 			].join("\n")}\n</available_skills>` },
 		],
 	};
-	const { next, removed, selected } = optimize(payload, { ...BASE, topK: 1 }) as {
+	const { next, removedChars, selected } = optimize(payload, { ...BASE, topK: 1 }) as {
 		next: { tools: Array<{ name: string; description: string }> };
-		removed: number;
+		removedChars: number;
 		selected: string[];
 	};
-	assert.ok(removed > 0);
+	assert.ok(removedChars > 0);
 	assert.deepEqual(selected, ["hashcat"]);
 	assert.equal(next.tools[0].description, "Run commands."); // untouched tool
 	assert.ok(next.tools[1].description.includes("<name>tcpdump</name>")); // tail kept discoverable
@@ -133,12 +134,12 @@ test("Pi-style Skill tool fixture is optimized while preserving payload shapes",
 			},
 		],
 	};
-	const { next, selected, removed } = optimize(payload, { ...BASE, topK: 1 }) as {
+	const { next, selected, removedChars } = optimize(payload, { ...BASE, topK: 1 }) as {
 		next: { system: string; tools: Array<{ name: string; description: string; input_schema?: unknown }> };
 		selected: string[];
-		removed: number;
+		removedChars: number;
 	};
-	assert.ok(removed > 0);
+	assert.ok(removedChars > 0);
 	assert.equal(next.system, "plain system string");
 	assert.equal(next.tools[0].name, "Skill");
 	assert.ok(next.tools[0].input_schema);
@@ -184,7 +185,7 @@ test("alwaysFull and never are threaded into the skill catalog rewrite", () => {
 		selected: string[];
 	};
 	const cat = next.system[0].text;
-	assert.ok(!cat.includes("<name>hashcat</name>")); // never → removed entirely
+	assert.ok(!cat.includes("<name>hashcat</name>")); // never → removedChars entirely
 	assert.ok(cat.includes("Packet capture")); // alwaysFull tcpdump kept full
 	assert.ok(selected.includes("rsactftool")); // ranked
 	assert.ok(selected.includes("tcpdump")); // alwaysFull
@@ -211,9 +212,9 @@ test("tools relevance mode keeps core + top-K relevant of the rest", () => {
 
 test("returns identity when there is no catalog and no extra rules match", () => {
 	const payload = { messages: [], system: [{ type: "text", text: "nothing to do" }] };
-	const { next, removed } = optimize(payload, BASE);
+	const { next, removedChars } = optimize(payload, BASE);
 	assert.equal(next, payload);
-	assert.equal(removed, 0);
+	assert.equal(removedChars, 0);
 });
 
 test("ignores non-object payloads", () => {
@@ -235,11 +236,11 @@ test("reports removedSkills and removedTools separately", () => {
 		],
 	};
 	const r = optimize(payload, { ...BASE, toolsMode: "drop", toolsDropPrefixes: ["drop_"] }) as {
-		removed: number; removedSkills: number; removedTools: number; droppedTools: string[];
+		removedChars: number; removedSkills: number; removedTools: number; droppedTools: string[];
 	};
 	assert.ok(r.removedSkills > 0); // catalog rewrite
 	assert.ok(r.removedTools > 0); // dropped tool definition
-	assert.equal(r.removed, r.removedSkills + r.removedTools);
+	assert.equal(r.removedChars, r.removedSkills + r.removedTools);
 	assert.deepEqual(r.droppedTools, ["drop_me"]);
 });
 
@@ -253,10 +254,18 @@ test("rewrites the catalog in Gemini systemInstruction (string)", () => {
 });
 
 test("rewrites the catalog in OpenAI Responses instructions (string)", () => {
-	const payload = { messages: [{ role: "user", content: "recover RSA" }], instructions: catalogText() };
-	const { next, removedSkills } = optimize(payload, BASE) as { next: { instructions: string }; removedSkills: number };
+	const payload = {
+		input: [{ role: "user", content: [{ type: "input_text", text: "recover RSA" }] }],
+		instructions: catalogText(),
+	};
+	const { next, removedSkills, selected } = optimize(payload, BASE) as {
+		next: { instructions: string }; removedSkills: number; selected: string[];
+	};
 	assert.ok(removedSkills > 0);
-	assert.ok(next.instructions.includes("<available_skills>") === false || next.instructions.includes("<name>rsactftool</name>"));
+	assert.ok(next.instructions.includes("<available_skills>"));
+	assert.ok(next.instructions.includes("<name>rsactftool</name>"));
+	assert.ok(next.instructions.includes("Use when recovering RSA keys"));
+	assert.deepEqual(selected, ["rsactftool"]);
 });
 
 test("rewrites the catalog in an OpenAI/Mistral system-role message", () => {
@@ -270,4 +279,86 @@ test("rewrites the catalog in an OpenAI/Mistral system-role message", () => {
 	assert.ok(removedSkills > 0);
 	assert.ok(next.messages[0].content.includes("<name>rsactftool</name>"));
 	assert.equal(next.messages[1].content, "recover RSA"); // user message untouched
+});
+
+test("extracts the hybrid query from Gemini contents", () => {
+	const payload = {
+		contents: [{ role: "user", parts: [{ text: "capture packet traffic" }] }],
+		systemInstruction: { parts: [{ text: catalogText() }] },
+	};
+	const { selected } = optimize(payload, BASE);
+	assert.deepEqual(selected, ["tcpdump"]);
+});
+
+test("used OpenAI Responses tools remain callable and preserve payload identity", () => {
+	const payload = {
+		input: [
+			{ role: "user", content: [{ type: "input_text", text: "continue" }] },
+			{ type: "function_call", name: "vendor_used", arguments: "{}" },
+		],
+		tools: [{ name: "vendor_used", description: "Used earlier." }, { name: "Bash", description: "core" }],
+	};
+	const result = optimize(payload, { ...BASE, mode: "off", toolsMode: "drop", toolsDropPrefixes: ["vendor_"] });
+	assert.equal(result.next, payload);
+	assert.deepEqual(result.droppedTools, []);
+});
+
+test("tools relevance preserves identity when a multimodal request has no text signal", () => {
+	const payload = {
+		input: [{ role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,x" }] }],
+		tools: [{ name: "view_image", description: "Inspect an image." }],
+	};
+	const result = optimize(payload, { ...BASE, mode: "off", toolsMode: "relevance", toolsTopK: 1 });
+	assert.equal(result.next, payload);
+	assert.equal(result.removedChars, 0);
+	assert.deepEqual(result.droppedTools, []);
+});
+
+test("rewrites catalogs in nested OpenAI Chat function descriptions", () => {
+	const payload = {
+		messages: [{ role: "user", content: "recover RSA" }],
+		tools: [{ type: "function", function: { name: "Skill", description: catalogText() } }],
+	};
+	const result = optimize(payload, BASE) as {
+		next: { tools: Array<{ function: { description: string } }> };
+		removedChars: number;
+		selected: string[];
+	};
+	assert.ok(result.removedChars > 0);
+	assert.deepEqual(result.selected, ["rsactftool"]);
+	assert.ok(result.next.tools[0].function.description.includes("Use when recovering RSA keys"));
+});
+
+test("full-render budget is propagated while rejected skills remain loadable; zero is unlimited", () => {
+	const largeRelevant = `Unique pathological router. ${"Large specialist detail. ".repeat(700)}`.trimEnd();
+	const filler = (name: string): string => skillXml(name, `Unrelated ${name} workflow. ${"Operational detail. ".repeat(12)}`);
+	const system = `<available_skills>\n${[
+		skillXml("pathological-router", largeRelevant),
+		filler("database-maintenance"),
+		filler("network-audit"),
+		filler("release-planning"),
+		filler("documentation-guide"),
+	].join("\n")}\n</available_skills>`;
+	const payload = { messages: [{ role: "user", content: "unique pathological router" }], system };
+
+	const capped = optimize(payload, { ...BASE, fullRenderBudgetChars: 1 }) as {
+		next: { system: string };
+		selected: string[];
+	};
+	assert.deepEqual(capped.selected, []);
+	assert.ok(capped.next.system.includes("<name>pathological-router</name>"));
+	assert.ok(capped.next.system.includes("<skill_path_note>"));
+	assert.ok(capped.next.system.includes("C:/s"));
+	assert.ok(!capped.next.system.includes(largeRelevant));
+
+	const unlimited = optimize(payload, { ...BASE, topK: 5, fullRenderBudgetChars: 0 }) as {
+		next: { system: string };
+		selected: string[];
+	};
+	assert.deepEqual(unlimited.selected, ["pathological-router"]);
+	assert.ok(unlimited.next.system.includes(largeRelevant));
+	assert.ok(unlimited.next.system.includes("C:/s/pathological-router/SKILL.md"));
+
+	const identity = optimize(payload, { ...BASE, mode: "off", fullRenderBudgetChars: 1 });
+	assert.equal(identity.next, payload);
 });

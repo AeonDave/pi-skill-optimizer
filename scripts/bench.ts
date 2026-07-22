@@ -5,9 +5,10 @@
  *
  * It builds a SYNTHETIC catalog (no machine data, no real skill names/paths) so
  * the numbers are reproducible and safe to publish. It measures, per `tail`
- * style, the token savings, the discovery invariants (no skill ever dropped,
+ * style, serialized-character savings, the discovery invariants (no skill ever dropped,
  * everything stays loadable), relevance precision, behavioural-skill pinning,
- * determinism, and a fuzz pass over random/adversarial queries.
+ * fuzzy recall, soft-budget behavior, cache stability, determinism, and a fuzz
+ * pass over random/adversarial queries.
  */
 import { optimize, type OptimizeConfig, type OptimizeResult } from "../src/optimize.ts";
 import { normalizeProfile } from "../src/profile.ts";
@@ -57,6 +58,7 @@ function buildSkills(): Syn[] {
 const SKILLS = buildSkills();
 const ROOT_BY_NAME = new Map(SKILLS.map((s) => [s.name, s.root] as const));
 const TOTAL = SKILLS.length;
+const EXPECTED_NAMES = new Set(SKILLS.map((s) => s.name));
 
 function escapeXml(s: string): string { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
 function rawCatalog(): string {
@@ -73,11 +75,12 @@ function rawCatalog(): string {
 }
 const CATALOG = rawCatalog();
 const RAW_LEN = CATALOG.length;
-const tok = (c: number) => Math.round(c / 4);
+const estimatedTokens = (chars: number) => Math.round(chars / 4);
 
-const PROFILE = normalizeProfile({ critical: BEHAVIOURAL });
+const PROFILE = normalizeProfile({ critical: BEHAVIOURAL, aliases: { codename: ["crypto"] } });
 const BASE: OptimizeConfig = {
 	mode: "hybrid", topK: 20, tail: "name",
+	fullRenderBudgetChars: 12_000,
 	toolsMode: "off", toolsDropPrefixes: [], toolsTopK: 24, toolsProtect: [],
 	profile: PROFILE,
 };
@@ -86,6 +89,9 @@ function names(text: string): string[] {
 	const out: string[] = []; const re = /<name>([\s\S]*?)<\/name>/g; let m: RegExpExecArray | null;
 	while ((m = re.exec(text)) !== null) out.push(m[1].trim());
 	return out;
+}
+function sameSet(actual: Set<string>, expected: Set<string>): boolean {
+	return actual.size === expected.size && [...expected].every((name) => actual.has(name));
 }
 function noteRoots(text: string): string[] {
 	const m = text.match(/<skill_path_note>[\s\S]*?\(roots:\s*([\s\S]*?)\)\.?\s*Read/);
@@ -115,7 +121,7 @@ function evalConfig(label: string, cfg: OptimizeConfig) {
 		savedSum += 1 - out.length / RAW_LEN;
 		full += r.selected.length;
 		const uniq = new Set(names(out));
-		if (uniq.size !== TOTAL) present = false;
+		if (!sameSet(uniq, EXPECTED_NAMES)) present = false;
 		minLoad = Math.min(minLoad, Math.round((loadable(out) / uniq.size) * 100));
 		if (BEHAVIOURAL.every((b) => r.selected.includes(b))) behavFull++;
 		const topicSelected = r.selected.filter((n) => n.startsWith(`${topic}-`));
@@ -135,7 +141,7 @@ function evalConfig(label: string, cfg: OptimizeConfig) {
 	};
 }
 
-console.log(`synthetic catalog: ${TOTAL} skills, raw ~${tok(RAW_LEN)} tokens (${RAW_LEN} chars)`);
+console.log(`synthetic catalog: ${TOTAL} skills, raw ${RAW_LEN} chars (~${estimatedTokens(RAW_LEN)} estimated tokens)`);
 console.log(`config: mode=hybrid topK=${BASE.topK}, behavioural-critical=${BEHAVIOURAL.length}\n`);
 
 const rows = [
@@ -143,7 +149,7 @@ const rows = [
 	evalConfig("hybrid tail=intent", { ...BASE, tail: "intent" }),
 	evalConfig("compact", { ...BASE, mode: "compact" }),
 ];
-console.log("config                       | saved | avgFull | names | load | relevance(P/recall) | behav");
+console.log("config                       | chars saved | avgFull | names | load | relevance(P/recall) | behav");
 console.log("-----------------------------|-------|---------|-------|------|---------------------|------");
 for (const r of rows) {
 	console.log(
@@ -154,11 +160,26 @@ for (const r of rows) {
 // determinism + idempotency
 const a = runQuery("crypto rsa key", BASE).r.selected;
 const b = runQuery("crypto rsa key", BASE).r.selected;
+const deterministic = JSON.stringify(a) === JSON.stringify(b);
 const once = runQuery("python pytest module", BASE).out;
-const twice = runQuery("python pytest module", { ...BASE }).out; // re-run
-const reopt = optimize({ messages: [{ role: "user", content: "x" }], system: [{ type: "text", text: once }] }, BASE);
+const alreadyOptimized = { messages: [{ role: "user", content: "x" }], system: [{ type: "text", text: once }] };
+const reopt = optimize(alreadyOptimized, BASE);
 const reoptText = (reopt.next as { system?: Array<{ text?: string }> }).system?.[0]?.text ?? once;
-console.log(`\ndeterministic: ${JSON.stringify(a) === JSON.stringify(b)} | re-optimize keeps all names: ${new Set(names(reoptText)).size === TOTAL} | (idempotent stable: ${once === twice})`);
+const idempotent = reopt.next === alreadyOptimized && reoptText === once;
+console.log(`\ndeterministic: ${deterministic} | re-optimize keeps exact names: ${sameSet(new Set(names(reoptText)), EXPECTED_NAMES)} | idempotent identity: ${idempotent}`);
+
+const compactA = runQuery("crypto rsa key", { ...BASE, mode: "compact" }).out;
+const compactB = runQuery("mobile android dex", { ...BASE, mode: "compact" }).out;
+const compactCacheStable = compactA === compactB;
+const fuzzyTypoRecall = runQuery("codenam", BASE).r.selected.some((name) => name.startsWith("crypto-"));
+const unlimited = runQuery("crypto rsa key", { ...BASE, topK: TOTAL, fullRenderBudgetChars: 0 });
+const budgeted = runQuery("crypto rsa key", { ...BASE, topK: TOTAL, fullRenderBudgetChars: 800 });
+const budgetPreservesCatalog = sameSet(new Set(names(budgeted.out)), EXPECTED_NAMES) && loadable(budgeted.out) === TOTAL;
+const budgetPreservesCritical = BEHAVIOURAL.every((name) => budgeted.r.selected.includes(name));
+const softBudgetWorks = budgeted.r.selected.length < unlimited.r.selected.length
+	&& budgetPreservesCatalog
+	&& budgetPreservesCritical;
+console.log(`cache-stable compact: ${compactCacheStable} | fuzzy alias typo recall: ${fuzzyTypoRecall} | soft budget: ${budgeted.r.selected.length}/${unlimited.r.selected.length} full, catalog safe=${budgetPreservesCatalog}, critical safe=${budgetPreservesCritical}`);
 
 // fuzz
 const VOCAB = [...new Set(SKILLS.flatMap((s) => s.description.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2)))];
@@ -176,10 +197,16 @@ for (let i = 0; i < N; i++) {
 	const q = fuzzQ();
 	try {
 		const { out, r } = runQuery(q, BASE);
-		if (new Set(names(out)).size !== TOTAL) drops++;
+		if (!sameSet(new Set(names(out)), EXPECTED_NAMES)) drops++;
 		if (loadable(out) !== new Set(names(out)).size) loadViol++;
 		const s = 1 - out.length / RAW_LEN; if (s < -1e-9 || s > 1) rangeViol++; savedSum += s;
 		if (BEHAVIOURAL.every((bb) => r.selected.includes(bb))) behav++;
 	} catch { crashes++; }
 }
-console.log(`\nfuzz ${N} queries: crashes=${crashes} drops=${drops} loadViol=${loadViol} rangeViol=${rangeViol} behavAlwaysFull=${behav}/${N - crashes} avgSaved=${Math.round((savedSum / (N - crashes)) * 100)}%`);
+const completed = Math.max(1, N - crashes);
+console.log(`\nfuzz ${N} queries: crashes=${crashes} drops=${drops} loadViol=${loadViol} rangeViol=${rangeViol} behavAlwaysFull=${behav}/${N - crashes} avgSaved=${Math.round((savedSum / completed) * 100)}%`);
+
+const invariantFailure = !deterministic || !idempotent || !compactCacheStable || !fuzzyTypoRecall || !softBudgetWorks
+	|| rows.some((row) => !row.present || row.minLoad !== 100)
+	|| crashes > 0 || drops > 0 || loadViol > 0 || rangeViol > 0 || behav !== N - crashes;
+if (invariantFailure) process.exitCode = 1;

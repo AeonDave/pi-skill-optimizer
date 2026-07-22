@@ -10,17 +10,22 @@
  * is removed/compacted; surviving text is never reordered or rewritten.
  */
 
-import { extractQuery, type SkillMode, type TailStyle, transformSkillsInText } from "./skills.ts";
-import { collectUsedToolNames, optimizeTools, type ToolsMode } from "./tools.ts";
+import { type TailStyle, transformSkillsInText } from "./skills.ts";
+import { extractRequestQuery, normalizeRequest } from "./request.ts";
+import { getToolDefinition, optimizeTools, replaceToolDescription, type ToolsMode } from "./tools.ts";
 import { type SkillOptimizerProfile } from "./profile.ts";
+
+export type OptimizeMode = "off" | "compact" | "hybrid";
 
 export interface OptimizeConfig {
 	/** What to do with the `<available_skills>` catalog: `off` | `compact` | `hybrid`. */
-	mode: SkillMode;
+	mode: OptimizeMode;
 	/** hybrid: relevant skills kept at full description + explicit location. */
 	topK: number;
 	/** hybrid tail style for non-selected skills: `name` or `intent`. */
 	tail: TailStyle;
+	/** Soft character cap for ordinary full skill renders; 0 disables the cap. */
+	fullRenderBudgetChars?: number;
 	/** What to do with the `tools` array (off by default — removing a tool has no fallback). */
 	toolsMode: ToolsMode;
 	/** drop mode: tool name prefixes to remove (e.g. `htb_`, `mcpwn_`). */
@@ -41,13 +46,13 @@ export interface OptimizeConfig {
 
 export interface OptimizeResult {
 	next: unknown;
-	/** Net characters removed total (skills catalog + tools array). */
-	removed: number;
-	/** Chars removed by the skills-catalog rewrite (system / systemInstruction / instructions / messages / tool descriptions). */
+	/** Net JSON-serialized characters removed total (skills catalog + tools array). */
+	removedChars: number;
+	/** JSON-serialized chars removed by the skills-catalog rewrite. */
 	removedSkills: number;
-	/** Chars removed by slimming the `tools` array. */
+	/** JSON-serialized chars removed by slimming the `tools` array. */
 	removedTools: number;
-	/** Skill names kept at full description on the last system/tool block processed. */
+	/** Skill names kept at full description across all processed system/tool blocks. */
 	selected: string[];
 	/** Tool names dropped from the `tools` array. */
 	droppedTools: string[];
@@ -61,6 +66,10 @@ interface RequestBody {
 	instructions?: unknown;
 	tools?: unknown;
 	messages?: unknown;
+	/** OpenAI Responses conversation input. */
+	input?: unknown;
+	/** Google Gemini conversation contents. */
+	contents?: unknown;
 	[key: string]: unknown;
 }
 
@@ -107,6 +116,11 @@ function restoreSystem(system: unknown, normalized: NormalizedSystem, blocks: un
 	return system;
 }
 
+function serializedStringLength(value: string): number {
+	const encoded = JSON.stringify(value);
+	return typeof encoded === "string" ? encoded.length : 0;
+}
+
 /** Apply the skill-catalog rewrite to one text string. Returns the new text and the names kept full (hybrid). */
 function transformText(text: string, query: string, config: OptimizeConfig): { text: string; selected: string[] } {
 	if (config.mode === "off") return { text, selected: [] };
@@ -119,6 +133,7 @@ function transformText(text: string, query: string, config: OptimizeConfig): { t
 		pinnedSkills: config.pinnedSkills,
 		alwaysFull: config.alwaysFull,
 		never: config.never,
+		fullRenderBudgetChars: config.fullRenderBudgetChars,
 	});
 	return { text: r.text, selected: r.selected };
 }
@@ -132,30 +147,36 @@ function hasWork(config: OptimizeConfig): boolean {
  * Provider-agnostic: scans the Anthropic `system`, the Gemini `systemInstruction`,
  * the OpenAI Responses `instructions`, and any `messages` entry with a system or
  * developer role, plus tool descriptions. Returns the original reference (and
- * `removed: 0`) when nothing changed. Pure and idempotent.
+ * zero removed characters when nothing changed. Pure and idempotent.
  */
 export function optimize(payload: unknown, config: OptimizeConfig): OptimizeResult {
 	if (!payload || typeof payload !== "object" || !hasWork(config)) {
-		return { next: payload, removed: 0, removedSkills: 0, removedTools: 0, selected: [], droppedTools: [] };
+		return { next: payload, removedChars: 0, removedSkills: 0, removedTools: 0, selected: [], droppedTools: [] };
 	}
 	const typed = payload as RequestBody;
-	const query = config.mode === "hybrid" || config.toolsMode === "relevance" ? extractQuery(typed.messages) : "";
+	const request = config.mode === "hybrid" || config.toolsMode !== "off" ? normalizeRequest(typed) : undefined;
+	const query = config.mode === "hybrid" || config.toolsMode === "relevance"
+		? extractRequestQuery(request ?? normalizeRequest(typed))
+		: "";
 
 	let removedSkills = 0;
 	let removedTools = 0;
 	let changed = false;
 	let droppedTools: string[] = [];
 	const selected: string[] = [];
+	const selectedSet = new Set<string>();
 	const addSelected = (names: readonly string[]): void => {
 		for (const name of names) {
-			if (!selected.includes(name)) selected.push(name);
+			if (selectedSet.has(name)) continue;
+			selectedSet.add(name);
+			selected.push(name);
 		}
 	};
 	/** Rewrite a plain string field; returns the new string (or the same when unchanged). */
 	const rewriteString = (value: string): string => {
 		const r = transformText(value, query, config);
 		if (r.text === value) return value;
-		removedSkills += value.length - r.text.length;
+		removedSkills += serializedStringLength(value) - serializedStringLength(r.text);
 		addSelected(r.selected);
 		changed = true;
 		return r.text;
@@ -235,14 +256,17 @@ export function optimize(payload: unknown, config: OptimizeConfig): OptimizeResu
 
 	// Skills catalog inside a tool description, then slim the tools array itself
 	let newTools: unknown = typed.tools;
-	if (Array.isArray(typed.tools)) {
-		newTools = typed.tools.map((tool) => {
-			if (!tool || typeof tool !== "object" || typeof (tool as { description?: unknown }).description !== "string") return tool;
-			const t = tool as { description: string };
-			const description = rewriteString(t.description);
-			if (description === t.description) return tool;
-			return { ...t, description };
+	if (config.mode !== "off" && Array.isArray(typed.tools)) {
+		let descriptionsChanged = false;
+		const rewrittenTools = typed.tools.map((tool) => {
+			const definition = getToolDefinition(tool);
+			if (!definition || typeof definition.description !== "string") return tool;
+			const description = rewriteString(definition.description);
+			if (description === definition.description) return tool;
+			descriptionsChanged = true;
+			return replaceToolDescription(tool, description);
 		});
+		if (descriptionsChanged) newTools = rewrittenTools;
 	}
 	if (config.toolsMode !== "off" && Array.isArray(newTools)) {
 		const result = optimizeTools(newTools, {
@@ -250,18 +274,18 @@ export function optimize(payload: unknown, config: OptimizeConfig): OptimizeResu
 			dropPrefixes: config.toolsDropPrefixes,
 			topK: config.toolsTopK,
 			protect: config.toolsProtect,
-			keepNames: collectUsedToolNames(typed.messages),
+			keepNames: request?.usedToolNames ?? new Set<string>(),
 			query,
 		});
 		if (result.dropped.length > 0) {
 			newTools = result.tools;
-			removedTools += result.removed;
+			removedTools += result.removedChars;
 			droppedTools = result.dropped;
 			changed = true;
 		}
 	}
 	if (newTools !== typed.tools) next.tools = newTools;
 
-	if (!changed) return { next: payload, removed: 0, removedSkills: 0, removedTools: 0, selected: [], droppedTools: [] };
-	return { next, removed: removedSkills + removedTools, removedSkills, removedTools, selected, droppedTools };
+	if (!changed) return { next: payload, removedChars: 0, removedSkills: 0, removedTools: 0, selected: [], droppedTools: [] };
+	return { next, removedChars: removedSkills + removedTools, removedSkills, removedTools, selected, droppedTools };
 }

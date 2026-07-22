@@ -42,6 +42,17 @@ const OVERBROAD_ALIAS_TARGETS = new Set([
 ]);
 
 let userAliasCandidates: AliasRecord = {};
+let userAliasRevision = 0;
+
+function aliasRecordsEqual(left: AliasRecord, right: AliasRecord): boolean {
+	const leftEntries = Object.entries(left);
+	const rightEntries = Object.entries(right);
+	if (leftEntries.length !== rightEntries.length) return false;
+	return leftEntries.every(([key, targets]) => {
+		const other = right[key];
+		return other !== undefined && targets.length === other.length && targets.every((target, i) => target === other[i]);
+	});
+}
 
 function normalizeToken(value: string): string[] {
 	return value
@@ -66,8 +77,17 @@ export function normalizeAliasRecord(value: unknown): AliasRecord {
 }
 
 export function setUserAliasCandidates(value: unknown): AliasRecord {
-	userAliasCandidates = normalizeAliasRecord(value);
+	const normalized = normalizeAliasRecord(value);
+	if (!aliasRecordsEqual(userAliasCandidates, normalized)) {
+		userAliasCandidates = normalized;
+		userAliasRevision += 1;
+	}
 	return userAliasCandidates;
+}
+
+/** Monotonic revision used to invalidate catalog analyses that captured global aliases. */
+export function getUserAliasRevision(): number {
+	return userAliasRevision;
 }
 
 export function buildCatalogAliases(hasTerm: (term: string) => boolean, extraCandidates: AliasRecord = {}): QueryAliasMap {

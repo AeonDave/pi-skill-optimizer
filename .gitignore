@@ -5,4 +5,12 @@ node_modules/
 # optimizer generated state (config.json is user-authored and may be committed)
 .pi/skill-optimizer/profile.json
 .pi/skill-optimizer/usage.json
+.pi/skill-optimizer/stats.json
+.pi/skill-optimizer/*.lock
+.pi/skill-optimizer/*.tmp
+.pi/skill-optimizer/*.tmp-*
+.pi/skill-optimizer/benchmark/
 .pi-skill-optimizer.*.json
+.pi-skill-optimizer.*.lock
+.pi-skill-optimizer.*.tmp
+.pi-skill-optimizer.*.tmp-*

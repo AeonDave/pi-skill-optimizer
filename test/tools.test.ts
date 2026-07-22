@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { collectUsedToolNames, CORE_TOOLS, optimizeTools, type ToolsOptions } from "../src/tools.ts";
+import { CORE_TOOLS, optimizeTools, type ToolsOptions } from "../src/tools.ts";
 
 const TOOLS = [
 	{ name: "Read", description: "Read a file." },
@@ -18,13 +18,13 @@ test("CORE_TOOLS contains the obvious built-ins (case-insensitive lookup)", () =
 });
 
 test("drop mode removes only prefixed, non-core, non-used tools", () => {
-	const { tools, dropped, removed } = optimizeTools(TOOLS, {
+	const { tools, dropped, removedChars } = optimizeTools(TOOLS, {
 		...BASE,
 		mode: "drop",
 		dropPrefixes: ["htb_", "mcpwn_"],
 	});
 	assert.deepEqual(dropped.sort(), ["htb_app_search", "htb_app_whoami", "mcpwn_run"]);
-	assert.ok(removed > 0);
+	assert.ok(removedChars > 0);
 	assert.deepEqual((tools as Array<{ name: string }>).map((t) => t.name), ["Read", "Bash", "tavily_search"]);
 });
 
@@ -72,27 +72,31 @@ test("relevance mode preserves original tool order among the kept", () => {
 	assert.ok(names.indexOf("htb_app_whoami") < names.indexOf("htb_app_search"));
 });
 
-test("optimizeTools is identity (removed 0, same ref) when nothing is dropped", () => {
+test("optimizeTools is identity (removedChars 0, same ref) when nothing is dropped", () => {
 	const res = optimizeTools(TOOLS, { ...BASE, mode: "drop", dropPrefixes: ["nomatch_"] });
 	assert.equal(res.tools, TOOLS);
-	assert.equal(res.removed, 0);
+	assert.equal(res.removedChars, 0);
 	assert.deepEqual(res.dropped, []);
 });
 
-test("collectUsedToolNames gathers tool_use names across messages", () => {
-	const messages = [
-		{ role: "user", content: "go" },
-		{ role: "assistant", content: [{ type: "text", text: "ok" }, { type: "tool_use", name: "tavily_search" }] },
-		{ role: "assistant", content: [{ type: "tool_use", name: "htb_app_whoami" }] },
-	];
-	const used = collectUsedToolNames(messages);
-	assert.ok(used.has("tavily_search") && used.has("htb_app_whoami"));
-	assert.equal(used.size, 2);
+test("relevance mode is an identity no-op without lexical signal", () => {
+	for (const query of ["", "qzxvplm"]) {
+		const res = optimizeTools(TOOLS, { ...BASE, mode: "relevance", topK: 1, query });
+		assert.equal(res.tools, TOOLS);
+		assert.equal(res.removedChars, 0);
+		assert.deepEqual(res.dropped, []);
+	}
+});
+
+test("removedChars counts JSON-serialized characters", () => {
+	const tools = [{ name: "drop_me", description: "line\n\"C:\\tmp\"" }, { name: "Bash", description: "core" }];
+	const res = optimizeTools(tools, { ...BASE, mode: "drop", dropPrefixes: ["drop_"] });
+	assert.equal(res.removedChars, JSON.stringify(tools).length - JSON.stringify(res.tools).length);
 });
 
 test("optimizeTools handles a non-array gracefully", () => {
 	const res = optimizeTools(undefined, BASE);
-	assert.equal(res.removed, 0);
+	assert.equal(res.removedChars, 0);
 	assert.deepEqual(res.dropped, []);
 });
 
@@ -107,4 +111,60 @@ test("relevance mode keeps malformed tool entries instead of crashing", () => {
 	assert.equal(tools[0], malformed);
 	assert.deepEqual((tools as Array<{ name?: string } | undefined>).map((t) => t?.name), [undefined, "Bash", "foo_search"]);
 	assert.deepEqual(dropped, []);
+});
+
+test("drop and relevance modes understand nested OpenAI Chat function definitions", () => {
+	const tools = [
+		{ type: "function", function: { name: "vendor_search", description: "Search current vulnerability news." } },
+		{ type: "function", function: { name: "vendor_other", description: "Unrelated operation." } },
+	];
+	const dropped = optimizeTools(tools, { ...BASE, mode: "drop", dropPrefixes: ["vendor_"] });
+	assert.deepEqual(dropped.dropped, ["vendor_search", "vendor_other"]);
+	const relevant = optimizeTools(tools, { ...BASE, mode: "relevance", topK: 1, query: "search vulnerability news" });
+	assert.deepEqual(relevant.dropped, ["vendor_other"]);
+	assert.equal(relevant.tools[0], tools[0]);
+});
+
+test("relevance indexes bounded direct input schemas without changing tool payloads", () => {
+	const tools = [
+		{
+			name: "record_lookup",
+			description: "Fetch one record.",
+			input_schema: {
+				type: "object",
+				required: ["advisoryId"],
+				properties: {
+					advisoryId: { type: "string", description: "GitHub security advisory identifier" },
+					severity: { type: "string", enum: ["critical", "high", "medium"] },
+				},
+			},
+		},
+		{ name: "record_archive", description: "Archive one record." },
+	];
+	const result = optimizeTools(tools, { ...BASE, mode: "relevance", topK: 1, query: "critical github security advisory identifier" });
+	assert.deepEqual(result.dropped, ["record_archive"]);
+	assert.equal(result.tools[0], tools[0]);
+	assert.deepEqual(result.tools[0], tools[0]);
+});
+
+test("relevance indexes OpenAI function.parameters property descriptions and enums", () => {
+	const tools = [
+		{
+			type: "function",
+			function: {
+				name: "asset_lookup",
+				description: "Fetch an asset.",
+				parameters: {
+					type: "object",
+					properties: {
+						cloudRegion: { type: "string", description: "Deployment geography", enum: ["eu-west-1", "us-east-1"] },
+					},
+				},
+			},
+		},
+		{ type: "function", function: { name: "asset_delete", description: "Delete an asset." } },
+	];
+	const result = optimizeTools(tools, { ...BASE, mode: "relevance", topK: 1, query: "deployment geography eu west" });
+	assert.deepEqual(result.dropped, ["asset_delete"]);
+	assert.equal(result.tools[0], tools[0]);
 });

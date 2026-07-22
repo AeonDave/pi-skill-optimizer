@@ -30,21 +30,83 @@ export function stripCodeFences(text: string): string {
 
 /** Parse the model's JSON profile, tolerating code fences, comments, and trailing commas. */
 export function parseJsonObject(text: string): unknown {
-	let cleaned = stripCodeFences(text).trim();
-	// collapse multi-line strings into single lines (newlines are not valid JSON string chars)
-	cleaned = cleaned.replace(/"((?:[^"\\]|\\.)*)"/g, (m) =>
-		m.replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t"),
-	);
-	// strip // line comments
-	cleaned = cleaned.replace(/\/\/.*$/gm, "");
-	// strip /* */ block comments
-	cleaned = cleaned.replace(/\/\*[\s\S]*?\*\//g, "");
-	// remove trailing commas before } or ]
-	cleaned = cleaned.replace(/,(\s*[}\]])/g, "$1");
-	const start = cleaned.indexOf("{");
-	const end = cleaned.lastIndexOf("}");
-	if (start < 0 || end <= start) throw new Error("model response did not contain a JSON object");
-	return JSON.parse(cleaned.slice(start, end + 1));
+	const source = stripCodeFences(text).trim();
+	let started = false;
+	let inString = false;
+	let escaped = false;
+	let lineComment = false;
+	let blockComment = false;
+	let depth = 0;
+	let cleaned = "";
+
+	for (let i = 0; i < source.length; i++) {
+		const ch = source[i];
+		const next = source[i + 1];
+		if (!started) {
+			if (ch !== "{") continue;
+			started = true;
+			depth = 1;
+			cleaned = "{";
+			continue;
+		}
+		if (lineComment) {
+			if (ch === "\n") {
+				lineComment = false;
+				cleaned += ch;
+			}
+			continue;
+		}
+		if (blockComment) {
+			if (ch === "*" && next === "/") {
+				blockComment = false;
+				i++;
+			} else if (ch === "\n") cleaned += ch;
+			continue;
+		}
+		if (inString) {
+			if (escaped) {
+				cleaned += ch;
+				escaped = false;
+			} else if (ch === "\\") {
+				cleaned += ch;
+				escaped = true;
+			} else if (ch === '"') {
+				cleaned += ch;
+				inString = false;
+			} else if (ch === "\n") cleaned += "\\n";
+			else if (ch === "\r") cleaned += "\\r";
+			else if (ch === "\t") cleaned += "\\t";
+			else cleaned += ch;
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+			cleaned += ch;
+			continue;
+		}
+		if (ch === "/" && next === "/") {
+			lineComment = true;
+			i++;
+			continue;
+		}
+		if (ch === "/" && next === "*") {
+			blockComment = true;
+			i++;
+			continue;
+		}
+		if (ch === "}" || ch === "]") {
+			const whitespace = cleaned.match(/\s*$/)?.[0] ?? "";
+			const prefix = cleaned.slice(0, cleaned.length - whitespace.length);
+			if (prefix.endsWith(",")) cleaned = `${prefix.slice(0, -1)}${whitespace}`;
+			depth--;
+			cleaned += ch;
+			if (depth === 0) return JSON.parse(cleaned);
+			continue;
+		}
+		if (ch === "{" || ch === "[") depth++;
+		cleaned += ch;
+	}
+	throw new Error("model response did not contain a JSON object");
 }
 
 /** Split `items` into consecutive groups of at most `size` (one group when `size <= 0`). */
@@ -57,27 +119,48 @@ export function chunk<T>(items: readonly T[], size: number): T[][] {
 
 /** Outcome of interpreting a single batch's model response. */
 export type BatchResponseOutcome =
-	| { status: "ok"; profile: SkillOptimizerProfile; truncated: boolean }
-	| { status: "failed"; reason: string };
+	| { status: "ok"; profile: SkillOptimizerProfile; processedSkills: string[] }
+	| { status: "failed"; reason: string; retryable: boolean };
+
+function readProcessedSkills(value: unknown): string[] | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const raw = record.processedSkills;
+	if (!Array.isArray(raw)) return undefined;
+	return [...new Set(raw
+		.filter((name): name is string => typeof name === "string")
+		.map((name) => name.trim())
+		.filter(Boolean))];
+}
 
 /**
- * Classify a batch response: an `error`/`aborted` stop, or a body with no parseable
- * JSON object, is a `failed` outcome (with a human-readable reason). A `length`
- * (truncated) stop still parses what came back and is flagged `truncated`.
+ * Classify truncated, errored, aborted, invalid, and explicitly uncovered batch
+ * responses as failures. Successful responses must declare processed skill coverage.
  */
 export function interpretBatchResponse(response: ModelResponse): BatchResponseOutcome {
 	const stopReason = response.stopReason;
+	if (stopReason === "length") {
+		return { status: "failed", reason: "output was truncated (length limit)", retryable: true };
+	}
 	if (stopReason === "error" || stopReason === "aborted") {
 		const detail = response.errorMessage;
-		return { status: "failed", reason: `${stopReason}${detail ? `: ${detail}` : ""}` };
+		return {
+			status: "failed",
+			reason: `${stopReason}${detail ? `: ${detail}` : ""}`,
+			retryable: stopReason === "error",
+		};
 	}
 	let parsed: unknown;
 	try {
 		parsed = parseJsonObject(responseText(response));
 	} catch (err) {
-		return { status: "failed", reason: `produced no valid JSON (${(err as Error).message})` };
+		return { status: "failed", reason: `produced no valid JSON (${(err as Error).message})`, retryable: true };
 	}
-	return { status: "ok", profile: normalizeProfile(parsed), truncated: stopReason === "length" };
+	const processedSkills = readProcessedSkills(parsed);
+	if (!processedSkills || processedSkills.length === 0) {
+		return { status: "failed", reason: "omitted explicit processedSkills coverage", retryable: true };
+	}
+	return { status: "ok", profile: normalizeProfile(parsed), processedSkills };
 }
 
 /** Result of a batched profile generation: the merged partial plus which skills landed. */
@@ -85,6 +168,11 @@ export interface BatchGenerationResult {
 	partial: SkillOptimizerProfile;
 	/** Skill names covered by a batch that succeeded. */
 	applied: Set<string>;
+}
+
+export interface GeneratedBatchProfile {
+	profile: SkillOptimizerProfile;
+	processedSkills: readonly string[];
 }
 
 /**
@@ -97,17 +185,20 @@ export interface BatchGenerationResult {
 export async function generateProfileInBatches(
 	targetSkills: readonly SkillRef[],
 	batchSize: number,
-	runBatch: (batch: SkillRef[], index: number, total: number) => Promise<SkillOptimizerProfile | undefined>,
+	runBatch: (batch: SkillRef[], index: number, total: number) => Promise<GeneratedBatchProfile | undefined>,
 ): Promise<BatchGenerationResult | undefined> {
 	const batches = chunk(targetSkills, batchSize);
 	const partials: SkillOptimizerProfile[] = [];
 	const applied = new Set<string>();
 	for (let i = 0; i < batches.length; i++) {
 		const batch = batches[i];
-		const profile = await runBatch(batch, i, batches.length);
-		if (!profile) continue;
-		partials.push(profile);
-		for (const skill of batch) applied.add(skill.name);
+		const generated = await runBatch(batch, i, batches.length);
+		if (!generated) continue;
+		const expected = new Set(batch.map((skill) => skill.name));
+		const covered = new Set(generated.processedSkills);
+		if (covered.size !== expected.size || [...covered].some((name) => !expected.has(name))) continue;
+		partials.push(generated.profile);
+		for (const name of expected) applied.add(name);
 	}
 	if (partials.length === 0) return undefined;
 	const partial = partials.reduce((acc, p) => mergeProfiles(acc, p), EMPTY_PROFILE);

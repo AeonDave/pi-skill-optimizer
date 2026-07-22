@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+## 1.1.0 - 2026-07-23
+
+### Changed
+- Added a shared provider-request normalizer for query extraction, system
+  surfaces, and Anthropic/OpenAI/Gemini tool-use history.
+- Added bounded typo recovery over skill names/profile aliases and bounded
+  JSON-schema terms for tool relevance scoring.
+- Added a configurable soft full-render budget that never caps critical, pinned,
+  explicitly protected, or ambiguity-guard skill selections.
+- Hardened tool-output reduction around real UTF-8 byte limits, protected
+  evidence with context, ordered-verbatim extraction validation, minimum benefit
+  floors, and the fail-open chain `extract -> smart -> original`.
+- Added bounded usage-history pruning that preserves critical and current pins,
+  plus separate output-attempt and fallback telemetry.
+- Added an opt-in private real-corpus pipeline: one-shot pre-optimization catalog
+  capture, irreversible local redaction, observed skill-read labels, real output
+  comparison against RTK, and authoritative Luna token/cache usage.
+- Limited public skill modes to `off`, `compact`, and `hybrid`, and clarified
+  that RTK is a recommended output companion rather than a runtime prerequisite.
+- Split exact serialized-character savings from estimated token equivalents in
+  diagnostics and measurement output.
+
+### Fixed
+- Hybrid no-signal requests now retain compact intent, and repeated catalog
+  optimization is an identity operation that preserves loadability notes.
+- Tool relevance now fails open without a lexical match and protects tools used
+  in canonical provider histories.
+- Incomplete `init` batches remain retryable; profile version/scope handling and
+  generated JSON parsing no longer accept partial or misclassified data.
+- Profile, usage, and statistics state uses atomic replacement, with serialized
+  delta updates for concurrent writers.
+- Corrected boolean disable parsing, zero top-K selection, compact-description
+  bounds, path-note markup, scoped clusters, alias cache invalidation, and
+  conservative usage deduplication.
+- Benchmarks now enforce exact idempotence, discovery, and loadability
+  invariants, fuzzy recovery, soft budgets, cache stability, UTF-8 safety,
+  evidence recall, and hallucination rejection; provider normalization and usage
+  behavior have dedicated tests.
+
 ## 1.0.1 - 2026-07-01
 
 ### Fixed
@@ -27,10 +68,8 @@ All notable changes to this project are documented here. The format follows
 First stable release.
 
 ### Skills catalog
-- `hybrid` (default): dependency-free BM25 ranking over the full descriptions;
-  top-K full (name + description + explicit `<location>`), the rest name-only
-  with a single shared `<skill_path_note>` — every skill stays discoverable and
-  loadable. ~67% catalog savings with 100% loadability in a 3000-query fuzz.
+- `hybrid` (default): dependency-free BM25 ranking over full descriptions;
+  top-K full and a compact tail with a shared `<skill_path_note>`.
 - `compact`: keep every skill, trimmed to its intent sentence; query-independent
   (cache-stable).
 - Adaptive top-K, `alwaysFull` allowlist, `never` denylist, usage-based pinning,

@@ -18,6 +18,12 @@ test("normalizeProfile accepts enhanced init output and drops malformed fields",
 	assert.deepEqual(profile.negativeHints.tcpdump, ["python tests"]);
 });
 
+test("normalizeProfile does not reinterpret structured fields as legacy aliases", () => {
+	const profile = normalizeProfile({ critical: ["test-driven-development"] });
+	assert.deepEqual(profile.aliases, {});
+	assert.deepEqual(profile.critical, ["test-driven-development"]);
+});
+
 test("mergeProfiles unions aliases, critical, and name-keyed records (project extends global)", () => {
 	const global = normalizeProfile({
 		aliases: { apk: ["android"] },
@@ -61,6 +67,13 @@ test("splitProfileByScope routes project-skill entries to the project slice, kee
 	assert.deepEqual(project.queries["my-project-skill"], ["deploy demo"]);
 	assert.deepEqual(project.clusters.mix, ["my-project-skill"]);
 	assert.deepEqual(project.negativeHints["my-project-skill"], ["unrelated"]);
+});
+
+test("splitProfileByScope preserves global skills referenced only by clusters", () => {
+	const profile = normalizeProfile({ clusters: { crypto: ["openssl", "project-crypto"] } });
+	const { global, project } = splitProfileByScope(profile, new Set(["project-crypto"]));
+	assert.deepEqual(global.clusters.crypto, ["openssl"]);
+	assert.deepEqual(project.clusters.crypto, ["project-crypto"]);
 });
 
 test("hashSkill is stable for same input and changes when description changes", () => {
@@ -118,11 +131,14 @@ test("mergeIncrementalProfile replaces changed skills and keeps the rest", () =>
 	const base = normalizeProfile({
 		critical: ["keep", "was"],
 		queries: { keep: ["old keep"], was: ["old was"] },
+		clusters: { old: ["keep", "was"] },
 		negativeHints: { was: ["old hint"] },
 	});
 	const partial = normalizeProfile({
 		critical: [], // 'was' is changed and the model no longer marks it critical
-		queries: { was: ["new was"] },
+		queries: { was: ["new was"], unexpected: ["must not leak"] },
+		clusters: { fresh: ["was"], unexpected: ["other"] },
+		negativeHints: { unexpected: ["must not leak"] },
 	});
 	const out = mergeIncrementalProfile(base, partial, ["was"]);
 	assert.deepEqual(out.queries.keep, ["old keep"]); // unchanged kept
@@ -130,6 +146,11 @@ test("mergeIncrementalProfile replaces changed skills and keeps the rest", () =>
 	assert.ok(out.critical.includes("keep")); // unchanged critical kept
 	assert.ok(!out.critical.includes("was")); // changed skill demoted per partial
 	assert.ok(!("was" in out.negativeHints)); // changed skill's stale hint dropped (none in partial)
+	assert.deepEqual(out.clusters.old, ["keep"]); // stale membership for changed skill removed
+	assert.deepEqual(out.clusters.fresh, ["was"]); // replacement membership accepted
+	assert.ok(!("unexpected" in out.queries));
+	assert.ok(!("unexpected" in out.clusters));
+	assert.ok(!("unexpected" in out.negativeHints));
 });
 
 test("usage stats record and select pinned skills by frequency plus recency", () => {

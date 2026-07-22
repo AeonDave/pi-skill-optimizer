@@ -9,7 +9,6 @@
  *   - `hybrid` (default): keep relevant skills at full description and keep a
  *      short, loadable tail for missed skills.
  *   - `compact`: keep every skill, trim each description to its intent sentence.
- *   - `strip`: remove the catalog entirely (maximum savings, no discovery).
  *
  * Provider-agnostic by default; scope with `PI_SKILL_OPTIMIZER_PROVIDERS`.
  * Pi has no `Skill` tool: the model loads a skill by `read`-ing its `<location>`,
@@ -21,16 +20,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { complete, type UserMessage } from "@earendil-works/pi-ai";
 import { generateProfileInBatches, interpretBatchResponse, responseText } from "./generate.ts";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
 import { setUserAliasCandidates } from "./aliases.ts";
-import { ensureGlobalConfigTemplate, getConfig, getConfigPaths, getOutputConfig, getPinnedTopK, getProfilePaths, getScopeProviders, getStatsFilePath, getUsageFilePath, isDisabled } from "./config.ts";
-import { buildExtractPrompt, isExcludedCommand, isRtkSource, mergeExtracted, reduceOutput, signalLines } from "./output.ts";
+import { ensureGlobalConfigTemplate, getConfig, getConfigPaths, getOutputConfig, getPinnedTopK, getProfilePaths, getScopeProviders, getStatsFilePath, getUsageConfig, getUsageFilePath, isDisabled } from "./config.ts";
+import { buildExtractPrompt, DEFAULT_OUTPUT_OPTIONS, isExcludedCommand, isRtkSource, reduceOutput, utf8ByteLength, validateExtractedOutput, type ExtractRejectionReason } from "./output.ts";
 import { optimize } from "./optimize.ts";
-import { computeFinalHashes, diffSkills, EMPTY_PROFILE, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope, type SkillOptimizerProfile } from "./profile.ts";
-import { normalizeUsageFile, recordSkillUsage, selectPinnedSkills, selectUsageRecordSkills, toUsageFile, usageRecordSignature, type SkillUsageStats } from "./usage.ts";
-import { addSavings, EMPTY_SAVINGS, normalizeStatsFile, type SavingsByArea, toStatsFile, totalSavings } from "./stats.ts";
+import { ConcurrentFileUpdateError, fileExists, loadExtractionTelemetryFile, loadMergedProfile, loadStatsFile, loadUsageFile, pruneUsageFile, readStoredProfile, saveStatsDeltas, saveTemporaryOutput, saveUsageDelta, writeProfileFiles, type ProfileWrite } from "./persistence.ts";
+import { computeFinalHashes, diffSkills, EMPTY_PROFILE, mergeIncrementalProfile, mergeProfiles, pruneProfileNames, splitProfileByScope, type SkillOptimizerProfile } from "./profile.ts";
+import { collectSkillUsageEvidence, pruneUsageStats, recordSkillUsage, selectPinnedSkills, type SkillUsageStats, type UsagePruneOptions } from "./usage.ts";
+import { addExtractionTelemetry, addSavings, EMPTY_EXTRACTION_TELEMETRY, EMPTY_SAVINGS, subtractExtractionTelemetry, subtractSavings, totalExtractionEvents, type ExtractionTelemetry, type SavingsByArea, totalSavings } from "./stats.ts";
 
 const STATUS_KEY = "skill-optimizer";
 
@@ -118,11 +115,8 @@ async function tryExtractOutput(ctx: ExtensionContext, spec: string, request: st
 			{ systemPrompt: system, messages: [message] },
 			{ apiKey: auth.apiKey, headers: auth.headers },
 		);
-		const extracted = responseText(response).trim();
-		if (!extracted) return undefined;
-		const merged = mergeExtracted(extracted, signalLines(text));
-		if (!merged || merged.length >= text.length) return undefined;
-		return merged;
+		const extracted = responseText(response);
+		return extracted.trim() ? extracted : undefined;
 	} catch {
 		return undefined;
 	}
@@ -130,51 +124,6 @@ async function tryExtractOutput(ctx: ExtensionContext, spec: string, request: st
 
 function profileSummary(profile: SkillOptimizerProfile): string {
 	return `${Object.keys(profile.aliases).length} aliases, ${profile.critical.length} critical, ${Object.keys(profile.queries).length} query sets`;
-}
-
-interface StoredProfile {
-	profile: SkillOptimizerProfile;
-	hashes: Record<string, string>;
-	initVersion: number;
-}
-
-function sanitizeHashes(value: unknown): Record<string, string> {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-	const out: Record<string, string> = {};
-	for (const [name, hash] of Object.entries(value as Record<string, unknown>)) {
-		if (typeof hash === "string" && hash) out[name] = hash;
-	}
-	return out;
-}
-
-function readStoredProfile(path: string): StoredProfile {
-	if (!existsSync(path)) return { profile: EMPTY_PROFILE, hashes: {}, initVersion: 0 };
-	const raw = JSON.parse(readFileSync(path, "utf8")) as { skillHashes?: unknown; initVersion?: unknown };
-	return {
-		profile: normalizeProfile(raw),
-		hashes: sanitizeHashes(raw.skillHashes),
-		initVersion: typeof raw.initVersion === "number" ? raw.initVersion : 0,
-	};
-}
-
-/** Load global + project profiles and merge them (project extends global). */
-function loadMergedProfile(paths: { global: string; project: string }): SkillOptimizerProfile {
-	const globalProfile = readStoredProfile(paths.global).profile;
-	const projectProfile = paths.project === paths.global ? EMPTY_PROFILE : readStoredProfile(paths.project).profile;
-	const merged = mergeProfiles(globalProfile, projectProfile);
-	setUserAliasCandidates(merged.aliases);
-	return merged;
-}
-
-function writeProfileFile(
-	path: string,
-	profile: SkillOptimizerProfile,
-	skillCount: number,
-	hashes: Record<string, string>,
-): void {
-	mkdirSync(dirname(path), { recursive: true });
-	const body = { version: 2, initVersion: INIT_VERSION, generatedAt: new Date().toISOString(), skillCount, ...profile, skillHashes: hashes };
-	writeFileSync(path, `${JSON.stringify(body, null, 2)}\n`, "utf8");
 }
 
 function pickKeys(record: Record<string, string>, keep: (name: string) => boolean): Record<string, string> {
@@ -189,16 +138,6 @@ function usageCount(stats: SkillUsageStats): number {
 	return Object.keys(stats).length;
 }
 
-function loadUsageFile(path: string): SkillUsageStats {
-	if (!existsSync(path)) return {};
-	return normalizeUsageFile(JSON.parse(readFileSync(path, "utf8")));
-}
-
-function saveUsageFile(path: string, stats: SkillUsageStats): void {
-	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(toUsageFile(stats), null, 2)}\n`, "utf8");
-}
-
 export default function skillOptimizer(pi: ExtensionAPI) {
 	let lastRemovedChars = 0;
 	let lastSelected: string[] = [];
@@ -207,57 +146,125 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	let loadedUsagePath: string | undefined;
 	let activeProfile: SkillOptimizerProfile = EMPTY_PROFILE;
 	let usageStats: SkillUsageStats = {};
-	let lastUsageRecordSignature = "";
+	const pendingUsage = new Map<string, SkillUsageStats>();
+	const seenUsageEvidence = new Set<string>();
+	const maxUsageEvidence = 4096;
+	const usagePruneOptions = (ctx: ExtensionContext, stats: SkillUsageStats): UsagePruneOptions => {
+		const config = getConfig(ctx.cwd);
+		return {
+			...getUsageConfig(ctx.cwd),
+			protectedNames: [
+				...activeProfile.critical,
+				...(config.alwaysFull ?? []),
+				...selectPinnedSkills(stats, getPinnedTopK(ctx.cwd)),
+			],
+		};
+	};
 
-	// Granular savings telemetry (chars removed per area).
+	// Savings are removed characters; extraction guard outcomes are event counts.
 	let sessionSaved: SavingsByArea = { ...EMPTY_SAVINGS };
+	let sessionExtraction: ExtractionTelemetry = { ...EMPTY_EXTRACTION_TELEMETRY };
 	let baseLifetime: SavingsByArea = { ...EMPTY_SAVINGS };
+	let baseExtraction: ExtractionTelemetry = { ...EMPTY_EXTRACTION_TELEMETRY };
+	const pendingStats = new Map<string, SavingsByArea>();
+	const pendingExtraction = new Map<string, ExtractionTelemetry>();
 	let loadedStatsPath: string | undefined;
 	let lastFlushAt = 0;
+	const pendingSavings = (path: string): SavingsByArea => pendingStats.get(path) ?? { ...EMPTY_SAVINGS };
+	const pendingExtract = (path: string): ExtractionTelemetry => pendingExtraction.get(path) ?? { ...EMPTY_EXTRACTION_TELEMETRY };
+	const addPendingSavings = (path: string, delta: SavingsByArea): void => {
+		pendingStats.set(path, addSavings(pendingSavings(path), delta));
+	};
+	const addPendingExtraction = (path: string, delta: ExtractionTelemetry): void => {
+		pendingExtraction.set(path, addExtractionTelemetry(pendingExtract(path), delta));
+	};
+	const flushStats = (onlyPath?: string): void => {
+		const paths = onlyPath ? [onlyPath] : [...new Set([...pendingStats.keys(), ...pendingExtraction.keys()])];
+		for (const path of paths) {
+			const savingsDelta = pendingSavings(path);
+			const extractionDelta = pendingExtract(path);
+			if (totalSavings(savingsDelta) === 0 && totalExtractionEvents(extractionDelta) === 0) continue;
+			try {
+				const saved = saveStatsDeltas(path, savingsDelta, extractionDelta);
+				const remainingSavings = subtractSavings(pendingSavings(path), savingsDelta);
+				const remainingExtraction = subtractExtractionTelemetry(pendingExtract(path), extractionDelta);
+				if (totalSavings(remainingSavings) === 0) pendingStats.delete(path);
+				else pendingStats.set(path, remainingSavings);
+				if (totalExtractionEvents(remainingExtraction) === 0) pendingExtraction.delete(path);
+				else pendingExtraction.set(path, remainingExtraction);
+				if (loadedStatsPath === path) {
+					baseLifetime = saved.savings;
+					baseExtraction = saved.extraction;
+				}
+			} catch {
+				// Keep the delta pending and fail open.
+			}
+		}
+	};
 	const ensureStatsLoaded = (ctx: ExtensionContext): string => {
 		const path = getStatsFilePath(ctx.cwd);
 		if (path !== loadedStatsPath) {
+			loadedStatsPath = undefined;
 			try {
-				baseLifetime = existsSync(path) ? normalizeStatsFile(JSON.parse(readFileSync(path, "utf8"))) : { ...EMPTY_SAVINGS };
+				baseLifetime = loadStatsFile(path);
+				baseExtraction = loadExtractionTelemetryFile(path);
+				loadedStatsPath = path;
 			} catch {
 				baseLifetime = { ...EMPTY_SAVINGS };
+				baseExtraction = { ...EMPTY_EXTRACTION_TELEMETRY };
 			}
-			loadedStatsPath = path;
 		}
 		return path;
 	};
-	const flushStats = (): void => {
-		if (!loadedStatsPath || totalSavings(sessionSaved) === 0) return;
-		try {
-			mkdirSync(dirname(loadedStatsPath), { recursive: true });
-			writeFileSync(loadedStatsPath, `${JSON.stringify(toStatsFile(addSavings(baseLifetime, sessionSaved)), null, 2)}\n`, "utf8");
-		} catch {
-			// telemetry is best-effort; never disrupt the session
+	const flushUsage = (onlyPath?: string, ctx?: ExtensionContext): void => {
+		const paths = onlyPath ? [onlyPath] : [...pendingUsage.keys()];
+		for (const path of paths) {
+			const delta = pendingUsage.get(path);
+			if (!delta || usageCount(delta) === 0) continue;
+			try {
+				const saved = saveUsageDelta(path, delta, ctx ? usagePruneOptions(ctx, usageStats) : undefined);
+				pendingUsage.delete(path);
+				if (loadedUsagePath === path) usageStats = saved;
+			} catch (err) {
+				ctx?.ui.notify(`skill-optimizer: failed to save usage stats (${(err as Error).message})`, "warning");
+			}
 		}
+	};
+	const resetLastRequest = (ctx: ExtensionContext): void => {
+		lastRemovedChars = 0;
+		lastSelected = [];
+		lastDroppedTools = 0;
+		setStatus(ctx, undefined);
 	};
 
 	const ensureStateLoaded = (ctx: ExtensionContext): void => {
 		const profilePaths = getProfilePaths(ctx.cwd);
 		const profileKey = `${profilePaths.global}::${profilePaths.project}`;
 		if (profileKey !== loadedProfilePath) {
+			loadedProfilePath = undefined;
 			try {
 				activeProfile = loadMergedProfile(profilePaths);
+				setUserAliasCandidates(activeProfile.aliases);
 				loadedProfilePath = profileKey;
 			} catch (err) {
 				activeProfile = EMPTY_PROFILE;
 				setUserAliasCandidates({});
-				loadedProfilePath = profileKey;
 				ctx.ui.notify(`skill-optimizer: failed to load profile (${(err as Error).message})`, "warning");
 			}
 		}
 		const usagePath = getUsageFilePath(ctx.cwd);
 		if (usagePath === loadedUsagePath) return;
+		if (loadedUsagePath) flushUsage(loadedUsagePath, ctx);
+		loadedUsagePath = undefined;
 		try {
-			usageStats = loadUsageFile(usagePath);
+			const loaded = loadUsageFile(usagePath);
+			const pruneOptions = usagePruneOptions(ctx, loaded);
+			usageStats = pruneUsageStats(loaded, pruneOptions);
+			if (usageStats !== loaded) usageStats = pruneUsageFile(usagePath, pruneOptions);
 			loadedUsagePath = usagePath;
+			seenUsageEvidence.clear();
 		} catch (err) {
 			usageStats = {};
-			loadedUsagePath = usagePath;
 			ctx.ui.notify(`skill-optimizer: failed to load usage stats (${(err as Error).message})`, "warning");
 		}
 	};
@@ -277,16 +284,23 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 
 		const paths = getProfilePaths(ctx.cwd);
-		const stored = readStoredProfile(paths.global);
-		const projectStored = paths.project !== paths.global && existsSync(paths.project)
-			? readStoredProfile(paths.project)
-			: undefined;
-		const baseProfile = projectStored ? mergeProfiles(stored.profile, projectStored.profile) : stored.profile;
-		const storedHashes = projectStored ? { ...stored.hashes, ...projectStored.hashes } : stored.hashes;
+		let stored: ReturnType<typeof readStoredProfile>;
+		let projectStored: ReturnType<typeof readStoredProfile> | undefined;
+		try {
+			stored = readStoredProfile(paths.global);
+			projectStored = paths.project !== paths.global ? readStoredProfile(paths.project) : undefined;
+		} catch (err) {
+			ctx.ui.notify(`skill-optimizer: failed to read existing profile (${(err as Error).message})`, "error");
+			return;
+		}
+		const baseProfile = projectStored?.exists ? mergeProfiles(stored.profile, projectStored.profile) : stored.profile;
+		const storedHashes = projectStored?.exists ? { ...stored.hashes, ...projectStored.hashes } : stored.hashes;
 
 		// A tool/prompt upgrade (INIT_VERSION bump) forces a full regeneration; otherwise
 		// only new/modified skills are sent to the model and removed ones are pruned.
-		const forceFull = !existsSync(paths.global) || stored.initVersion !== INIT_VERSION;
+		const forceFull = !stored.exists
+			|| stored.initVersion !== INIT_VERSION
+			|| (!!projectStored?.exists && projectStored.initVersion !== INIT_VERSION);
 		const { changed, removed, hashes } = diffSkills(
 			skills.map((skill) => ({ name: skill.name, description: skill.description })),
 			forceFull ? {} : storedHashes,
@@ -311,6 +325,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			const systemPrompt = [
 				"You generate a compact JSON retrieval profile for lexical skill retrieval.",
 				"Return only JSON. No markdown.",
+				"Include processedSkills as an array containing every input skill name exactly as given after inspecting it.",
 				"Schema: {\"aliases\":{\"query_token\":[\"catalog_token\"]},\"critical\":[\"skill-name\"],\"queries\":{\"skill-name\":[\"example user query\"]},\"clusters\":{\"topic\":[\"skill-name\"]},\"negativeHints\":{\"skill-name\":[\"misleading query\"]}}.",
 				"aliases: keys are lowercase single query tokens; values are lowercase single tokens that appear in skill names/descriptions.",
 				"critical = the ALWAYS-ON skills that define HOW to work in essentially every session, because lexical ranking can never surface them from a task query. Two kinds belong here:",
@@ -352,10 +367,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 					ctx.ui.notify(`skill-optimizer: ${label} ${outcome.reason}`, "warning");
 					return undefined;
 				}
-				if (outcome.truncated) {
-					ctx.ui.notify(`skill-optimizer: ${label} output was truncated (length limit); using what was returned`, "warning");
-				}
-				return outcome.profile;
+				return { profile: outcome.profile, processedSkills: outcome.processedSkills };
 			});
 			if (!result) {
 				ctx.ui.notify(`skill-optimizer: profile generation failed for all ${batchCount} batch(es); no changes written`, "error");
@@ -379,7 +391,17 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const splitEnabled = paths.project !== paths.global && projectNames.size > 0;
 
 		if (!splitEnabled) {
-			writeProfileFile(paths.global, profile, skills.length, finalHashes);
+			const writes: ProfileWrite[] = [{ path: paths.global, profile, skillCount: skills.length, hashes: finalHashes, expectedRevision: stored.revision }];
+			if (projectStored?.exists) {
+				writes.push({ path: paths.project, profile: EMPTY_PROFILE, skillCount: 0, hashes: {}, expectedRevision: projectStored.revision });
+			}
+			try {
+				writeProfileFiles(writes, INIT_VERSION);
+			} catch (err) {
+				const detail = err instanceof ConcurrentFileUpdateError ? "profile changed concurrently; run init again" : (err as Error).message;
+				ctx.ui.notify(`skill-optimizer: profile was not saved (${detail})`, "error");
+				return;
+			}
 			activeProfile = profile;
 			setUserAliasCandidates(profile.aliases);
 			loadedProfilePath = `${paths.global}::${paths.project}`;
@@ -390,8 +412,16 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const { global: globalProfile, project: projectProfile } = splitProfileByScope(profile, projectNames);
 		const globalHashes = pickKeys(finalHashes, (name) => !projectNames.has(name));
 		const projectHashes = pickKeys(finalHashes, (name) => projectNames.has(name));
-		writeProfileFile(paths.global, globalProfile, Object.keys(globalHashes).length, globalHashes);
-		writeProfileFile(paths.project, projectProfile, Object.keys(projectHashes).length, projectHashes);
+		try {
+			writeProfileFiles([
+				{ path: paths.global, profile: globalProfile, skillCount: Object.keys(globalHashes).length, hashes: globalHashes, expectedRevision: stored.revision },
+				{ path: paths.project, profile: projectProfile, skillCount: Object.keys(projectHashes).length, hashes: projectHashes, expectedRevision: projectStored?.revision ?? null },
+			], INIT_VERSION);
+		} catch (err) {
+			const detail = err instanceof ConcurrentFileUpdateError ? "profile changed concurrently; run init again" : (err as Error).message;
+			ctx.ui.notify(`skill-optimizer: profiles were not saved (${detail})`, "error");
+			return;
+		}
 		activeProfile = mergeProfiles(globalProfile, projectProfile);
 		setUserAliasCandidates(activeProfile.aliases);
 		loadedProfilePath = `${paths.global}::${paths.project}`;
@@ -399,6 +429,11 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		seenUsageEvidence.clear();
+		sessionSaved = { ...EMPTY_SAVINGS };
+		sessionExtraction = { ...EMPTY_EXTRACTION_TELEMETRY };
+		lastFlushAt = 0;
+		resetLastRequest(ctx);
 		try {
 			const created = ensureGlobalConfigTemplate();
 			if (created) ctx.ui.notify(`skill-optimizer: wrote default config to ${created} (edit to configure)`, "info");
@@ -408,42 +443,57 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
-		if (isDisabled(ctx.cwd)) return;
+		resetLastRequest(ctx);
+		if (isDisabled(ctx.cwd)) {
+			return;
+		}
 		const providers = getScopeProviders(ctx.cwd);
-		if (providers && ctx.model && !providers.includes(ctx.model.provider)) return;
+		if (providers && ctx.model && !providers.includes(ctx.model.provider)) {
+			return;
+		}
 		ensureStateLoaded(ctx);
+		if (loadedUsagePath) flushUsage(loadedUsagePath, ctx);
 
 		const config = {
 			...getConfig(ctx.cwd),
 			profile: activeProfile,
 			pinnedSkills: selectPinnedSkills(usageStats, getPinnedTopK(ctx.cwd)),
 		};
-		ensureStatsLoaded(ctx);
-		const { next, removed, removedSkills, removedTools, selected, droppedTools } = optimize(event.payload, config);
-		if (removed > 0) {
-			lastRemovedChars = removed;
-			lastSelected = selected;
-			lastDroppedTools = droppedTools.length;
+		const statsPath = ensureStatsLoaded(ctx);
+		const { next, removedChars, removedSkills, removedTools, selected, droppedTools } = optimize(event.payload, config);
+		lastRemovedChars = removedChars;
+		lastSelected = selected;
+		lastDroppedTools = droppedTools.length;
+		if (removedChars > 0) {
 			sessionSaved.skills += removedSkills;
 			sessionSaved.tools += removedTools;
-			setStatus(ctx, `✂ −${approxK(removed)} tok`);
+			addPendingSavings(statsPath, { skills: removedSkills, tools: removedTools, output: 0 });
+			setStatus(ctx, `✂ −${approxK(removedChars)} tok`);
+		} else {
+			setStatus(ctx, undefined);
 		}
 		// Persist telemetry periodically so it survives even without a clean shutdown.
-		if (Date.now() - lastFlushAt > 15_000 && totalSavings(sessionSaved) > 0) {
+		if (Date.now() - lastFlushAt > 15_000 && (totalSavings(pendingSavings(statsPath)) > 0 || totalExtractionEvents(pendingExtract(statsPath)) > 0)) {
 			lastFlushAt = Date.now();
-			flushStats();
+			flushStats(statsPath);
 		}
-		const messages = (event.payload as { messages?: unknown })?.messages;
-		const recordable = selectUsageRecordSkills(messages, selected);
-		const recordSignature = usageRecordSignature(messages, recordable);
-		if (recordable.length > 0 && loadedUsagePath && recordSignature !== lastUsageRecordSignature) {
-			lastUsageRecordSignature = recordSignature;
-			usageStats = recordSkillUsage(usageStats, recordable);
-			try {
-				saveUsageFile(loadedUsagePath, usageStats);
-			} catch (err) {
-				ctx.ui.notify(`skill-optimizer: failed to save usage stats (${(err as Error).message})`, "warning");
+		if (loadedUsagePath) {
+			const evidence = collectSkillUsageEvidence(event.payload, selected).slice(-maxUsageEvidence);
+			let delta = pendingUsage.get(loadedUsagePath) ?? {};
+			const now = Date.now();
+			for (const entry of evidence) {
+				if (seenUsageEvidence.has(entry.key)) continue;
+				seenUsageEvidence.add(entry.key);
+				usageStats = recordSkillUsage(usageStats, [entry.name], now);
+				delta = recordSkillUsage(delta, [entry.name], now);
+				while (seenUsageEvidence.size > maxUsageEvidence) {
+					const oldest = seenUsageEvidence.values().next().value as string | undefined;
+					if (!oldest) break;
+					seenUsageEvidence.delete(oldest);
+				}
 			}
+			if (usageCount(delta) > 0) pendingUsage.set(loadedUsagePath, delta);
+			flushUsage(loadedUsagePath, ctx);
 		}
 		return next === event.payload ? undefined : next;
 	});
@@ -454,6 +504,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	// `smart`). Errors stay verbatim and the full output is saved to a temp file.
 	// Off by default; opt in via config `outputMode`.
 	// Detect a coexisting `rtk`-named extension (it has its own output compaction).
+	// These hooks expose no authoritative main-provider cache read/write usage, so
+	// cache telemetry is deliberately not inferred and no dynamic prompt block is
+	// injected merely to measure it.
 	let rtkPresence: boolean | undefined;
 	const rtkExtensionPresent = (): boolean => {
 		if (rtkPresence !== undefined) return rtkPresence;
@@ -466,16 +519,6 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			rtkPresence = false;
 		}
 		return rtkPresence;
-	};
-
-	const saveFullOutput = (text: string): string => {
-		try {
-			const file = join(tmpdir(), `sko-output-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
-			writeFileSync(file, text, "utf8");
-			return `; full output: ${file}`;
-		} catch {
-			return "";
-		}
 	};
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -495,7 +538,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			? (rawInput as { command: string }).command
 			: "";
 		const request = outCfg.mode === "extract" ? latestUserText(ctx) : "";
-		ensureStatsLoaded(ctx);
+		const statsPath = ensureStatsLoaded(ctx);
 
 		let changed = false;
 		const next: typeof content = [];
@@ -504,30 +547,73 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			const b = block as { type?: unknown; text?: unknown };
 			if (b.type !== "text" || typeof b.text !== "string") { next.push(block); continue; }
 			const text = b.text;
-			if (text.split(/\r?\n/).length <= outCfg.maxLines && text.length <= 16_000) { next.push(block); continue; }
+			if (text.split(/\r?\n/).length <= outCfg.maxLines && utf8ByteLength(text) <= DEFAULT_OUTPUT_OPTIONS.maxBytes) { next.push(block); continue; }
 
-			let body: string | undefined;
-			let how = "reduced";
+			const smartOptions = {
+				maxLines: outCfg.maxLines,
+				minSavingsBytes: outCfg.minSavingsBytes,
+				minSavingsRatio: outCfg.minSavingsRatio,
+			};
+			let result: ReturnType<typeof reduceOutput>;
+			let how = "smart";
 			if (outCfg.mode === "extract" && !isExcludedCommand(command, outCfg.extractExclude)) {
 				const extracted = await tryExtractOutput(ctx, outCfg.model, request, command, text);
-				if (extracted) { body = extracted; how = "extracted"; }
+				let outcome: Exclude<keyof ExtractionTelemetry, "attempts">;
+				if (extracted === undefined) {
+					result = reduceOutput(text, smartOptions);
+					outcome = "fallbackError";
+					how = "smart fallback";
+				} else {
+					const validated = validateExtractedOutput(text, extracted, {
+						smartOptions,
+						minSavingsBytes: outCfg.minSavingsBytes,
+						minSavingsRatio: outCfg.minSavingsRatio,
+					});
+					result = validated;
+					if (validated.strategy === "extract") {
+						outcome = "accepted";
+						how = "extracted";
+					} else {
+						const reason: ExtractRejectionReason | undefined = validated.rejectionReason;
+						outcome = reason === "insufficient-benefit"
+							? "fallbackSavings"
+							: reason === "empty-extraction"
+								? "fallbackError"
+								: "fallbackEvidence";
+						how = validated.strategy === "smart" ? "smart fallback" : "original";
+					}
+				}
+				const telemetry: ExtractionTelemetry = { ...EMPTY_EXTRACTION_TELEMETRY, attempts: 1 };
+				telemetry[outcome] = 1;
+				sessionExtraction = addExtractionTelemetry(sessionExtraction, telemetry);
+				addPendingExtraction(statsPath, telemetry);
+			} else {
+				result = reduceOutput(text, smartOptions);
 			}
-			if (body === undefined) {
-				const r = reduceOutput(text, { maxLines: outCfg.maxLines });
-				if (!r.reduced) { next.push(block); continue; }
-				body = r.text;
-			}
+			if (!result.reduced) { next.push(block); continue; }
+			const body = result.text;
+			const fullOutputPath = saveTemporaryOutput(text);
+			if (!fullOutputPath) { next.push(block); continue; }
+			const note = `${how} ${result.fromLines}\u2192${result.toLines} lines; ${text.length}\u2192${body.length} chars; ${result.fromBytes}\u2192${result.toBytes} UTF-8 bytes; estimated ~${approxK(text.length)}\u2192~${approxK(body.length)} tokens; full output: ${fullOutputPath}`;
+			const rendered = `${body}\n[skill-optimizer: ${note}]`;
 			changed = true;
-			if (text.length > body.length) sessionSaved.output += text.length - body.length;
-			const fromLines = text.split(/\r?\n/).length;
-			const note = `${how} ${fromLines}\u2192${body.split(/\r?\n/).length} lines (${approxK(text.length)}\u2192${approxK(body.length)} tok)${saveFullOutput(text)}`;
-			next.push({ ...b, text: `${body}\n[skill-optimizer: ${note}]` });
+			if (text.length > rendered.length) {
+				const removedOutput = text.length - rendered.length;
+				sessionSaved.output += removedOutput;
+				addPendingSavings(statsPath, { skills: 0, tools: 0, output: removedOutput });
+			}
+			next.push({ ...b, text: rendered });
+		}
+		if (Date.now() - lastFlushAt > 15_000 && (totalSavings(pendingSavings(statsPath)) > 0 || totalExtractionEvents(pendingExtract(statsPath)) > 0)) {
+			lastFlushAt = Date.now();
+			flushStats(statsPath);
 		}
 		if (!changed) return;
 		return { content: next };
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		flushUsage(undefined, ctx);
 		flushStats();
 		setStatus(ctx, undefined);
 	});
@@ -545,28 +631,33 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			const profilePaths = getProfilePaths(ctx.cwd);
 			const profileLocations = profilePaths.project === profilePaths.global
 				? profilePaths.global
-				: `global ${profilePaths.global}${existsSync(profilePaths.project) ? `, project ${profilePaths.project}` : ""}`;
+				: `global ${profilePaths.global}${fileExists(profilePaths.project) ? `, project ${profilePaths.project}` : ""}`;
 			const configPaths = getConfigPaths(ctx.cwd);
-			const configLocations = `${existsSync(configPaths.global) ? configPaths.global : `${configPaths.global} (missing)`}${existsSync(configPaths.project) ? `, project ${configPaths.project}` : ""}`;
+			const configLocations = `${fileExists(configPaths.global) ? configPaths.global : `${configPaths.global} (missing)`}${fileExists(configPaths.project) ? `, project ${configPaths.project}` : ""}`;
 			const usagePath = getUsageFilePath(ctx.cwd);
-			ensureStatsLoaded(ctx);
-			const lifetime = addSavings(baseLifetime, sessionSaved);
-			const byArea = (s: SavingsByArea): string => `skills ~${approxK(s.skills)}, tools ~${approxK(s.tools)}, output ~${approxK(s.output)} (total ~${approxK(totalSavings(s))})`;
+			const statsPath = ensureStatsLoaded(ctx);
+			flushStats(statsPath);
+			const lifetime = addSavings(baseLifetime, pendingSavings(statsPath));
+			const lifetimeExtraction = addExtractionTelemetry(baseExtraction, pendingExtract(statsPath));
+			const byArea = (s: SavingsByArea): string => `skills ${s.skills}, tools ${s.tools}, output ${s.output} chars (total ${totalSavings(s)} chars, ~${approxK(totalSavings(s))} tok)`;
+			const extractSummary = (s: ExtractionTelemetry): string => `${s.accepted}/${s.attempts} accepted; fallback evidence ${s.fallbackEvidence}, savings ${s.fallbackSavings}, error ${s.fallbackError}`;
 			const lines = [
 				"pi-skill-optimizer",
 				`  enabled:        ${isDisabled(ctx.cwd) ? "no (disabled)" : "yes"}`,
 				`  config:         ${configLocations}`,
 				`  skills mode:    ${config.mode}${config.mode === "hybrid" ? ` (top ${config.topK}, tail ${config.tail})` : ""}`,
 				`  tools mode:     ${config.toolsMode}${config.toolsMode === "drop" ? ` (${config.toolsDropPrefixes.join(", ") || "no prefixes set"})` : config.toolsMode === "relevance" ? ` (top ${config.toolsTopK} + core + used)` : ""}`,
-				`  output mode:    ${(() => { const o = getOutputConfig(ctx.cwd); if (o.mode === "off") return "off"; if (o.disableWithRtk && rtkExtensionPresent()) return `off (rtk extension detected; set outputDisableWithRtk:false to override)`; return `${o.mode} (>${o.maxLines} lines; tools: ${o.tools.join(", ")})`; })()}`,
+				`  output mode:    ${(() => { const o = getOutputConfig(ctx.cwd); if (o.mode === "off") return "off"; if (o.disableWithRtk && rtkExtensionPresent()) return `off (rtk extension detected; set outputDisableWithRtk:false to override)`; return `${o.mode} (>${o.maxLines} lines; min ${o.minSavingsBytes} bytes and ${Math.round(o.minSavingsRatio * 100)}%; tools: ${o.tools.join(", ")})`; })()}`,
 				`  scope:          ${providers ? providers.join(", ") : "all providers"}`,
 				`  profile:        ${profileSummary(activeProfile)} (${profileLocations})`,
+				`  critical:       ${activeProfile.critical.join(", ") || "none"}`,
 				`  pinned:         ${selectPinnedSkills(usageStats, getPinnedTopK(ctx.cwd)).join(", ") || "none"} (${usageCount(usageStats)} tracked, ${usagePath})`,
 				`  saved (session): ${byArea(sessionSaved)}`,
 				`  saved (lifetime):${byArea(lifetime)}`,
-				`  last request:   −${approxK(lastRemovedChars)} tokens (${lastRemovedChars} chars), ${lastDroppedTools} tools dropped`,
+				`  extract session: ${extractSummary(sessionExtraction)}`,
+				`  extract lifetime:${extractSummary(lifetimeExtraction)}`,
+				`  last request:   ${lastRemovedChars} chars removed (~${approxK(lastRemovedChars)} tokens), ${lastDroppedTools} tools dropped`,
 			];
-			flushStats();
 			if (config.alwaysFull && config.alwaysFull.length > 0) lines.push(`  always full:    ${config.alwaysFull.join(", ")}`);
 			if (config.never && config.never.length > 0) lines.push(`  never:          ${config.never.join(", ")}`);
 			if (lastSelected.length > 0) lines.push(`  last relevant:  ${lastSelected.join(", ")}`);

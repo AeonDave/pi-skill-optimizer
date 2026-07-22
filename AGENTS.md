@@ -1,93 +1,132 @@
 # AGENTS.md
 
-Pi extension that slims the system prompt before each request to cut input-token
-cost, by intelligently rewriting the `<available_skills>` catalog rather than
-nuking it. TypeScript, loaded by Pi via jiti (no build step).
+Pi extension that reduces repeated request tokens by compacting the
+`<available_skills>` catalog, optionally slimming the tools array, and reducing
+long tool output. TypeScript, loaded by Pi through jiti without a build step.
 
 ## Commands
 
 ```bash
 npm install
-npm run typecheck                 # tsc --noEmit (uses real @earendil-works/* types)
-npm test                          # node --test on the pure modules
-npm run measure [capture.json]    # real token savings + relevance on a captured catalog
-pi -e ./src/index.ts              # live-load in Pi for manual testing
+npm run typecheck                 # tsc --noEmit against real Pi types
+npm test                          # node --test on pure modules
+npm run bench                     # deterministic invariants and fuzz benchmark
+npm run bench:output              # output safety and evidence benchmark
+npm run corpus:build              # private real catalog/session corpus (uses Luna)
+npm run bench:real                # paired real-model and RTK evaluation
+npm run measure <capture.json>    # exact chars and estimated token equivalent
+pi -e ./src/index.ts              # live-load for manual testing
 ```
 
 ## Architecture
 
-- `src/skills.ts` — **pure**, the catalog intelligence:
-  - `parseSkills` / `BLOCK_RE` — parse `<available_skills>` (name, description, location).
-  - `tokenize` + `scoreSkills` — dependency-free BM25 lexical ranking with name-match boosts.
-  - `selectRelevant`, `compactDescription`, `renderSkill`, `transformSkillsInText` — rebuild the block (`compact`/`hybrid`).
-  - `extractQuery` — pull the query (first + last user text) from `messages`.
-- `src/profile.ts` — **pure**, normalizes `/skill-optimizer init` output (aliases,
-  critical skills, synthetic queries, clusters, negative hints).
-- `src/usage.ts` — **pure**, normalizes pinned-skill usage stats and derives
-  conservative recordable usage from explicit mentions / real skill-tool calls.
-- `src/aliases.ts` — **pure**, built-in and profile-generated alias normalization,
-  filtered against the user's active catalog before scoring.
-- `src/tools.ts` — **pure**, the `tools`-array slimmer: `optimizeTools` (modes
-  `drop` by prefix / `relevance` by lexical score) with a generous `CORE_TOOLS`
-  protected set; `collectUsedToolNames` keeps any tool already used in the
-  conversation. Off by default.
-- `src/optimize.ts` — **pure** orchestration: `optimize(payload, config)` walks every
-  system text block AND tool description, applies the skill rewrite (off/strip/compact/hybrid)
-  plus extra tag-block / paragraph removal, then slims the `tools` array, and returns
-  `{ next, removed, selected, droppedTools }`.
-- `src/config.ts` — env-driven `OptimizeConfig` (`getConfig`), `isDisabled`, `getScopeProviders`.
-- `src/index.ts` — factory: a `before_provider_request` hook (scoped + enabled), footer
-  status, and the `/skill-optimizer` diagnostics command.
-- `scripts/measure.ts` — runs the optimizer over a captured request body to report
-  real char/token savings per mode and the skills selected per sample query.
+- `src/request.ts` - pure normalization of canonical Anthropic, OpenAI,
+  Gemini, and Mistral request shapes; shared text/query extraction and tool-use
+  history.
+- `src/skills.ts` - pure catalog parser, BM25 plus conservative name/alias fuzzy
+  recall, soft-budget selection, compact rendering, loadability notes, and
+  idempotent text transformation.
+- `src/tools.ts` - pure tools-array optimization with core, configured, and
+  already-used tool protection.
+- `src/optimize.ts` - pure orchestration over normalized system surfaces and tool
+  descriptions; returns `{ next, removedChars, selected, droppedTools }`.
+- `src/aliases.ts` - built-in and profile-generated aliases filtered against the
+  active catalog.
+- `src/profile.ts` - profile normalization, scope splitting, and incremental hash
+  bookkeeping.
+- `src/generate.ts` - pure parsing and validation of batched `init` responses.
+- `src/usage.ts` - conservative, deduplicated evidence for usage-derived pins.
+- `src/output.ts` - UTF-8 byte-safe deterministic reduction and guarded
+  model-assisted verbatim extraction with protected evidence.
+- `src/stats.ts` - savings counters and mergeable persistent deltas.
+- `src/persistence.ts` - atomic JSON replacement and lock-serialized
+  read-modify-write helpers for concurrent project and global state.
+- `src/corpus.ts` - pure HMAC identifiers, irreversible redaction, private corpus
+  schema, validation, rendering, and exact evidence recall.
+- `src/evaluation.ts` - pure paired exposure, recall, byte/token, cache-stability,
+  and hard-safety metrics for real corpus cases.
+- `src/config.ts` - defaults, file/env normalization, disable handling, and
+  provider scoping.
+- `src/index.ts` - Pi hook registration, state I/O, RTK coexistence, footer, and
+  `/skill-optimizer` commands.
+- `scripts/measure.ts` - captured-request serialized-size measurement.
+- `scripts/bench.ts` - deterministic synthetic benchmark and blocking invariants.
+- `scripts/output-bench.ts` - deterministic output-safety and evidence benchmark.
+- `scripts/build-real-corpus.ts` - explicit one-shot real catalog/session capture.
+- `scripts/evaluate-real-corpus.ts` - Luna token/recall and RTK output comparison.
+- `scripts/lib/luna.ts` - isolated Luna CLI runner and authoritative usage parser.
 
-## Key invariants (do not break)
+## Key invariants
 
-- **Score on full, render compacted.** Relevance is computed over the *full*
-  descriptions plus generated query hints, so a relevant skill is always promoted
-  to full regardless of how cryptic its name is; only the irrelevant tail is
-  compacted/dropped. Never score on the already-compacted text.
-- **Names always survive; loading needs the location.** Pi has no `Skill` tool —
-  the model loads a skill by `read`-ing its `<location>` (and explicit
-  `/skill:name` expands from the on-disk registry, catalog-independent).
-  `compact`/`hybrid` keep every `<name>` so the model stays *aware* of every
-  skill, and promoted (relevant/critical/pinned) skills keep their `<location>` so
-  they are *loadable*. A name-only tail entry is intentionally not model-loadable
-  (that is the saving); `KEEP_LOCATIONS` restores loadability for all. Only `strip`
-  removes names entirely (and advertises "no discovery").
-- **Quality guardrails over raw savings.** Hybrid must keep critical and pinned
-  skills full, adapt top-K upward on ambiguous close scores, and use a short-tail
-  fallback when the query has no lexical signal.
-- **Pinned usage must be conservative.** Do not record every ranked/selected
-  skill as usage; only explicit user mentions or observed skill-tool invocations
-  should feed the pinned-skill file, deduped across provider tool loops.
-- **Remove/compact only, never rewrite.** Surviving description text is verbatim;
-  the module must not paraphrase or reorder it. Keep `skills.ts`/`optimize.ts`
-  pure and tested.
-- **Catalog can live in system or a tool description.** Scan both (Pi puts it in
-  the system prompt; genuine Claude Code puts it in the `Skill` tool description).
-- **Tools have no fallback — guard hard.** A skill dropped from the catalog is
-  still invokable by name; a tool dropped from `tools` is *not callable at all*.
-  So tool slimming is OFF by default, never drops `CORE_TOOLS`, and never drops a
-  tool present in `collectUsedToolNames(messages)`. Prefer `drop` (explicit
-  prefixes) over `relevance` (a miss removes a tool the model wanted).
-- **Identity-return.** Return the original reference / `undefined` from the hook
-  when nothing changed (detected by reference), and honor `PI_SKILL_OPTIMIZER_DISABLE`.
+- **Score full text, compact only while rendering.** Never rank an already
+  compacted description.
+- **Public catalog modes are `off`, `compact`, and `hybrid`.** Except for an
+  explicit `never` exclusion, every name survives in `compact` and `hybrid`.
+- **Every retained skill remains loadable.** Promoted and irregular entries keep
+  explicit locations; regular tail entries may use one shared
+  `<skill_path_note>` containing roots and the `<root>/<name>/SKILL.md`
+  convention.
+- **Optimization is idempotent.** Return an already transformed catalog
+  unchanged because removed text cannot be reconstructed.
+- **No-signal requests preserve intent.** `hybrid` uses a short `intent` tail
+  when query extraction or lexical scoring has no usable signal.
+- **Quality wins over nominal savings.** Keep critical and pinned skills full and
+  expand top-K when close scores are ambiguous. A soft full-render budget applies
+  only to ordinary selections; protected and ambiguity-guard entries may exceed
+  it.
+- **Fuzzy recall is bounded.** Apply typo recovery only to skill names and aliases,
+  only when lexical coverage is weak, and never turn a no-signal request into a
+  false promotion.
+- **Descriptions are not rewritten.** Surviving text remains verbatim and in its
+  original order.
+- **Usage evidence is conservative.** Record only explicit skill mentions or
+  observed skill-tool calls, deduplicated across provider tool loops. Pruning may
+  remove only stale one-off entries and must protect critical/current pins.
+- **Catalogs may occur in system content or tool descriptions.** Normalize and
+  scan both.
+- **Tools have no fallback after removal.** Tools slimming is off by default,
+  never removes core/protected/already-used tools, and relevance mode fails open
+  without lexical signal. Schema indexing must stay bounded. Prefer deterministic
+  prefix `drop` mode.
+- **Output reducers fail open.** Use real UTF-8 bytes, retain protected evidence,
+  accept model output only as an ordered verbatim subsequence, require material
+  savings, and fall back `extract -> smart -> original`. Never return a reduced
+  result when the full-output archive failed.
+- **Benchmark data stays private by default.** Never collect in the normal hook,
+  never send unsanitized sessions remotely, never use generated profile queries
+  as labels, and never commit `.pi/skill-optimizer/benchmark/`.
+- **Identity return matters.** Return the original reference, and the hook must
+  return `undefined`, when nothing changed. Honor
+  `PI_SKILL_OPTIMIZER_DISABLE` using boolean semantics.
+- **Persistent updates must not lose deltas.** Write JSON through atomic
+  replacement and serialize read-modify-write operations with the persistence
+  lock; never overwrite usage or statistics from a stale in-memory snapshot.
 
-## Relationship to pi-claude
+## Compatibility
 
-This is the general, provider-agnostic **token** optimizer. It is intentionally
-separate from `pi-claude` (Claude Pro/Max Native): that extension keeps only the
-system-prompt edit it *needs* to function (removing Pi's "Pi documentation"
-paragraph, which trips Anthropic's third-party classifier). Skill-catalog
-trimming benefits any provider, so it lives here. The two coexist cleanly — both
-hook `before_provider_request`; this one only touches `<available_skills>` (and
-configured extra tags/paragraphs), never the billing header or identity blocks.
+This extension is provider-agnostic and separate from `pi-claude`. It edits only
+the configured catalog, tag/paragraph surfaces, tools array, and tool results;
+it does not alter billing or identity blocks.
+
+RTK is the recommended companion for effective command-output reduction, not a
+runtime prerequisite. When an RTK-style extension is detected, only this
+extension's overlapping output reducer steps aside. Catalog and tools-array
+safety must not change when RTK is absent.
+
+`compact` must remain query-independent for provider-cache stability. Do not
+claim cache hit metrics unless Pi exposes authoritative provider cache data.
 
 ## Testing
 
-- `skills.ts` / `optimize.ts` changes: add/update `test/skills.test.ts` /
-  `test/optimize.test.ts` (`npm test`), then re-run `npm run measure` to confirm
-  the savings/relevance numbers still hold.
-- Hook/config changes: `npm run typecheck`, then verify in Pi with
-  `pi -e ./src/index.ts` and `/skill-optimizer` (footer shows `✂ −Nk tok`).
+- Changes to request normalization require `test/request.test.ts` coverage for
+  Anthropic, OpenAI Responses/messages, and Gemini forms.
+- Changes to `skills.ts`, `tools.ts`, or `optimize.ts` require focused unit tests
+  plus `npm run bench` for discovery, loadability, no-signal, determinism, and
+  idempotence invariants.
+- Profile, usage, generation, output, stats, persistence, and config changes
+  require tests in their corresponding pure-module suites.
+- Hook/config changes require `npm run typecheck`, then a live Pi check with
+  `pi -e ./src/index.ts` and `/skill-optimizer`.
+- Output changes require `test/output.test.ts` and `npm run bench:output`.
+- Corpus/evaluation changes require their pure-module tests. Remote Luna calls
+  are opt-in through `corpus:build` and `bench:real`, never part of `npm test`.

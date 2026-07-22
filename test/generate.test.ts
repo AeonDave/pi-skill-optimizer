@@ -59,6 +59,13 @@ test("parseJsonObject collapses multi-line string values instead of failing", ()
 	assert.equal(parsed.queries.a[0], "line one\nline two");
 });
 
+test("parseJsonObject preserves comment markers in strings and stops at the first balanced object", () => {
+	assert.deepEqual(
+		parseJsonObject('prefix {"url":"https://example.test/a/*b*/","value":"x,}"} suffix {not json}'),
+		{ url: "https://example.test/a/*b*/", value: "x,}" },
+	);
+});
+
 test("parseJsonObject throws the diagnostic error when there is no object", () => {
 	assert.throws(() => parseJsonObject(""), /did not contain a JSON object/);
 	assert.throws(() => parseJsonObject("no json here"), /did not contain a JSON object/);
@@ -88,15 +95,22 @@ test("interpretBatchResponse fails (does not throw) when the body has no JSON ob
 	assert.match((out as { reason: string }).reason, /no valid JSON/);
 });
 
-test("interpretBatchResponse parses ok and flags truncation on a length stop", () => {
-	const ok = interpretBatchResponse(textResponse('{"critical":["a"]}'));
+test("interpretBatchResponse parses valid output and rejects truncation as retryable", () => {
+	const ok = interpretBatchResponse(textResponse('{"critical":["a"],"processedSkills":["a"]}'));
 	assert.equal(ok.status, "ok");
-	assert.equal((ok as { truncated: boolean }).truncated, false);
 	assert.deepEqual((ok as { profile: SkillOptimizerProfile }).profile.critical, ["a"]);
 
 	const truncated = interpretBatchResponse(textResponse('{"critical":["a"]}', "length"));
-	assert.equal(truncated.status, "ok");
-	assert.equal((truncated as { truncated: boolean }).truncated, true);
+	assert.equal(truncated.status, "failed");
+	assert.equal((truncated as { retryable: boolean }).retryable, true);
+});
+
+test("interpretBatchResponse requires explicit processedSkills even with profile content", () => {
+	assert.equal(interpretBatchResponse(textResponse("{}")).status, "failed");
+	assert.equal(interpretBatchResponse(textResponse('{"critical":["a"]}')).status, "failed");
+	const covered = interpretBatchResponse(textResponse('{"processedSkills":["a"]}'));
+	assert.equal(covered.status, "ok");
+	assert.deepEqual((covered as { processedSkills?: string[] }).processedSkills, ["a"]);
 });
 
 const refs = (...names: string[]): SkillRef[] => names.map((name) => ({ name, description: `${name} desc` }));
@@ -106,7 +120,7 @@ test("generateProfileInBatches batches by size and merges every successful batch
 	const result = await generateProfileInBatches(refs("a", "b", "c", "d", "e"), 2, async (batch, i, total) => {
 		assert.equal(total, 3); // ceil(5/2)
 		seen.push(batch.map((s) => s.name));
-		return { ...EMPTY_PROFILE, critical: batch.map((s) => s.name) };
+		return { profile: { ...EMPTY_PROFILE, critical: batch.map((s) => s.name) }, processedSkills: batch.map((s) => s.name) };
 	});
 	assert.ok(result);
 	assert.deepEqual(seen, [["a", "b"], ["c", "d"], ["e"]]);
@@ -117,7 +131,7 @@ test("generateProfileInBatches batches by size and merges every successful batch
 test("generateProfileInBatches keeps successes and marks a failed batch's skills unapplied", async () => {
 	const result = await generateProfileInBatches(refs("a", "b", "c", "d"), 2, async (batch) => {
 		if (batch.some((s) => s.name === "c")) return undefined; // 2nd batch (c,d) fails
-		return { ...EMPTY_PROFILE, critical: batch.map((s) => s.name) };
+		return { profile: { ...EMPTY_PROFILE, critical: batch.map((s) => s.name) }, processedSkills: batch.map((s) => s.name) };
 	});
 	assert.ok(result);
 	assert.deepEqual([...result.applied].sort(), ["a", "b"]);
@@ -125,6 +139,19 @@ test("generateProfileInBatches keeps successes and marks a failed batch's skills
 	// caller derives failed = changed - applied
 	const failed = ["a", "b", "c", "d"].filter((n) => !result.applied.has(n));
 	assert.deepEqual(failed, ["c", "d"]);
+});
+
+test("generateProfileInBatches rejects incomplete or foreign batch coverage", async () => {
+	const result = await generateProfileInBatches(refs("a", "b"), 2, async () => ({
+		profile: { ...EMPTY_PROFILE, critical: ["a"] },
+		processedSkills: ["a", "not-in-batch"],
+	}));
+	assert.equal(result, undefined);
+});
+
+test("generateProfileInBatches has no legacy fallback without explicit processedSkills", async () => {
+	const result = await generateProfileInBatches(refs("a"), 1, async () => EMPTY_PROFILE as unknown as { profile: SkillOptimizerProfile; processedSkills: string[] });
+	assert.equal(result, undefined);
 });
 
 test("generateProfileInBatches returns undefined only when every batch fails", async () => {

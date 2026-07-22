@@ -103,10 +103,11 @@ test("fuzz: 1500 random queries never drop a skill, keep everything loadable, ne
 	for (let i = 0; i < N; i++) {
 		const q = fuzzQuery(rand);
 		const payload = { messages: [{ role: "user", content: q }], system: [{ type: "text", text: CAT.text }] };
-		const r = optimize(payload, BASE) as { next: { system: Array<{ text: string }> }; removed: number; selected: string[] };
+		const r = optimize(payload, BASE) as { next: { system: Array<{ text: string }> }; removedChars: number; selected: string[] };
 		const out = r.next.system[0].text;
-		const unique = new Set(namesOf(out));
-		if (unique.size !== total) namesViol++;
+		const listed = namesOf(out);
+		const unique = new Set(listed);
+		if (listed.length !== total || unique.size !== total || [...CAT.names].some((name) => !unique.has(name))) namesViol++;
 		if (loadableCount(out, CAT.rootByName) !== unique.size) loadViol++;
 		const savedPct = 1 - out.length / CAT.text.length;
 		if (savedPct < -1e-9 || savedPct > 1) savedViol++;
@@ -129,7 +130,11 @@ test("fuzz: re-optimizing an already-optimized catalog preserves all names (idem
 	const once = optimize({ messages: [{ role: "user", content: "python test" }], system: [{ type: "text", text: CAT.text }] }, BASE) as { next: { system: Array<{ text: string }> } };
 	const onceText = once.next.system[0].text;
 	const twice = optimize({ messages: [{ role: "user", content: "python test" }], system: [{ type: "text", text: onceText }] }, BASE) as { next: { system: Array<{ text: string }> } };
-	assert.equal(new Set(namesOf(twice.next.system[0].text)).size, CAT.names.size);
+	const twiceText = twice.next.system[0].text;
+	assert.equal(twiceText, onceText);
+	assert.deepEqual(new Set(namesOf(twiceText)), CAT.names);
+	assert.equal(namesOf(twiceText).length, CAT.names.size);
+	assert.equal(loadableCount(twiceText, CAT.rootByName), CAT.names.size);
 });
 
 test("never + alwaysFull behave under fuzz", () => {

@@ -1,22 +1,4 @@
-/**
- * Pure tool-array slimming — no Pi imports, fully unit-testable.
- *
- * The `tools` array (built-in + MCP tool definitions: name, description,
- * input_schema) is a major input-token cost — often *larger* than the skills
- * catalog (measured ~28K tokens for 113 tools, 105 of them from MCP servers like
- * `htb_*` (57!), `mcpwn_*`, `ctx_*`, `tavily_*`).
- *
- * CRITICAL difference from skills: a skill dropped from the catalog is still
- * invokable by name (fallback); a tool dropped from `tools` is **not callable at
- * all** — there is no fallback within the turn. So this is conservative and
- * OPT-IN:
- *   - core tools are never dropped (a generous built-in protected set);
- *   - any tool already used in the conversation is kept (so nothing vanishes
- *     mid-task);
- *   - `drop` mode removes only the server prefixes you explicitly list
- *     (deterministic, cache-stable, predictable);
- *   - `relevance` mode keeps core + used + the top-K query-relevant of the rest.
- */
+/** Pure, conservative tool-array slimming. Dropped tools are not callable. */
 
 import { tokenize } from "./skills.ts";
 
@@ -44,7 +26,8 @@ export interface ToolsOptions {
 
 export interface ToolsResult {
 	tools: unknown[];
-	removed: number;
+	/** JSON-serialized characters removed from the tools array. */
+	removedChars: number;
 	dropped: string[];
 }
 
@@ -69,19 +52,88 @@ function isProtected(name: string, protect: readonly string[], keepNames: Readon
 	return CORE_TOOLS.has(name.toLowerCase()) || keepNames.has(name) || matchesAny(name, protect);
 }
 
-function isTool(value: unknown): value is Tool {
-	return !!value && typeof value === "object" && typeof (value as { name?: unknown }).name === "string";
+/** Read Anthropic/Responses or nested OpenAI Chat function definitions. */
+export function getToolDefinition(value: unknown): Tool | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const record = value as Record<string, unknown>;
+	if (typeof record.name === "string") return record as Tool;
+	const fn = record.function;
+	if (fn && typeof fn === "object" && typeof (fn as { name?: unknown }).name === "string") return fn as Tool;
+	return undefined;
 }
 
-/** Lexical IDF score of each tool (name + description) against the query terms. */
+/** Immutably replace a top-level or nested OpenAI Chat tool description. */
+export function replaceToolDescription(value: unknown, description: string): unknown {
+	if (!value || typeof value !== "object") return value;
+	const record = value as Record<string, unknown>;
+	if (typeof record.name === "string") return { ...record, description };
+	const fn = record.function;
+	if (fn && typeof fn === "object" && typeof (fn as { name?: unknown }).name === "string") {
+		return { ...record, function: { ...(fn as Record<string, unknown>), description } };
+	}
+	return value;
+}
+
+const MAX_SCHEMA_SEARCH_CHARS = 2_048;
+const MAX_SCHEMA_SEARCH_NODES = 96;
+const MAX_SCHEMA_SEARCH_DEPTH = 4;
+
+/** Extract only routing-relevant schema text under strict size/depth bounds. */
+function schemaSearchText(tool: Tool): string {
+	const schema = tool.input_schema ?? tool.inputSchema ?? tool.parameters;
+	if (!schema || typeof schema !== "object") return "";
+	const chunks: string[] = [];
+	let chars = 0;
+	let nodes = 0;
+	const append = (value: unknown): void => {
+		if ((typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") || chars >= MAX_SCHEMA_SEARCH_CHARS) return;
+		const text = String(value)
+			.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+			.replace(/[_-]+/g, " ")
+			.trim();
+		if (!text) return;
+		const remaining = MAX_SCHEMA_SEARCH_CHARS - chars;
+		const bounded = text.slice(0, remaining);
+		chunks.push(bounded);
+		chars += bounded.length + 1;
+	};
+	const visit = (value: unknown, depth: number): void => {
+		if (!value || typeof value !== "object" || depth > MAX_SCHEMA_SEARCH_DEPTH || nodes >= MAX_SCHEMA_SEARCH_NODES || chars >= MAX_SCHEMA_SEARCH_CHARS) return;
+		nodes += 1;
+		const record = value as Record<string, unknown>;
+		if (Array.isArray(record.required)) for (const required of record.required) append(required);
+		if (Array.isArray(record.enum)) for (const option of record.enum) append(option);
+		if (typeof record.description === "string") append(record.description);
+		if (record.properties && typeof record.properties === "object" && !Array.isArray(record.properties)) {
+			for (const [name, property] of Object.entries(record.properties as Record<string, unknown>)) {
+				append(name);
+				visit(property, depth + 1);
+				if (nodes >= MAX_SCHEMA_SEARCH_NODES || chars >= MAX_SCHEMA_SEARCH_CHARS) break;
+			}
+		}
+		if (record.items) visit(record.items, depth + 1);
+		for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
+			const branches = record[keyword];
+			if (Array.isArray(branches)) for (const branch of branches) visit(branch, depth + 1);
+		}
+	};
+	visit(schema, 0);
+	return chunks.join(" ");
+}
+
+/** Lexical IDF score of each tool (name + description + bounded schema) against the query terms. */
 function scoreTools(tools: readonly Tool[], queryTokens: readonly string[]): number[] {
 	const n = tools.length;
-	const sets = tools.map((t) => new Set(tokenize(`${t.name} ${t.description ?? ""}`)));
+	const sets = tools.map((t) => new Set(tokenize(`${t.name} ${t.description ?? ""} ${schemaSearchText(t)}`)));
 	const nameSets = tools.map((t) => new Set(tokenize(t.name)));
-	const df = new Map<string, number>();
-	for (const set of sets) for (const term of set) df.set(term, (df.get(term) ?? 0) + 1);
-	const idf = (term: string) => Math.log(1 + n / (1 + (df.get(term) ?? 0)));
 	const terms = new Set(queryTokens);
+	const df = new Map<string, number>();
+	for (const term of terms) {
+		let count = 0;
+		for (const set of sets) if (set.has(term)) count++;
+		df.set(term, count);
+	}
+	const idf = (term: string) => Math.log(1 + n / (1 + (df.get(term) ?? 0)));
 	return sets.map((set, i) => {
 		let score = 0;
 		for (const term of terms) {
@@ -92,34 +144,23 @@ function scoreTools(tools: readonly Tool[], queryTokens: readonly string[]): num
 	});
 }
 
-/** Collect tool names referenced by `tool_use` blocks anywhere in the messages. */
-export function collectUsedToolNames(messages: unknown): Set<string> {
-	const used = new Set<string>();
-	if (!Array.isArray(messages)) return used;
-	for (const message of messages) {
-		const content = (message as { content?: unknown })?.content;
-		if (!Array.isArray(content)) continue;
-		for (const block of content) {
-			const b = block as { type?: unknown; name?: unknown };
-			if (b?.type === "tool_use" && typeof b.name === "string") used.add(b.name);
-		}
-	}
-	return used;
-}
-
 /**
- * Slim a `tools` array. Returns the original reference (and `removed: 0`) when
+ * Slim a `tools` array. Returns the original reference and zero savings when
  * nothing was dropped. Order of kept tools is preserved. Pure.
  */
 export function optimizeTools(tools: unknown, opts: ToolsOptions): ToolsResult {
-	if (!Array.isArray(tools)) return { tools: tools as unknown[], removed: 0, dropped: [] };
+	if (!Array.isArray(tools)) return { tools: tools as unknown[], removedChars: 0, dropped: [] };
+	const relevanceQueryTokens = opts.mode === "relevance" ? tokenize(opts.query) : [];
+	if (opts.mode === "relevance" && relevanceQueryTokens.length === 0) {
+		return { tools, removedChars: 0, dropped: [] };
+	}
 
 	const keepIndex = new Set<number>();
 	const dropped: string[] = [];
 
 	if (opts.mode === "drop") {
 		tools.forEach((tool, i) => {
-			const name = isTool(tool) ? tool.name : "";
+			const name = getToolDefinition(tool)?.name ?? "";
 			if (!isProtected(name, opts.protect, opts.keepNames) && matchesAny(name, opts.dropPrefixes)) {
 				dropped.push(name);
 			} else {
@@ -129,15 +170,17 @@ export function optimizeTools(tools: unknown, opts: ToolsOptions): ToolsResult {
 	} else {
 		const candidates: { tool: Tool; i: number }[] = [];
 		tools.forEach((tool, i) => {
-			if (!isTool(tool)) {
+			const definition = getToolDefinition(tool);
+			if (!definition) {
 				keepIndex.add(i);
 				return;
 			}
-			const name = tool.name;
+			const name = definition.name;
 			if (isProtected(name, opts.protect, opts.keepNames)) keepIndex.add(i);
-			else candidates.push({ tool, i });
+			else candidates.push({ tool: definition, i });
 		});
-		const scores = scoreTools(candidates.map((c) => c.tool), tokenize(opts.query));
+		const scores = scoreTools(candidates.map((c) => c.tool), relevanceQueryTokens);
+		if (!scores.some((score) => score > 0)) return { tools, removedChars: 0, dropped: [] };
 		const selected = scores
 			.map((score, idx) => ({ score, idx }))
 			.filter((x) => x.score > 0)
@@ -151,8 +194,8 @@ export function optimizeTools(tools: unknown, opts: ToolsOptions): ToolsResult {
 		});
 	}
 
-	if (dropped.length === 0) return { tools, removed: 0, dropped: [] };
+	if (dropped.length === 0) return { tools, removedChars: 0, dropped: [] };
 	const kept = tools.filter((_, i) => keepIndex.has(i));
-	const removed = JSON.stringify(tools).length - JSON.stringify(kept).length;
-	return { tools: kept, removed, dropped };
+	const removedChars = JSON.stringify(tools).length - JSON.stringify(kept).length;
+	return { tools: kept, removedChars, dropped };
 }

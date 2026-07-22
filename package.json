@@ -1,9 +1,9 @@
 {
   "name": "pi-skill-optimizer",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "private": false,
   "type": "module",
-  "description": "A Pi extension that cuts input-token cost every request — slims the <available_skills> catalog, the tools array, and noisy tool output — without hiding your skills. Provider-agnostic, config-driven, cross-OS.",
+  "description": "Pi extension that reduces repeated request tokens while preserving skill discovery and loadability.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -30,14 +30,18 @@
   "files": [
     "src",
     "README.md",
+    "BENCHMARK.md",
     "LICENSE",
     "CHANGELOG.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/skills.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/generate.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts",
+    "test": "node --import tsx --test test/request.test.ts test/skills.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/generate.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts test/usage.test.ts test/persistence.test.ts test/corpus.test.ts test/evaluation.test.ts test/luna.test.ts",
     "measure": "node --import tsx scripts/measure.ts",
-    "bench": "node --import tsx scripts/bench.ts"
+    "bench": "node --import tsx scripts/bench.ts",
+    "bench:output": "node --import tsx scripts/output-bench.ts",
+    "corpus:build": "node --import tsx scripts/build-real-corpus.ts",
+    "bench:real": "node --import tsx scripts/evaluate-real-corpus.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

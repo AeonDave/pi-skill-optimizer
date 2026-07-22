@@ -9,6 +9,7 @@ import {
 	tokenize,
 	transformSkillsInText,
 } from "../src/skills.ts";
+import { setUserAliasCandidates } from "../src/aliases.ts";
 import { normalizeProfile } from "../src/profile.ts";
 
 function skillXml(name: string, description: string, location = `C:/skills/${name}/SKILL.md`): string {
@@ -100,6 +101,7 @@ test("selectRelevant returns up to K positive-scored indices, best first", () =>
 test("selectRelevant supports adaptive K for ambiguous positive scores", () => {
 	assert.deepEqual(selectRelevant([10, 9, 8, 1], { targetTopK: 1, minTopK: 1, maxTopK: 3, adaptive: true }), [0, 1, 2]);
 	assert.deepEqual(selectRelevant([10, 1, 0.5], { targetTopK: 1, minTopK: 1, maxTopK: 3, adaptive: true }), [0]);
+	assert.deepEqual(selectRelevant([10, 9], { targetTopK: 0, minTopK: 0, maxTopK: 2, adaptive: true }), []);
 });
 
 test("compactDescription keeps the first sentence and caps length", () => {
@@ -109,7 +111,13 @@ test("compactDescription keeps the first sentence and caps length", () => {
 	);
 	const capped = compactDescription("aaaa bbbb cccc dddd eeee ffff", 12);
 	assert.ok(capped.endsWith("…"));
-	assert.ok(capped.length <= 13);
+	assert.ok(capped.length <= 12);
+	const routed = compactDescription(
+		"A deliberately long first sentence that must be shortened substantially. Use when routing requests with no direct catalog overlap.",
+		60,
+	);
+	assert.ok(routed.length <= 60);
+	assert.ok(routed.includes("Use when"));
 });
 
 test("compactDescription appends the routing clause when the first sentence lacks one (#4a)", () => {
@@ -127,13 +135,13 @@ test("compactDescription appends the routing clause when the first sentence lack
 
 test("hybrid: relevant stays full with location, tail is name-only, all names survive", () => {
 	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
-	const { text: out, removed, selected } = transformSkillsInText(text, {
+	const { text: out, removedChars, selected } = transformSkillsInText(text, {
 		mode: "hybrid",
 		topK: 1,
 		tail: "name",
 		query: "crack RSA key recovery",
 	});
-	assert.ok(removed > 0);
+	assert.ok(removedChars > 0);
 	assert.deepEqual(selected, ["rsactftool"]);
 	// full skill keeps its full description + explicit location
 	assert.ok(out.includes("Use when targeting RSA key recovery"));
@@ -144,6 +152,11 @@ test("hybrid: relevant stays full with location, tail is name-only, all names su
 	assert.ok(!out.includes("C:/skills/tcpdump/SKILL.md"));
 	assert.ok(out.includes("<skill_path_note>"));
 	assert.ok(out.includes("C:/skills"));
+	assert.ok(out.includes("without a location field"));
+	assert.ok(!out.includes("without a <location>"));
+	const pathNote = out.match(/<skill_path_note>([\s\S]*?)<\/skill_path_note>/);
+	assert.ok(pathNote);
+	assert.ok(!pathNote[1].includes("<"), "path note must contain plain XML text, not pseudo-tags");
 	// tail is name-only: no hashcat description
 	assert.ok(!out.includes("password cracking"));
 });
@@ -158,10 +171,29 @@ test("hybrid tail=intent keeps first sentence + routing clause, drops the deriva
 		skillXml("ffuf", long("Fast web fuzzer for content discovery", "Use when fuzzing endpoints.")),
 	);
 	const { text: out } = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "intent", query: "RSA key recovery" });
-	assert.ok(out.includes("GPU-accelerated offline password cracking")); // first sentence kept
-	assert.ok(out.includes("Use when cracking captured password hashes")); // routing clause kept (#4a)
+	const hashcat = parseSkills(out).find((skill) => skill.name === "hashcat");
+	assert.ok(hashcat);
+	assert.ok(hashcat.description.startsWith("GPU-accelerated")); // original intent survives within the shared budget
+	assert.match(hashcat.description, /\bUse when\b/); // routing signal survives within the shared budget
+	assert.ok(hashcat.description.length <= 80);
 	assert.ok(!out.includes("A long middle sentence with plenty of extra detail")); // middle sentence dropped
 	assert.ok(!out.includes("C:/skills/hashcat/SKILL.md")); // location still dropped
+});
+
+test("hybrid falls back to compact intent tails when the query has no lexical signal", () => {
+	const long = (lead: string, route: string): string => `${lead}. A long middle sentence that the fallback must discard because it has no routing value. ${route}`;
+	const text = catalog(
+		skillXml("hashcat", long("GPU-accelerated offline password cracking", "Use when cracking captured password hashes.")),
+		skillXml("nmap", long("Network port scanner and host discovery", "Use when mapping a network.")),
+		skillXml("sqlmap", long("Automated SQL injection validation", "Use when testing SQL injection.")),
+	);
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "日本語 🔥" });
+	assert.deepEqual(out.selected, []);
+	const tails = parseSkills(out.text);
+	assert.deepEqual(tails.map((skill) => skill.name), ["hashcat", "nmap", "sqlmap"]);
+	assert.ok(tails.every((skill) => skill.description.length > 0), "no-signal fallback must preserve an intent for every described skill");
+	assert.ok(tails.every((skill) => skill.description.length <= 80), "fallback intents must respect the shared character budget");
+	assert.ok(tails.every((skill) => !skill.description.includes("A long middle sentence")), "fallback must discard non-routing detail");
 });
 
 test("compact renders every skill as a short intent tail with a path note, keeping routing clauses", () => {
@@ -180,7 +212,8 @@ test("compact renders every skill as a short intent tail with a path note, keepi
 });
 
 test("hybrid keeps profile-critical and pinned skills full", () => {
-	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)));
+	const reducibleTail = "General maintenance workflow with extensive operational guidance for routine housekeeping. ".repeat(6);
+	const text = catalog(...SAMPLE.map(([n, d]) => skillXml(n, d)), skillXml("maintenance-guide", reducibleTail));
 	const out = transformSkillsInText(text, {
 		mode: "hybrid",
 		topK: 1,
@@ -191,6 +224,8 @@ test("hybrid keeps profile-critical and pinned skills full", () => {
 	});
 	assert.ok(out.text.includes("GPU-accelerated offline password cracking"));
 	assert.ok(out.text.includes("Command-line packet capture"));
+	assert.ok(out.text.includes("<name>maintenance-guide</name>"));
+	assert.ok(!out.text.includes(reducibleTail));
 	assert.deepEqual(out.selected, ["rsactftool", "hashcat", "tcpdump"]);
 });
 
@@ -241,7 +276,7 @@ test("transformSkillsInText is identity when there is no catalog", () => {
 	const text = "no skills here";
 	const out = transformSkillsInText(text, { mode: "hybrid", topK: 5, tail: "name", query: "x" });
 	assert.equal(out.text, text);
-	assert.equal(out.removed, 0);
+	assert.equal(out.removedChars, 0);
 });
 
 test("transformSkillsInText skips rewrites that would not shrink a catalog block", () => {
@@ -249,14 +284,27 @@ test("transformSkillsInText skips rewrites that would not shrink a catalog block
 	const text = `<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>`;
 	const out = transformSkillsInText(text, { mode: "hybrid", topK: 0, tail: "name", query: "" });
 	assert.equal(out.text, text);
-	assert.equal(out.removed, 0);
+	assert.equal(out.removedChars, 0);
 });
 
-test("transformSkillsInText rewrites every catalog in the text", () => {
+test("transformSkillsInText is a no-op for its own transformed catalog", () => {
+	const source = catalog(...SAMPLE.map(([name, description]) => skillXml(name, description)));
+	const first = transformSkillsInText(source, { mode: "hybrid", topK: 1, tail: "name", query: "RSA key recovery" });
+	assert.ok(first.removedChars > 0);
+	assert.ok(first.text.includes("<!--skill-optimizer-->"));
+	assert.ok(first.text.includes("<skill_path_note>"));
+	const second = transformSkillsInText(first.text, { mode: "hybrid", topK: 1, tail: "name", query: "RSA key recovery" });
+	assert.equal(second.text, first.text);
+	assert.equal(second.removedChars, 0);
+	assert.deepEqual(second.selected, []);
+});
+
+test("transformSkillsInText rewrites every reducible catalog in the text", () => {
 	const first = `<available_skills>\n${SAMPLE.map(([n, d]) => skillXml(n, d)).join("\n")}\n</available_skills>`;
-	const second = `<available_skills>\n${skillXml("alpha-skill", "Alpha skill does several things. Extra detail here.")}\n${skillXml("beta-skill", "Beta skill does other things. More detail here.")}\n</available_skills>`;
-	const out = transformSkillsInText(`${first}\nmid\n${second}`, { mode: "hybrid", topK: 0, tail: "name", query: "" });
-	assert.equal((out.text.match(/<description>/g) ?? []).length, 0); // name-only tail, no descriptions
+	const second = `<available_skills>\n${skillXml("alpha-skill", "Alpha skill does several things. A deliberately long second sentence that compact mode must remove from this catalog.")}\n${skillXml("beta-skill", "Beta skill does other things. Another deliberately long second sentence that compact mode must remove from this catalog.")}\n</available_skills>`;
+	const out = transformSkillsInText(`${first}\nmid\n${second}`, { mode: "compact", topK: 0, tail: "name", query: "" });
+	assert.equal((out.text.match(/<!--skill-optimizer-->/g) ?? []).length, 2);
+	assert.equal(parseSkills(out.text).length, SAMPLE.length + 2);
 	assert.ok(out.text.includes("<name>rsactftool</name>"));
 	assert.ok(out.text.includes("<name>alpha-skill</name>"));
 	assert.ok(out.text.includes("<name>beta-skill</name>"));
@@ -276,6 +324,7 @@ test("extractQuery returns the single task when there is one user message, '' wh
 	assert.equal(extractQuery([{ role: "user", content: "only one" }]), "only one");
 	assert.equal(extractQuery([{ role: "assistant", content: "hi" }]), "");
 	assert.equal(extractQuery(undefined), "");
+	assert.equal(extractQuery([{ role: "user", content: "must not leak" }], 0), "");
 });
 
 test("extractQuery always preserves the latest user text when truncating", () => {
@@ -290,4 +339,118 @@ test("extractQuery always preserves the latest user text when truncating", () =>
 	);
 	assert.ok(query.includes(last));
 	assert.ok(query.length <= 2000);
+});
+
+test("catalog analysis cache observes global alias revisions", () => {
+	setUserAliasCandidates({});
+	try {
+		const text = catalog(
+			skillXml("quantum-tool", "Quantum circuit analysis with a deliberately long description for specialist workloads."),
+			skillXml("python-testing", "Python test fixtures and regression workflows with a deliberately long description."),
+			skillXml("network-scan", "Network discovery and port scanning with a deliberately long description."),
+		);
+		const options = { mode: "hybrid" as const, topK: 1, tail: "name" as const, query: "codename" };
+		assert.deepEqual(transformSkillsInText(text, options).selected, []);
+		setUserAliasCandidates({ codename: ["quantum"] });
+		assert.deepEqual(transformSkillsInText(text, options).selected, ["quantum-tool"]);
+	} finally {
+		setUserAliasCandidates({});
+	}
+});
+
+test("selected skill diagnostics are deduplicated across catalog blocks", () => {
+	const block = `<available_skills>\n${SAMPLE.map(([name, description]) => skillXml(name, description)).join("\n")}\n</available_skills>`;
+	const out = transformSkillsInText(`${block}\n${block}`, { mode: "hybrid", topK: 1, tail: "name", query: "RSA key recovery" });
+	assert.deepEqual(out.selected, ["rsactftool"]);
+});
+
+test("hybrid uses conservative name trigrams for typos and separator/camel-case variants", () => {
+	const typoCatalog = catalog(
+		skillXml("rsactftool", "Specialized public-key workflow with enough detail to benefit from full rendering."),
+		skillXml("network-audit", "Network assessment workflow with unrelated operational guidance."),
+		skillXml("release-planning", "Release planning and coordination guidance with substantial unrelated procedural detail."),
+		skillXml("database-maintenance", "Database upkeep and migration guidance with substantial unrelated procedural detail."),
+	);
+	assert.deepEqual(
+		transformSkillsInText(typoCatalog, { mode: "hybrid", topK: 1, tail: "name", query: "rsactftol" }).selected,
+		["rsactftool"],
+	);
+
+	const camelCatalog = catalog(
+		skillXml("githubAddressComments", "Resolve review feedback with detailed repository guidance."),
+		skillXml("release-notes", "Prepare product release documentation and summaries."),
+		skillXml("database-maintenance", "Database upkeep and migration guidance with substantial unrelated procedural detail."),
+		skillXml("network-audit", "Network assessment workflow with substantial unrelated operational guidance."),
+	);
+	assert.deepEqual(
+		transformSkillsInText(camelCatalog, { mode: "hybrid", topK: 1, tail: "name", query: "github address comments" }).selected,
+		["githubAddressComments"],
+	);
+});
+
+test("hybrid fuzzy recall covers alias sources but does not promote near-misses below threshold", () => {
+	const text = catalog(
+		skillXml("pi-extension-creator", "Create an extension package with detailed Pi integration guidance."),
+		skillXml("python-testing", "Python regression tests and fixture design guidance."),
+		skillXml("database-maintenance", "Database upkeep and migration guidance with substantial unrelated procedural detail."),
+		skillXml("network-audit", "Network assessment workflow with substantial unrelated operational guidance."),
+	);
+	assert.deepEqual(
+		transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "plugi" }).selected,
+		["pi-extension-creator"],
+	);
+	assert.deepEqual(
+		transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "plug" }).selected,
+		[],
+	);
+});
+
+test("hybrid full-render budget caps ordinary promotions and never caps protected skills", () => {
+	const detail = " Detailed operational guidance for a complex workflow.".repeat(4);
+	const text = catalog(
+		skillXml("alpha-engine", `Alpha prime target workflow.${detail}`),
+		skillXml("target-helper", `Target support workflow.${detail}`),
+		skillXml("critical-guide", `Critical recovery workflow.${detail}`),
+		skillXml("pinned-guide", `Pinned historical workflow.${detail}`),
+		skillXml("always-guide", `Always available workflow.${detail}`),
+		skillXml("ordinary-tail", `Unrelated maintenance workflow.${detail}`),
+	);
+	const budgeted = transformSkillsInText(text, {
+		mode: "hybrid",
+		topK: 2,
+		tail: "name",
+		query: "alpha prime target",
+		fullRenderBudgetChars: 450,
+	});
+	assert.deepEqual(budgeted.selected, ["alpha-engine"]);
+	assert.ok(budgeted.text.includes(`Alpha prime target workflow.${detail}`));
+	assert.ok(!budgeted.text.includes(`Target support workflow.${detail}`));
+
+	const protectedResult = transformSkillsInText(text, {
+		mode: "hybrid",
+		topK: 1,
+		tail: "name",
+		query: "alpha prime target",
+		fullRenderBudgetChars: 1,
+		profile: normalizeProfile({ critical: ["critical-guide"] }),
+		pinnedSkills: ["pinned-guide"],
+		alwaysFull: ["always-guide"],
+	});
+	assert.ok(!protectedResult.text.includes(`Alpha prime target workflow.${detail}`));
+	for (const name of ["critical-guide", "pinned-guide", "always-guide"]) {
+		assert.ok(protectedResult.selected.includes(name));
+		assert.ok(parseSkills(protectedResult.text).find((skill) => skill.name === name)?.description.includes("workflow"));
+	}
+});
+
+test("hybrid default budget prevents pathological full-description expansion", () => {
+	const pathological = `Unique pathological router. ${"Very large detail block. ".repeat(700)}`;
+	const text = catalog(
+		skillXml("pathological-router", pathological),
+		skillXml("ordinary-tail", "Ordinary unrelated workflow with a useful concise description."),
+	);
+	const out = transformSkillsInText(text, { mode: "hybrid", topK: 1, tail: "name", query: "unique pathological router" });
+	assert.deepEqual(out.selected, []);
+	assert.ok(!out.text.includes(pathological));
+	assert.ok(out.text.includes("<name>pathological-router</name>"));
 });
