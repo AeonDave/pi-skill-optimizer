@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+	buildUsagePrior,
 	collectSkillUsageEvidence,
 	mergeUsageStats,
 	pruneUsageStats,
+	scoreSkillUsage,
 	selectUsageRecordSkills,
 	usageRecordSignature,
 } from "../src/usage.ts";
@@ -135,4 +137,26 @@ test("usage cap is deterministic and never drops protected entries", () => {
 	assert.deepEqual(Object.keys(first), ["protectedA", "protectedB", "frequent"]);
 	assert.deepEqual(pruneUsageStats(stats, options), first);
 	assert.equal(pruneUsageStats(first, options), first);
+});
+
+test("usage prior decays exponentially instead of creating permanent pins", () => {
+	const day = 86_400_000;
+	const now = 120 * day;
+	const recent = scoreSkillUsage({ count: 2, lastUsed: 119 * day }, now, 30);
+	const stale = scoreSkillUsage({ count: 100, lastUsed: 20 * day }, now, 30);
+	assert.ok(recent > stale);
+	const prior = buildUsagePrior({
+		recent: { count: 2, lastUsed: 119 * day },
+		stale: { count: 100, lastUsed: 20 * day },
+	}, { now, halfLifeDays: 30 });
+	assert.ok(prior.recent > prior.stale);
+});
+
+test("buildUsagePrior is deterministic and can discard negligible evidence", () => {
+	const stats = {
+		beta: { count: 1, lastUsed: 1 },
+		alpha: { count: 1, lastUsed: 1 },
+	};
+	assert.deepEqual(Object.keys(buildUsagePrior(stats, { now: 1 })), ["alpha", "beta"]);
+	assert.deepEqual(buildUsagePrior(stats, { now: 365 * 86_400_000, minimumScore: 0.01 }), {});
 });

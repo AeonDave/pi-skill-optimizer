@@ -1,14 +1,26 @@
 /**
- * Measure serialized request-size savings on a captured provider request and
- * report a deliberately approximate token equivalent.
+ * Measure baseline versus auto stable-base and eager-prefetch request surfaces.
  *
- *   node --import tsx scripts/measure.ts [path-to-captured-request.json]
+ *   node --import tsx scripts/measure.ts <path-to-captured-request.json>
  */
 
 import { readFileSync } from "node:fs";
-import { optimize, type OptimizeConfig } from "../src/optimize.ts";
+import { extractRequestQuery, normalizeRequest } from "../src/request.ts";
+import { optimizeSkillCatalog, renderSkillPrefetch } from "../src/skills.ts";
 
 type JsonObject = Record<string, unknown>;
+
+interface SurfacePair {
+	base: unknown;
+	eager: unknown;
+}
+
+interface Measurement {
+	label: string;
+	serialized: string;
+	chars: number;
+	bytes: number;
+}
 
 function isObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -21,10 +33,8 @@ function requestBody(value: unknown): JsonObject {
 	return candidate;
 }
 
-function toolName(value: unknown): string {
-	if (!isObject(value)) return "";
-	if (typeof value.name === "string") return value.name;
-	return isObject(value.function) && typeof value.function.name === "string" ? value.function.name : "";
+function joinBaseAndOverlay(base: string, overlay: string): string {
+	return overlay.trim() ? `${base}\n\n${overlay}` : base;
 }
 
 const capturePath = process.argv[2];
@@ -34,49 +44,71 @@ if (!capturePath) {
 }
 
 const body = requestBody(JSON.parse(readFileSync(capturePath, "utf8")) as unknown);
-const tools = Array.isArray(body.tools) ? body.tools : [];
-const estimateTokens = (chars: number) => Math.round(chars / 4);
-const pct = (from: number, to: number) => from > 0 ? `${Math.round((100 * (from - to)) / from)}%` : "0%";
+const query = extractRequestQuery(normalizeRequest(body));
+const selectedNames = new Set<string>();
+const baseFingerprints = new Set<string>();
+let catalogCount = 0;
 
-const OFF: OptimizeConfig = {
-	mode: "off", topK: 20, tail: "name", alwaysFull: [], never: [],
-	toolsMode: "off", toolsDropPrefixes: [], toolsTopK: 24, toolsProtect: [],
-};
-
-function run(overrides: Partial<OptimizeConfig>): { chars: number; removedChars: number; selected: string[]; droppedTools: string[] } {
-	const { next, removedChars, selected, droppedTools } = optimize(body, { ...OFF, ...overrides });
-	return { chars: JSON.stringify(next).length, removedChars, selected, droppedTools };
-}
-
-const original = JSON.stringify(body).length;
-console.log(`\ncaptured provider request: ${original} serialized chars (~${estimateTokens(original)} estimated tokens)\n`);
-
-const MCP_PREFIXES = ["htb_", "mcpwn_", "ctx_", "tavily_", "hypa_", "web_", "code_", "fetch_", "get_"];
-const rows: Array<[string, ReturnType<typeof run>]> = [
-	["off (baseline)", run({})],
-	["skills hybrid", run({ mode: "hybrid" })],
-	["+ tools drop htb_,mcpwn_", run({ mode: "hybrid", toolsMode: "drop", toolsDropPrefixes: ["htb_", "mcpwn_"] })],
-	["+ tools relevance", run({ mode: "hybrid", toolsMode: "relevance", toolsTopK: 8 })],
-	["all (skills+tools drop MCP)", run({ mode: "hybrid", toolsMode: "drop", toolsDropPrefixes: MCP_PREFIXES })],
-];
-
-console.log("config                       | est tok | saved | chars removed | selected | tools dropped");
-console.log("-----------------------------|---------|-------|---------------|----------|--------------");
-for (const [label, result] of rows) {
-	console.log(`${label.padEnd(28)} | ${String(estimateTokens(result.chars)).padStart(7)} | ${pct(original, result.chars).padStart(5)} | ${String(result.removedChars).padStart(13)} | ${String(result.selected.length).padStart(8)} | ${result.droppedTools.length}`);
-}
-
-if (tools.length > 0) {
-	console.log("\ntools relevance - kept non-core tools per sample query (top-8):");
-	for (const query of [
-		"recover a weak RSA private key",
-		"enumerate a HackTheBox machine over the VPN",
-		"search the web and index documentation for a library",
-	]) {
-		const payload = { messages: [{ role: "user", content: query }], tools };
-		const { next } = optimize(payload, { ...OFF, toolsMode: "relevance", toolsTopK: 8 });
-		const keptTools = isObject(next) && Array.isArray(next.tools) ? next.tools : [];
-		const kept = keptTools.map(toolName).filter((name) => MCP_PREFIXES.some((prefix) => name.startsWith(prefix)));
-		console.log(`  "${query}"\n    -> ${kept.join(", ") || "(none)"}`);
+function transform(value: unknown): SurfacePair {
+	if (typeof value === "string") {
+		if (!value.includes("<available_skills>")) return { base: value, eager: value };
+		const result = optimizeSkillCatalog(value, query);
+		const overlay = renderSkillPrefetch(result.plan);
+		catalogCount += 1;
+		baseFingerprints.add(result.fingerprint);
+		for (const name of result.plan.selectedNames) selectedNames.add(name);
+		return { base: result.text, eager: joinBaseAndOverlay(result.text, overlay) };
 	}
+	if (Array.isArray(value)) {
+		const entries = value.map(transform);
+		return {
+			base: entries.map((entry) => entry.base),
+			eager: entries.map((entry) => entry.eager),
+		};
+	}
+	if (!isObject(value)) return { base: value, eager: value };
+	const base: JsonObject = {};
+	const eager: JsonObject = {};
+	for (const [key, child] of Object.entries(value)) {
+		const pair = transform(child);
+		base[key] = pair.base;
+		eager[key] = pair.eager;
+	}
+	return { base, eager };
 }
+
+function measure(label: string, value: unknown): Measurement {
+	const serialized = JSON.stringify(value);
+	return {
+		label,
+		serialized,
+		chars: serialized.length,
+		bytes: new TextEncoder().encode(serialized).byteLength,
+	};
+}
+
+const surfaces = transform(body);
+const measurements = [
+	measure("baseline/request", body),
+	measure("auto/base-cache", surfaces.base),
+	measure("auto/eager-prefetch", surfaces.eager),
+];
+const baseline = measurements[0];
+const estimateTokens = (bytes: number): number => Math.round(bytes / 4);
+const percentSaved = (bytes: number): string => baseline.bytes > 0
+	? `${Math.round((100 * (baseline.bytes - bytes)) / baseline.bytes)}%`
+	: "0%";
+
+console.log(`\ncaptured provider request: ${baseline.bytes} UTF-8 bytes (~${estimateTokens(baseline.bytes)} estimated tokens)`);
+console.log(`catalog surfaces: ${catalogCount}; stable fingerprints: ${baseFingerprints.size}; eager prefetches: ${selectedNames.size}\n`);
+console.log("arm/surface          | UTF-8 bytes | est tokens | bytes saved | saved");
+console.log("---------------------|-------------|------------|-------------|------");
+for (const entry of measurements) {
+	console.log(
+		`${entry.label.padEnd(20)} | ${String(entry.bytes).padStart(11)} | ${String(estimateTokens(entry.bytes)).padStart(10)} | ${String(baseline.bytes - entry.bytes).padStart(11)} | ${percentSaved(entry.bytes).padStart(5)}`,
+	);
+}
+
+if (catalogCount === 0) console.log("\nNo <available_skills> catalog was found; all surfaces are identical.");
+if (selectedNames.size > 0) console.log(`\nEager prefetch: ${[...selectedNames].join(", ")}`);
+console.log("\nTool definitions are unchanged; dynamic tool discovery is measured separately.");

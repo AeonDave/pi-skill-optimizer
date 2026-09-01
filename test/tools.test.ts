@@ -1,132 +1,46 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CORE_TOOLS, optimizeTools, type ToolsOptions } from "../src/tools.ts";
+import {
+	buildToolDiscoveryCatalog,
+	CORE_TOOLS,
+	planToolActivation,
+	searchToolDiscoveryCatalog,
+} from "../src/tools.ts";
 
 const TOOLS = [
 	{ name: "Read", description: "Read a file." },
 	{ name: "Bash", description: "Run a shell command." },
-	{ name: "htb_app_whoami", description: "HackTheBox: current user." },
-	{ name: "htb_app_search", description: "HackTheBox: search machines." },
+	{ name: "htb_app_whoami", description: "HackTheBox current user." },
+	{ name: "htb_app_search", description: "HackTheBox search machines." },
 	{ name: "mcpwn_run", description: "Run a pwn command." },
 	{ name: "tavily_search", description: "Search the web for current information and news." },
 ];
 
-const BASE: ToolsOptions = { mode: "drop", dropPrefixes: [], topK: 24, protect: [], keepNames: new Set(), query: "" };
-
-test("CORE_TOOLS contains the obvious built-ins (case-insensitive lookup)", () => {
-	for (const n of ["read", "bash", "edit", "write", "subagent", "skill"]) assert.ok(CORE_TOOLS.has(n));
+test("CORE_TOOLS contains obvious built-ins", () => {
+	for (const name of ["read", "bash", "edit", "write", "subagent", "skill"]) assert.ok(CORE_TOOLS.has(name));
 });
 
-test("drop mode removes only prefixed, non-core, non-used tools", () => {
-	const { tools, dropped, removedChars } = optimizeTools(TOOLS, {
-		...BASE,
-		mode: "drop",
-		dropPrefixes: ["htb_", "mcpwn_"],
-	});
-	assert.deepEqual(dropped.sort(), ["htb_app_search", "htb_app_whoami", "mcpwn_run"]);
-	assert.ok(removedChars > 0);
-	assert.deepEqual((tools as Array<{ name: string }>).map((t) => t.name), ["Read", "Bash", "tavily_search"]);
+test("build catalog keeps core and configured prefixes always active", () => {
+	const catalog = buildToolDiscoveryCatalog(TOOLS, { protect: ["HTB_APP_"] });
+	assert.deepEqual(catalog.alwaysActiveNames, ["Read", "Bash", "htb_app_whoami", "htb_app_search"]);
+	assert.deepEqual(catalog.candidateNames, ["mcpwn_run", "tavily_search"]);
+	assert.equal(catalog.entries.length, TOOLS.length);
+	assert.notEqual(catalog.tools, TOOLS);
+	assert.deepEqual(catalog.tools, TOOLS);
 });
 
-test("drop mode never removes a core tool even if a prefix would match", () => {
-	const { dropped } = optimizeTools([{ name: "bash_extra", description: "x" }, { name: "Bash", description: "core" }], {
-		...BASE,
-		mode: "drop",
-		dropPrefixes: ["bash"],
-	});
-	assert.ok(dropped.includes("bash_extra"));
-	assert.ok(!dropped.includes("Bash")); // core protected
-});
-
-test("keepNames (used tools) and protect prefixes are never dropped", () => {
-	const { dropped } = optimizeTools(TOOLS, {
-		...BASE,
-		mode: "drop",
-		dropPrefixes: ["htb_", "tavily_"],
-		keepNames: new Set(["tavily_search"]),
-		protect: ["htb_app_search"],
-	});
-	assert.ok(!dropped.includes("tavily_search")); // used
-	assert.ok(!dropped.includes("htb_app_search")); // protected
-	assert.deepEqual(dropped, ["htb_app_whoami"]);
-});
-
-test("relevance mode keeps core + the top-K relevant of the rest", () => {
-	const { tools, dropped } = optimizeTools(TOOLS, {
-		...BASE,
-		mode: "relevance",
-		topK: 1,
-		query: "search the web for security news",
-	});
-	const names = (tools as Array<{ name: string }>).map((t) => t.name);
-	assert.ok(names.includes("Read") && names.includes("Bash")); // core kept
-	assert.ok(names.includes("tavily_search")); // most relevant non-core
-	assert.ok(dropped.includes("htb_app_whoami") && dropped.includes("mcpwn_run"));
-});
-
-test("relevance mode preserves original tool order among the kept", () => {
-	const { tools } = optimizeTools(TOOLS, { ...BASE, mode: "relevance", topK: 2, query: "hackthebox machine search" });
-	const names = (tools as Array<{ name: string }>).map((t) => t.name);
-	// core first (Read, Bash) in original positions, then the kept htb_ tools in order
-	assert.deepEqual(names.slice(0, 2), ["Read", "Bash"]);
-	assert.ok(names.indexOf("htb_app_whoami") < names.indexOf("htb_app_search"));
-});
-
-test("optimizeTools is identity (removedChars 0, same ref) when nothing is dropped", () => {
-	const res = optimizeTools(TOOLS, { ...BASE, mode: "drop", dropPrefixes: ["nomatch_"] });
-	assert.equal(res.tools, TOOLS);
-	assert.equal(res.removedChars, 0);
-	assert.deepEqual(res.dropped, []);
-});
-
-test("relevance mode is an identity no-op without lexical signal", () => {
-	for (const query of ["", "qzxvplm"]) {
-		const res = optimizeTools(TOOLS, { ...BASE, mode: "relevance", topK: 1, query });
-		assert.equal(res.tools, TOOLS);
-		assert.equal(res.removedChars, 0);
-		assert.deepEqual(res.dropped, []);
-	}
-});
-
-test("removedChars counts JSON-serialized characters", () => {
-	const tools = [{ name: "drop_me", description: "line\n\"C:\\tmp\"" }, { name: "Bash", description: "core" }];
-	const res = optimizeTools(tools, { ...BASE, mode: "drop", dropPrefixes: ["drop_"] });
-	assert.equal(res.removedChars, JSON.stringify(tools).length - JSON.stringify(res.tools).length);
-});
-
-test("optimizeTools handles a non-array gracefully", () => {
-	const res = optimizeTools(undefined, BASE);
-	assert.equal(res.removedChars, 0);
-	assert.deepEqual(res.dropped, []);
-});
-
-test("relevance mode keeps malformed tool entries instead of crashing", () => {
-	const malformed = undefined;
-	const { tools, dropped } = optimizeTools([malformed, { name: "Bash", description: "core" }, { name: "foo_search", description: "Search foo." }], {
-		...BASE,
-		mode: "relevance",
-		topK: 1,
-		query: "foo search",
-	});
-	assert.equal(tools[0], malformed);
-	assert.deepEqual((tools as Array<{ name?: string } | undefined>).map((t) => t?.name), [undefined, "Bash", "foo_search"]);
-	assert.deepEqual(dropped, []);
-});
-
-test("drop and relevance modes understand nested OpenAI Chat function definitions", () => {
+test("catalog supports nested OpenAI definitions and reports malformed entries", () => {
 	const tools = [
-		{ type: "function", function: { name: "vendor_search", description: "Search current vulnerability news." } },
-		{ type: "function", function: { name: "vendor_other", description: "Unrelated operation." } },
+		undefined,
+		{ type: "function", function: { name: "asset_lookup", description: "Fetch an asset.", parameters: { type: "object" } } },
 	];
-	const dropped = optimizeTools(tools, { ...BASE, mode: "drop", dropPrefixes: ["vendor_"] });
-	assert.deepEqual(dropped.dropped, ["vendor_search", "vendor_other"]);
-	const relevant = optimizeTools(tools, { ...BASE, mode: "relevance", topK: 1, query: "search vulnerability news" });
-	assert.deepEqual(relevant.dropped, ["vendor_other"]);
-	assert.equal(relevant.tools[0], tools[0]);
+	const catalog = buildToolDiscoveryCatalog(tools);
+	assert.deepEqual(catalog.unmanagedToolIndexes, [0]);
+	assert.deepEqual(catalog.candidateNames, ["asset_lookup"]);
 });
 
-test("relevance indexes bounded direct input schemas without changing tool payloads", () => {
-	const tools = [
+test("BM25F uses bounded direct schema names, descriptions, and enums", () => {
+	const catalog = buildToolDiscoveryCatalog([
 		{
 			name: "record_lookup",
 			description: "Fetch one record.",
@@ -140,15 +54,17 @@ test("relevance indexes bounded direct input schemas without changing tool paylo
 			},
 		},
 		{ name: "record_archive", description: "Archive one record." },
-	];
-	const result = optimizeTools(tools, { ...BASE, mode: "relevance", topK: 1, query: "critical github security advisory identifier" });
-	assert.deepEqual(result.dropped, ["record_archive"]);
-	assert.equal(result.tools[0], tools[0]);
-	assert.deepEqual(result.tools[0], tools[0]);
+	]);
+	const page = searchToolDiscoveryCatalog(catalog, "critical github security advisory identifier");
+	assert.equal(page.confidence, "high");
+	assert.equal(page.failOpen, false);
+	assert.equal(page.results[0]?.name, "record_lookup");
+	assert.ok(page.results[0]?.matchedFields.includes("schemaName"));
+	assert.ok(page.results[0]?.matchedFields.includes("schemaText"));
 });
 
-test("relevance indexes OpenAI function.parameters property descriptions and enums", () => {
-	const tools = [
+test("BM25F indexes nested OpenAI function.parameters", () => {
+	const catalog = buildToolDiscoveryCatalog([
 		{
 			type: "function",
 			function: {
@@ -157,14 +73,121 @@ test("relevance indexes OpenAI function.parameters property descriptions and enu
 				parameters: {
 					type: "object",
 					properties: {
-						cloudRegion: { type: "string", description: "Deployment geography", enum: ["eu-west-1", "us-east-1"] },
+						cloudRegion: { type: "string", description: "Deployment geography", enum: ["eu-west-1"] },
 					},
 				},
 			},
 		},
 		{ type: "function", function: { name: "asset_delete", description: "Delete an asset." } },
-	];
-	const result = optimizeTools(tools, { ...BASE, mode: "relevance", topK: 1, query: "deployment geography eu west" });
-	assert.deepEqual(result.dropped, ["asset_delete"]);
-	assert.equal(result.tools[0], tools[0]);
+	]);
+	const page = searchToolDiscoveryCatalog(catalog, "deployment geography eu west");
+	assert.equal(page.results[0]?.name, "asset_lookup");
+	assert.equal(page.confidence, "high");
+});
+
+test("schema traversal ignores routing text beyond the depth bound", () => {
+	const hidden = { properties: { hiddenNeedle: { description: "impossibleRoutingMarker" } } };
+	const deep = {
+		properties: {
+			level1: {
+				properties: {
+					level2: {
+						properties: {
+							level3: {
+								properties: {
+									level4: { properties: { level5: hidden } },
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	};
+	const catalog = buildToolDiscoveryCatalog([
+		{ name: "first_tool", input_schema: deep },
+		{ name: "second_tool", description: "ordinary" },
+	]);
+	const page = searchToolDiscoveryCatalog(catalog, "impossibleRoutingMarker", { pageSize: 10 });
+	assert.equal(page.confidence, "none");
+	assert.equal(page.failOpen, true);
+	assert.deepEqual(page.results.map((result) => result.name), ["first_tool", "second_tool"]);
+});
+
+test("exact name evidence outranks description-only evidence", () => {
+	const catalog = buildToolDiscoveryCatalog([
+		{ name: "invoice_lookup", description: "Fetch billing data." },
+		{ name: "generic_fetch", description: "Use this for invoice lookup operations." },
+	]);
+	const page = searchToolDiscoveryCatalog(catalog, "invoice lookup");
+	assert.equal(page.confidence, "high");
+	assert.equal(page.results[0]?.name, "invoice_lookup");
+});
+
+test("search pagination is deterministic and cursors are catalog/query bound", () => {
+	const catalog = buildToolDiscoveryCatalog([
+		{ name: "alpha_tool", description: "First." },
+		{ name: "beta_tool", description: "Second." },
+		{ name: "gamma_tool", description: "Third." },
+		{ name: "delta_tool", description: "Fourth." },
+	]);
+	const first = searchToolDiscoveryCatalog(catalog, "unmatched", { pageSize: 2 });
+	assert.deepEqual(first.results.map((result) => result.name), ["alpha_tool", "beta_tool"]);
+	assert.ok(first.nextCursor);
+	const second = searchToolDiscoveryCatalog(catalog, "unmatched", { pageSize: 2, cursor: first.nextCursor });
+	assert.deepEqual(second.results.map((result) => result.name), ["gamma_tool", "delta_tool"]);
+	assert.equal(second.nextCursor, undefined);
+	assert.throws(
+		() => searchToolDiscoveryCatalog(catalog, "different query", { cursor: first.nextCursor }),
+		/Invalid tool discovery cursor/,
+	);
+});
+
+test("search result descriptions are compact and configurable", () => {
+	const catalog = buildToolDiscoveryCatalog([{ name: "long_tool", description: `needle ${"x".repeat(600)}` }]);
+	const page = searchToolDiscoveryCatalog(catalog, "needle", { descriptionChars: 40 });
+	assert.equal(page.results[0]?.description.length, 40);
+	assert.ok(page.results[0]?.description.endsWith("..."));
+});
+
+test("activation keeps core, protected, and used tools in stable registration order", () => {
+	const catalog = buildToolDiscoveryCatalog(TOOLS, { protect: ["htb_app_whoami"] });
+	const plan = planToolActivation(catalog, "tavily web current news", {
+		topK: 1,
+		usedNames: new Set(["MCPWN_RUN"]),
+	});
+	assert.equal(plan.reason, "confident-match");
+	assert.equal(plan.failOpen, false);
+	assert.deepEqual(plan.alwaysActiveNames, ["Read", "Bash", "htb_app_whoami", "mcpwn_run"]);
+	assert.deepEqual(plan.selectedNames, ["tavily_search"]);
+	assert.deepEqual(plan.activeNames, ["Read", "Bash", "htb_app_whoami", "mcpwn_run", "tavily_search"]);
+});
+
+test("activation fails open on empty, unmatched, weak, and invalid-budget queries", () => {
+	const catalog = buildToolDiscoveryCatalog(TOOLS);
+	for (const [query, topK] of [["", 1], ["qzxvplm", 1], ["current", 1], ["tavily", 0]] as const) {
+		const plan = planToolActivation(catalog, query, { topK });
+		assert.equal(plan.failOpen, true, `${query}/${topK}`);
+		assert.deepEqual(plan.activeNames, TOOLS.map((tool) => tool.name));
+		assert.deepEqual(plan.selectedNames, []);
+	}
+});
+
+test("activation fails open when a top-K cutoff is tied", () => {
+	const catalog = buildToolDiscoveryCatalog([
+		{ name: "alpha_search", description: "Search records." },
+		{ name: "beta_search", description: "Search records." },
+		{ name: "gamma_search", description: "Search records." },
+	]);
+	const plan = planToolActivation(catalog, "search records", { topK: 1 });
+	assert.equal(plan.reason, "ambiguous-cutoff");
+	assert.equal(plan.failOpen, true);
+	assert.deepEqual(plan.activeNames, ["alpha_search", "beta_search", "gamma_search"]);
+});
+
+test("catalog fingerprints and rankings are deterministic", () => {
+	const first = buildToolDiscoveryCatalog(TOOLS, { protect: ["htb_"] });
+	const second = buildToolDiscoveryCatalog(TOOLS, { protect: ["htb_"] });
+	assert.equal(first.fingerprint, second.fingerprint);
+	assert.deepEqual(searchToolDiscoveryCatalog(first, "web news"), searchToolDiscoveryCatalog(second, "web news"));
 });

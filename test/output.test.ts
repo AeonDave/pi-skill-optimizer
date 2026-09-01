@@ -3,10 +3,15 @@ import { test } from "node:test";
 import {
 	buildExtractPrompt,
 	commandProgram,
+	decodeColumnarJson,
 	isExcludedCommand,
 	isRtkSource,
+	isKnownReducedOutput,
+	matchesOutputTool,
 	protectedEvidenceLines,
 	reduceOutput,
+	reduceJsonArrayColumnar,
+	shouldReduceToolResult,
 	truncateUtf8Bytes,
 	utf8ByteLength,
 	validateExtractedOutput,
@@ -259,4 +264,57 @@ test("smart and extraction validation are deterministic", () => {
 		validateExtractedOutput(original, "row 0\nnot in source", options),
 		validateExtractedOutput(original, "row 0\nnot in source", options),
 	);
+});
+
+test("homogeneous JSON object arrays round-trip through a smaller columnar representation", () => {
+	const rows = Array.from({ length: 200 }, (_, index) => ({
+		id: index,
+		status: "ok",
+		value: index % 7,
+		meta: { active: true },
+	}));
+	const original = JSON.stringify(rows, null, 2);
+	const result = reduceJsonArrayColumnar(original, { minSavingsBytes: 1, minSavingsRatio: 0 });
+	assert.equal(result.strategy, "columnar-json");
+	assert.equal(result.reduced, true);
+	assert.ok(result.toBytes < result.fromBytes);
+	assert.equal(result.rows, rows.length);
+	assert.equal(result.columns, 4);
+	assert.deepEqual(decodeColumnarJson(result.text), rows);
+});
+
+test("columnar reduction is identity for invalid, heterogeneous, protected, and never-better JSON", () => {
+	for (const original of [
+		"not json",
+		JSON.stringify([{ a: 1 }, { b: 2 }]),
+		JSON.stringify([{ value: "ERROR: protected" }, { value: "ordinary" }]),
+		JSON.stringify([{ a: 1 }, { a: 2 }]),
+	]) {
+		const result = reduceJsonArrayColumnar(original);
+		assert.equal(result.reduced, false);
+		assert.equal(result.text, original);
+		assert.equal(result.toBytes, result.fromBytes);
+	}
+	assert.equal(decodeColumnarJson('{"$format":"columnar-json-v1","rows":2,"keys":["a"],"columns":[[1]]}'), undefined);
+});
+
+test("output tool matching supports case-insensitive wildcards", () => {
+	assert.equal(matchesOutputTool("read", ["*"]), true);
+	assert.equal(matchesOutputTool("mcp__github__search", ["mcp__*"]), true);
+	assert.equal(matchesOutputTool("web_fetch", ["web_*", "read"]), true);
+	assert.equal(matchesOutputTool("bash", ["read", "mcp__*"]), false);
+});
+
+test("RTK coexistence requires per-result ownership evidence", () => {
+	const base = { outputTools: ["*"] } as const;
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "bash" }), true);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "powershell" }), true);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "bash", rtkHandled: true }), false);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "read" }), true);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "web_fetch" }), true);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "mcp__server__query" }), true);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "read", alreadyReduced: true }), false);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "read", rtkHandled: true }), false);
+	assert.equal(shouldReduceToolResult({ ...base, toolName: "read", text: "[skill-optimizer: reduced]" }), false);
+	assert.equal(isKnownReducedOutput("[rtk: filtered output]"), true);
 });

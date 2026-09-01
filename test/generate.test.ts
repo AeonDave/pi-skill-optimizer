@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-	chunk,
+	batchSkillsByWeight,
 	generateProfileInBatches,
 	interpretBatchResponse,
 	parseJsonObject,
 	responseText,
 	stripCodeFences,
+	skillBatchUtf8Bytes,
 	type ModelResponse,
 } from "../src/generate.ts";
 import { EMPTY_PROFILE, type SkillOptimizerProfile, type SkillRef } from "../src/profile.ts";
@@ -72,11 +73,20 @@ test("parseJsonObject throws the diagnostic error when there is no object", () =
 	assert.throws(() => parseJsonObject("[1,2,3]"), /did not contain a JSON object/);
 });
 
-test("chunk splits into groups, keeps the remainder, and never loses items", () => {
-	assert.deepEqual(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
-	assert.deepEqual(chunk([1, 2], 5), [[1, 2]]);
-	assert.deepEqual(chunk([], 3), []);
-	assert.deepEqual(chunk([1, 2, 3], 0), [[1, 2, 3]]); // size<=0 -> single group
+test("batchSkillsByWeight enforces count and UTF-8 limits without truncating descriptions", () => {
+	const skills: SkillRef[] = [
+		{ name: "a", description: "ASCII" },
+		{ name: "unicode", description: "😀😀" },
+		{ name: "c", description: "complete routing description" },
+	];
+	const firstTwoBytes = skillBatchUtf8Bytes(skills[0]) + skillBatchUtf8Bytes(skills[1]);
+	assert.deepEqual(
+		batchSkillsByWeight(skills, { maxSkills: 3, maxUtf8Bytes: firstTwoBytes }),
+		[[skills[0], skills[1]], [skills[2]]],
+	);
+	assert.deepEqual(batchSkillsByWeight(skills, { maxSkills: 1, maxUtf8Bytes: 1_000 }), skills.map((skill) => [skill]));
+	assert.deepEqual(batchSkillsByWeight([], { maxSkills: 2, maxUtf8Bytes: 100 }), []);
+	assert.equal(batchSkillsByWeight([{ name: "huge", description: "x".repeat(200) }], { maxSkills: 2, maxUtf8Bytes: 10 })[0][0].description.length, 200);
 });
 
 test("interpretBatchResponse fails on error/aborted with the errorMessage detail", () => {
@@ -114,10 +124,11 @@ test("interpretBatchResponse requires explicit processedSkills even with profile
 });
 
 const refs = (...names: string[]): SkillRef[] => names.map((name) => ({ name, description: `${name} desc` }));
+const limits = (maxSkills: number) => ({ maxSkills, maxUtf8Bytes: 10_000 });
 
 test("generateProfileInBatches batches by size and merges every successful batch", async () => {
 	const seen: string[][] = [];
-	const result = await generateProfileInBatches(refs("a", "b", "c", "d", "e"), 2, async (batch, i, total) => {
+	const result = await generateProfileInBatches(refs("a", "b", "c", "d", "e"), limits(2), async (batch, i, total) => {
 		assert.equal(total, 3); // ceil(5/2)
 		seen.push(batch.map((s) => s.name));
 		return { profile: { ...EMPTY_PROFILE, critical: batch.map((s) => s.name) }, processedSkills: batch.map((s) => s.name) };
@@ -129,7 +140,7 @@ test("generateProfileInBatches batches by size and merges every successful batch
 });
 
 test("generateProfileInBatches keeps successes and marks a failed batch's skills unapplied", async () => {
-	const result = await generateProfileInBatches(refs("a", "b", "c", "d"), 2, async (batch) => {
+	const result = await generateProfileInBatches(refs("a", "b", "c", "d"), limits(2), async (batch) => {
 		if (batch.some((s) => s.name === "c")) return undefined; // 2nd batch (c,d) fails
 		return { profile: { ...EMPTY_PROFILE, critical: batch.map((s) => s.name) }, processedSkills: batch.map((s) => s.name) };
 	});
@@ -142,19 +153,43 @@ test("generateProfileInBatches keeps successes and marks a failed batch's skills
 });
 
 test("generateProfileInBatches rejects incomplete or foreign batch coverage", async () => {
-	const result = await generateProfileInBatches(refs("a", "b"), 2, async () => ({
-		profile: { ...EMPTY_PROFILE, critical: ["a"] },
-		processedSkills: ["a", "not-in-batch"],
-	}));
+	let attempts = 0;
+	const result = await generateProfileInBatches(refs("a", "b"), limits(2), async () => {
+		attempts += 1;
+		return {
+			profile: { ...EMPTY_PROFILE, critical: ["a"] },
+			processedSkills: ["a", "not-in-batch"],
+		};
+	});
 	assert.equal(result, undefined);
+	assert.equal(attempts, 2);
+});
+
+test("generateProfileInBatches retries incomplete coverage and accepts a complete retry once", async () => {
+	const attempts: number[] = [];
+	const skills = refs("a", "b");
+	const result = await generateProfileInBatches(
+		skills,
+		{ maxSkills: 2, maxUtf8Bytes: 1_000, maxAttempts: 3 },
+		async (batch, _index, _total, attempt) => {
+			attempts.push(attempt);
+			return {
+				profile: { ...EMPTY_PROFILE, critical: batch.map((skill) => skill.name) },
+				processedSkills: attempt === 1 ? ["a"] : batch.map((skill) => skill.name),
+			};
+		},
+	);
+	assert.ok(result);
+	assert.deepEqual(attempts, [1, 2]);
+	assert.deepEqual([...result.applied].sort(), ["a", "b"]);
 });
 
 test("generateProfileInBatches has no legacy fallback without explicit processedSkills", async () => {
-	const result = await generateProfileInBatches(refs("a"), 1, async () => EMPTY_PROFILE as unknown as { profile: SkillOptimizerProfile; processedSkills: string[] });
+	const result = await generateProfileInBatches(refs("a"), limits(1), async () => EMPTY_PROFILE as unknown as { profile: SkillOptimizerProfile; processedSkills: string[] });
 	assert.equal(result, undefined);
 });
 
 test("generateProfileInBatches returns undefined only when every batch fails", async () => {
-	const result = await generateProfileInBatches(refs("a", "b", "c"), 1, async () => undefined);
+	const result = await generateProfileInBatches(refs("a", "b", "c"), limits(1), async () => undefined);
 	assert.equal(result, undefined);
 });

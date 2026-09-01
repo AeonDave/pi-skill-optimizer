@@ -434,3 +434,155 @@ export function validateExtractedOutput(
 		toBytes,
 	};
 }
+
+export interface ColumnarJsonOptions {
+	minSavingsBytes?: number;
+	minSavingsRatio?: number;
+	protectedPatterns?: readonly RegExp[];
+}
+
+export interface ColumnarJsonResult {
+	text: string;
+	reduced: boolean;
+	strategy: "columnar-json" | "original";
+	fromBytes: number;
+	toBytes: number;
+	rows: number;
+	columns: number;
+}
+
+interface ColumnarJsonV1 {
+	$format: "columnar-json-v1";
+	rows: number;
+	keys: string[];
+	columns: unknown[][];
+}
+
+function matchesOutputPattern(text: string, pattern: RegExp): boolean {
+	pattern.lastIndex = 0;
+	const matched = pattern.test(text);
+	pattern.lastIndex = 0;
+	return matched;
+}
+
+/** Decode only the self-describing lossless columnar format emitted below. */
+export function decodeColumnarJson(text: string): unknown[] | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(text);
+	} catch {
+		return undefined;
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const encoded = value as Partial<ColumnarJsonV1>;
+	const rowCount = encoded.rows;
+	if (encoded.$format !== "columnar-json-v1"
+		|| typeof rowCount !== "number"
+		|| !Number.isInteger(rowCount)
+		|| rowCount < 0
+		|| !Array.isArray(encoded.keys)
+		|| !encoded.keys.every((key) => typeof key === "string")
+		|| new Set(encoded.keys).size !== encoded.keys.length
+		|| !Array.isArray(encoded.columns)
+		|| encoded.columns.length !== encoded.keys.length
+		|| !encoded.columns.every((column) => Array.isArray(column) && column.length === rowCount)) {
+		return undefined;
+	}
+	const rows: unknown[] = [];
+	for (let rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+		rows.push(Object.fromEntries(encoded.keys.map((key, columnIndex) => [key, encoded.columns![columnIndex][rowIndex]])));
+	}
+	return rows;
+}
+
+/**
+ * Losslessly encode a homogeneous JSON object array as columns. The transform is
+ * accepted only after an internal round trip and only when the complete encoded
+ * result is materially smaller. Protected evidence always forces identity.
+ */
+export function reduceJsonArrayColumnar(text: string, options: ColumnarJsonOptions = {}): ColumnarJsonResult {
+	const fromBytes = utf8ByteLength(text);
+	const original = (): ColumnarJsonResult => ({
+		text,
+		reduced: false,
+		strategy: "original",
+		fromBytes,
+		toBytes: fromBytes,
+		rows: 0,
+		columns: 0,
+	});
+	if (protectedEvidenceLines(text).length > 0
+		|| (options.protectedPatterns ?? []).some((pattern) => matchesOutputPattern(text, pattern))) return original();
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return original();
+	}
+	if (!Array.isArray(parsed) || parsed.length < 2) return original();
+	if (parsed.some((row) => !row || typeof row !== "object" || Array.isArray(row))) return original();
+	const records = parsed as Array<Record<string, unknown>>;
+	const keys = Object.keys(records[0]);
+	for (let i = 1; i < records.length; i++) {
+		const rowKeys = Object.keys(records[i]);
+		if (rowKeys.length !== keys.length || rowKeys.some((key, index) => key !== keys[index])) return original();
+	}
+	const encoded: ColumnarJsonV1 = {
+		$format: "columnar-json-v1",
+		rows: records.length,
+		keys,
+		columns: keys.map((key) => records.map((record) => record[key])),
+	};
+	const candidate = JSON.stringify(encoded);
+	const decoded = decodeColumnarJson(candidate);
+	if (!decoded || JSON.stringify(decoded) !== JSON.stringify(parsed)) return original();
+	const toBytes = utf8ByteLength(candidate);
+	const minBytes = Math.max(0, Math.floor(options.minSavingsBytes ?? 256));
+	const minRatio = Math.min(1, Math.max(0, options.minSavingsRatio ?? 0.05));
+	if (!hasMinimumSavings(fromBytes, toBytes, minBytes, minRatio)) return original();
+	return {
+		text: candidate,
+		reduced: true,
+		strategy: "columnar-json",
+		fromBytes,
+		toBytes,
+		rows: records.length,
+		columns: keys.length,
+	};
+}
+
+export interface ToolResultReductionDecision {
+	toolName: string;
+	outputTools: readonly string[];
+	rtkHandled?: boolean;
+	alreadyReduced?: boolean;
+	text?: string;
+}
+
+function wildcardMatch(value: string, pattern: string): boolean {
+	const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+	return new RegExp(`^${escaped}$`, "i").test(value);
+}
+
+/** Case-insensitive exact/glob matching for configured output tool names. */
+export function matchesOutputTool(toolName: string, outputTools: readonly string[]): boolean {
+	return outputTools.some((pattern) => pattern.length > 0 && wildcardMatch(toolName, pattern));
+}
+
+/** Recognize outputs already replaced by this extension, history dedup, or RTK. */
+export function isKnownReducedOutput(text: string): boolean {
+	return text.includes("[skill-optimizer:")
+		|| /^\[duplicate tool result; same-as=htr:[A-Za-z0-9_-]{43}\]$/m.test(text)
+		|| /^\[rtk(?::|\])/im.test(text);
+}
+
+/**
+ * Per-result coexistence decision. Mere RTK presence is not ownership evidence:
+ * only an explicit handled flag or a recognizable reduction suppresses AUTO.
+ */
+export function shouldReduceToolResult(options: ToolResultReductionDecision): boolean {
+	if (!matchesOutputTool(options.toolName, options.outputTools)) return false;
+	if (options.alreadyReduced || options.rtkHandled || (options.text && isKnownReducedOutput(options.text))) return false;
+	return true;
+}

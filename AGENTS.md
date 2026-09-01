@@ -1,132 +1,121 @@
+@C:\Users\novad\.codex\RTK.md
+
 # AGENTS.md
 
-Pi extension that reduces repeated request tokens by compacting the
-`<available_skills>` catalog, optionally slimming the tools array, and reducing
-long tool output. TypeScript, loaded by Pi through jiti without a build step.
+Pi extension that reduces repeated request tokens through one AUTO discovery contract, dynamic tool activation, and recoverable tool-output reduction. TypeScript is loaded by Pi through jiti without a build step.
 
 ## Commands
 
 ```bash
 npm install
-npm run typecheck                 # tsc --noEmit against real Pi types
-npm test                          # node --test on pure modules
-npm run bench                     # deterministic invariants and fuzz benchmark
-npm run bench:output              # output safety and evidence benchmark
-npm run corpus:build              # private real catalog/session corpus (uses Luna)
-npm run bench:real                # paired real-model and RTK evaluation
-npm run measure <capture.json>    # exact chars and estimated token equivalent
-pi -e ./src/index.ts              # live-load for manual testing
+npm run typecheck
+npm test
+npm run bench
+npm run bench:output
+npm run corpus:build
+npm run bench:real
+npm run measure <capture.json>
+pi -e ./src/index.ts
 ```
+
+Remote corpus and provider runs are explicit and never part of `npm test`.
 
 ## Architecture
 
-- `src/request.ts` - pure normalization of canonical Anthropic, OpenAI,
-  Gemini, and Mistral request shapes; shared text/query extraction and tool-use
-  history.
-- `src/skills.ts` - pure catalog parser, BM25 plus conservative name/alias fuzzy
-  recall, soft-budget selection, compact rendering, loadability notes, and
-  idempotent text transformation.
-- `src/tools.ts` - pure tools-array optimization with core, configured, and
-  already-used tool protection.
-- `src/optimize.ts` - pure orchestration over normalized system surfaces and tool
-  descriptions; returns `{ next, removedChars, selected, droppedTools }`.
-- `src/aliases.ts` - built-in and profile-generated aliases filtered against the
-  active catalog.
-- `src/profile.ts` - profile normalization, scope splitting, and incremental hash
-  bookkeeping.
-- `src/generate.ts` - pure parsing and validation of batched `init` responses.
-- `src/usage.ts` - conservative, deduplicated evidence for usage-derived pins.
-- `src/output.ts` - UTF-8 byte-safe deterministic reduction and guarded
-  model-assisted verbatim extraction with protected evidence.
-- `src/stats.ts` - savings counters and mergeable persistent deltas.
-- `src/persistence.ts` - atomic JSON replacement and lock-serialized
-  read-modify-write helpers for concurrent project and global state.
-- `src/corpus.ts` - pure HMAC identifiers, irreversible redaction, private corpus
-  schema, validation, rendering, and exact evidence recall.
-- `src/evaluation.ts` - pure paired exposure, recall, byte/token, cache-stability,
-  and hard-safety metrics for real corpus cases.
-- `src/config.ts` - defaults, file/env normalization, disable handling, and
-  provider scoping.
-- `src/index.ts` - Pi hook registration, state I/O, RTK coexistence, footer, and
-  `/skill-optimizer` commands.
-- `scripts/measure.ts` - captured-request serialized-size measurement.
-- `scripts/bench.ts` - deterministic synthetic benchmark and blocking invariants.
-- `scripts/output-bench.ts` - deterministic output-safety and evidence benchmark.
-- `scripts/build-real-corpus.ts` - explicit one-shot real catalog/session capture.
-- `scripts/evaluate-real-corpus.ts` - Luna token/recall and RTK output comparison.
-- `scripts/lib/luna.ts` - isolated Luna CLI runner and authoritative usage parser.
+- `src/request.ts` - provider-neutral human-text extraction, tool-use history, and minimal-clone overlay insertion for Anthropic, OpenAI Chat and Responses, Gemini, and Mistral.
+- `src/skills.ts` - stable TSV index, BM25F and exact ranking, bounded fuzzy recovery, reciprocal-rank fusion, diversity, budgets, and fingerprints.
+- `src/skill-loader.ts` - exact skill, resource, and location resolution with canonical-path containment.
+- `src/tools.ts` - dynamic tool catalog, schema-aware ranking, protected activation, and paginated search.
+- `src/optimize.ts` - stable-base and latest-human overlay orchestration with identity preservation.
+- `src/profile.ts` - normalization and scope handling for `critical`, `queries`, `clusters`, and `negativeHints`.
+- `src/generate.ts` - UTF-8-weighted init batching, complete validation, and incomplete-batch retry.
+- `src/usage.ts` - bounded, decayed, deduplicated usage evidence.
+- `src/history.ts` - monotonic exact deduplication with opaque recovery artifacts.
+- `src/output.ts` - UTF-8-safe smart reduction, guarded verbatim extraction, lossless columnar JSON, protected evidence, and per-result RTK ownership.
+- `src/stats.ts` - savings and authoritative provider telemetry v3.
+- `src/persistence.ts` - atomic replacement, lock-serialized additive deltas, and content-addressed output archives.
+- `src/corpus.ts` - HMAC identifiers, irreversible sanitization, private corpus schema, and evidence labels.
+- `src/evaluation.ts` - paired discovery, tool, output, cache, token, cost, and safety metrics.
+- `src/config.ts` - AUTO defaults, project/global normalization, provider scope, and boolean bypass.
+- `src/index.ts` - Pi hooks, state, activation, `skill_search`, `tool_search`, `retrieve_output`, diagnostics, and commands.
+- `scripts/bench.ts` - deterministic AUTO invariants.
+- `scripts/output-bench.ts` - output, evidence, archive, columnar, and RTK benchmark.
+- `scripts/build-real-corpus.ts` and `scripts/evaluate-real-corpus.ts` - explicit private real-provider workflow.
+- `scripts/measure.ts` - serialized-size measurement.
 
-## Key invariants
+## AUTO invariants
 
-- **Score full text, compact only while rendering.** Never rank an already
-  compacted description.
-- **Public catalog modes are `off`, `compact`, and `hybrid`.** Except for an
-  explicit `never` exclusion, every name survives in `compact` and `hybrid`.
-- **Every retained skill remains loadable.** Promoted and irregular entries keep
-  explicit locations; regular tail entries may use one shared
-  `<skill_path_note>` containing roots and the `<root>/<name>/SKILL.md`
-  convention.
-- **Optimization is idempotent.** Return an already transformed catalog
-  unchanged because removed text cannot be reconstructed.
-- **No-signal requests preserve intent.** `hybrid` uses a short `intent` tail
-  when query extraction or lexical scoring has no usable signal.
-- **Quality wins over nominal savings.** Keep critical and pinned skills full and
-  expand top-K when close scores are ambiguous. A soft full-render budget applies
-  only to ordinary selections; protected and ambiguity-guard entries may exceed
-  it.
-- **Fuzzy recall is bounded.** Apply typo recovery only to skill names and aliases,
-  only when lexical coverage is weak, and never turn a no-signal request into a
-  false promotion.
-- **Descriptions are not rewritten.** Surviving text remains verbatim and in its
-  original order.
-- **Usage evidence is conservative.** Record only explicit skill mentions or
-  observed skill-tool calls, deduplicated across provider tool loops. Pruning may
-  remove only stale one-off entries and must protect critical/current pins.
-- **Catalogs may occur in system content or tool descriptions.** Normalize and
-  scan both.
-- **Tools have no fallback after removal.** Tools slimming is off by default,
-  never removes core/protected/already-used tools, and relevance mode fails open
-  without lexical signal. Schema indexing must stay bounded. Prefer deterministic
-  prefix `drop` mode.
-- **Output reducers fail open.** Use real UTF-8 bytes, retain protected evidence,
-  accept model output only as an ordered verbatim subsequence, require material
-  savings, and fall back `extract -> smart -> original`. Never return a reduced
-  result when the full-output archive failed.
-- **Benchmark data stays private by default.** Never collect in the normal hook,
-  never send unsanitized sessions remotely, never use generated profile queries
-  as labels, and never commit `.pi/skill-optimizer/benchmark/`.
-- **Identity return matters.** Return the original reference, and the hook must
-  return `undefined`, when nothing changed. Honor
-  `PI_SKILL_OPTIMIZER_DISABLE` using boolean semantics.
-- **Persistent updates must not lose deltas.** Write JSON through atomic
-  replacement and serialize read-modify-write operations with the persistence
-  lock; never overwrite usage or statistics from a stale in-memory snapshot.
+- AUTO is the only public discovery strategy. The only global bypass is `disable` or `PI_SKILL_OPTIMIZER_DISABLE`.
+- The base is query-independent `<skill_index format="tsv" columns="name,intent">` with marker `<!--skill-optimizer:auto:v2-->`.
+- The base contains no path. Every eligible name survives; intent yields first at the all-name floor.
+- The base remains byte-identical when catalog, profile, and configuration are unchanged.
+- Score full source text. Limit only rendered base, overlay, or search responses.
+- Prefetch is separate from the base and appends full verbatim text only to the latest genuine human block.
+- Never derive intent from tool or function results, assistant text, injected context, or image metadata.
+- Overlay insertion is idempotent, minimally clones the modified provider branch, and preserves identity without a target.
+- Empty input must not manufacture a ranking signal.
+- `skill_search` cursors bind to query and catalog fingerprint.
+- Exact load accepts only a registered name. Resource and location actions stay inside the canonical skill root.
+- The generated profile is exactly `critical`, `queries`, `clusters`, and `negativeHints`.
 
-## Compatibility
+## Dynamic tool invariants
 
-This extension is provider-agnostic and separate from `pi-claude`. It edits only
-the configured catalog, tag/paragraph surfaces, tools array, and tool results;
-it does not alter billing or identity blocks.
+- Keep core, configured, already used, and bounded predicted tools active.
+- Keep `tool_search` active while searchable definitions remain.
+- Search is paginated and activates bounded results through Pi's runtime API.
+- Never strand an in-progress provider tool loop by deactivating a used tool.
+- Bound schema indexing work so recursive or large schemas cannot dominate processing.
+- Empty or unrelated input preserves protected tools.
 
-RTK is the recommended companion for effective command-output reduction, not a
-runtime prerequisite. When an RTK-style extension is detected, only this
-extension's overlapping output reducer steps aside. Catalog and tools-array
-safety must not change when RTK is absent.
+## Output and history invariants
 
-`compact` must remain query-independent for provider-cache stability. Do not
-claim cache hit metrics unless Pi exposes authoritative provider cache data.
+- Reducers fail open and use real UTF-8 bytes.
+- Never return reduced output unless the complete archive was written.
+- Recovery text contains an opaque content identifier, never an archive path.
+- `retrieve_output` verifies content identity and supports bounded lines.
+- Preserve protected evidence in every path.
+- Extraction accepts only an ordered verbatim subsequence with material savings; rejection falls back through smart processing to the original.
+- Columnar JSON requires homogeneous rows, exact round trip, and a smaller complete representation.
+- RTK ownership is per result. Skip only shell output RTK already handled; read, web, MCP, and other eligible results remain available.
+- History keeps the first large successful result and changes only later exact copies with recoverable artifacts.
+- Never deduplicate errors, protected evidence, images, mixed media, or small results.
+- A second pass cannot be larger or more destructive.
+
+## Persistence and telemetry invariants
+
+- Persistent updates use atomic replacement.
+- Shared usage and statistics use a process lock and additive read-modify-write deltas.
+- Archives are immutable, content-addressed, SHA-256 verified, and TTL-cleaned.
+- Telemetry v3 is `requests`, `input`, `output`, `cacheRead`, `cacheWrite`, and `totalCost`.
+- Cache reads and writes come only from provider usage. Stable bytes do not prove a cache hit.
+- Keep characters and bytes separate from provider tokens and cost.
+- Usage evidence is bounded and decays; pruning protects current explicit evidence and configured skills.
+
+## Privacy invariants
+
+- Normal hooks never collect a benchmark corpus.
+- Corpus creation and remote evaluation require explicit commands.
+- Never send an unsanitized session or catalog remotely.
+- Use keyed irreversible identifiers and remove secrets, identities, hostnames, and absolute paths.
+- Generated profile queries are not labels.
+- Never commit `.pi/skill-optimizer/benchmark/`.
 
 ## Testing
 
-- Changes to request normalization require `test/request.test.ts` coverage for
-  Anthropic, OpenAI Responses/messages, and Gemini forms.
-- Changes to `skills.ts`, `tools.ts`, or `optimize.ts` require focused unit tests
-  plus `npm run bench` for discovery, loadability, no-signal, determinism, and
-  idempotence invariants.
-- Profile, usage, generation, output, stats, persistence, and config changes
-  require tests in their corresponding pure-module suites.
-- Hook/config changes require `npm run typecheck`, then a live Pi check with
-  `pi -e ./src/index.ts` and `/skill-optimizer`.
-- Output changes require `test/output.test.ts` and `npm run bench:output`.
-- Corpus/evaluation changes require their pure-module tests. Remote Luna calls
-  are opt-in through `corpus:build` and `bench:real`, never part of `npm test`.
+- Request changes require Anthropic, OpenAI Chat and Responses, Gemini, and Mistral human/tool-result cases.
+- Ranking, base, overlay, loader, or dynamic-tool changes require focused tests and `npm run bench`.
+- Output or history changes require focused tests and `npm run bench:output`.
+- Other pure modules require their corresponding suites.
+- Hook or config changes require `npm run typecheck`, then `pi -e ./src/index.ts` with status, audit, and search/load smoke paths.
+- Run focused tests after edits, then all local gates before a completion claim.
+- Never invoke `corpus:build` or `bench:real` implicitly.
+
+## References
+
+- [Pi skills](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/skills.md)
+- [Pi extensions](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md)
+- [OpenAI tool search](https://developers.openai.com/api/docs/guides/tools-tool-search)
+- [Anthropic tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+- [MCP tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
+- [MCP resources](https://modelcontextprotocol.io/specification/2025-06-18/server/resources)
+- [OpenAI Codex skills](https://developers.openai.com/codex/skills)

@@ -1,108 +1,94 @@
-/**
- * Candidate lexical aliases for short queries that may not share terms with
- * skill descriptions. They are filtered per catalog, so aliases only expand to
- * terms actually present in the user's available skills.
- */
-
 export type QueryAliasMap = ReadonlyMap<string, readonly string[]>;
 export type AliasRecord = Record<string, string[]>;
 
-export const CANDIDATE_QUERY_ALIASES: Readonly<Record<string, readonly string[]>> = {
-	ad: ["active", "directory", "kerberos", "ldap", "windows"],
-	apk: ["android", "mobile", "reverse"],
-	aws: ["cloud", "iam", "s3"],
-	azure: ["cloud", "entra", "oauth"],
-	csharp: ["dotnet", "windows"],
-	docker: ["container", "kubernetes"],
-	hash: ["password", "cracking"],
-	htb: ["hackthebox", "vpn", "machine"],
-	jwt: ["token", "oauth"],
+// Static, reviewed vocabulary only. Catalog filtering below prevents an alias
+// from adding terms that do not exist in the active catalog.
+export const CANDIDATE_QUERY_ALIASES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+	ad: ["active", "directory", "kerberos", "ldap"],
+	adb: ["android", "mobile"],
+	apk: ["android", "mobile", "application"],
+	authn: ["authentication", "identity"],
+	authz: ["authorization", "permission"],
+	aws: ["cloud", "amazon"],
+	azure: ["cloud", "microsoft"],
+	binary: ["reverse", "reversing", "exploitation"],
+	bug: ["debug", "debugging", "defect"],
+	ci: ["cicd", "pipeline"],
+	cli: ["command", "shell"],
+	container: ["docker", "kubernetes"],
+	crack: ["cracking", "password", "hash"],
+	ctf: ["challenge", "exploit"],
+	db: ["database", "sql"],
+	debug: ["debugging", "gdb", "windbg"],
+	deploy: ["deployment", "release"],
+	docker: ["container"],
+	forensic: ["forensics", "artifact"],
+	fuzz: ["fuzzer", "fuzzing"],
+	git: ["github", "repository"],
+	incident: ["forensics", "response"],
+	js: ["javascript", "typescript", "node"],
 	k8s: ["kubernetes", "container"],
-	ntlm: ["hash", "password", "smb", "windows"],
-	pcap: ["packet", "capture", "network"],
-	plugin: ["extension", "package"],
-	plugins: ["extension", "package"],
-	pr: ["pull", "request", "github"],
-	rsa: ["crypto", "cryptography", "key"],
-	smb: ["windows", "active", "directory"],
-	ts: ["typescript"],
-	tsc: ["typescript", "typecheck"],
-	typecheck: ["typescript", "tsc"],
-	web3: ["blockchain", "ethereum", "evm"],
-};
+	malware: ["reverse", "analysis"],
+	mobile: ["android", "ios", "application"],
+	network: ["packet", "traffic", "protocol"],
+	osint: ["intelligence", "reconnaissance"],
+	pentest: ["security", "assessment"],
+	plugin: ["extension"],
+	pr: ["pull", "request", "review"],
+	pwn: ["binary", "exploitation"],
+	py: ["python"],
+	recon: ["reconnaissance", "discovery", "enumeration"],
+	recover: ["recovery"],
+	refactor: ["architecture", "design"],
+	reverse: ["reversing", "analysis"],
+	rtk: ["output", "compression"],
+	sqli: ["sql", "injection"],
+	test: ["testing", "tests"],
+	token: ["context", "prompt"],
+	tunnel: ["pivot", "proxy"],
+	vuln: ["vulnerability", "security"],
+	web: ["http", "browser"],
+});
 
-const OVERBROAD_ALIAS_TARGETS = new Set([
-	"assessment",
-	"reference",
-	"security",
-	"technique",
-	"tool",
-	"tools",
-	"workflow",
-]);
+const OVERBROAD_TARGETS = new Set(["app", "code", "file", "tool", "use", "workflow"]);
 
-let userAliasCandidates: AliasRecord = {};
-let userAliasRevision = 0;
-
-function aliasRecordsEqual(left: AliasRecord, right: AliasRecord): boolean {
-	const leftEntries = Object.entries(left);
-	const rightEntries = Object.entries(right);
-	if (leftEntries.length !== rightEntries.length) return false;
-	return leftEntries.every(([key, targets]) => {
-		const other = right[key];
-		return other !== undefined && targets.length === other.length && targets.every((target, i) => target === other[i]);
-	});
-}
-
-function normalizeToken(value: string): string[] {
+function normalizeToken(value: string): string {
 	return value
-		.toLowerCase()
-		.split(/[^a-z0-9]+/)
-		.filter((token) => token.length >= 2 && /[a-z]/.test(token));
+		.normalize("NFKD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.trim()
+		.toLocaleLowerCase("en-US")
+		.replace(/[^\p{L}\p{N}#+.-]+/gu, "-")
+		.replace(/^-+|-+$/g, "");
 }
 
 export function normalizeAliasRecord(value: unknown): AliasRecord {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 	const out: AliasRecord = {};
-	if (!value || typeof value !== "object" || Array.isArray(value)) return out;
-	for (const [rawKey, rawTargets] of Object.entries(value)) {
-		if (!Array.isArray(rawTargets)) continue;
-		const keys = normalizeToken(rawKey);
-		const targets = Array.from(
-			new Set(rawTargets.flatMap((target) => (typeof target === "string" ? normalizeToken(target) : []))),
-		);
-		if (targets.length === 0) continue;
-		for (const key of keys) out[key] = Array.from(new Set([...(out[key] ?? []), ...targets]));
+	for (const [rawSource, rawTargets] of Object.entries(value)) {
+		const source = normalizeToken(rawSource);
+		if (!source || !Array.isArray(rawTargets)) continue;
+		const targets = [...new Set(rawTargets
+			.filter((target): target is string => typeof target === "string")
+			.map(normalizeToken)
+			.filter((target) => target && target !== source && !OVERBROAD_TARGETS.has(target)))];
+		if (targets.length > 0) out[source] = targets;
 	}
 	return out;
 }
 
-export function setUserAliasCandidates(value: unknown): AliasRecord {
-	const normalized = normalizeAliasRecord(value);
-	if (!aliasRecordsEqual(userAliasCandidates, normalized)) {
-		userAliasCandidates = normalized;
-		userAliasRevision += 1;
-	}
-	return userAliasCandidates;
-}
-
-/** Monotonic revision used to invalidate catalog analyses that captured global aliases. */
-export function getUserAliasRevision(): number {
-	return userAliasRevision;
-}
-
-export function buildCatalogAliases(hasTerm: (term: string) => boolean, extraCandidates: AliasRecord = {}): QueryAliasMap {
+/** Build an immutable alias view scoped to one catalog. */
+export function buildCatalogAliases(
+	hasTerm: (term: string) => boolean,
+	extraCandidates: AliasRecord = {},
+): QueryAliasMap {
+	const candidates = { ...CANDIDATE_QUERY_ALIASES, ...normalizeAliasRecord(extraCandidates) };
 	const aliases = new Map<string, readonly string[]>();
-	const merged = new Map<string, string[]>();
-	for (const [source, targets] of Object.entries(CANDIDATE_QUERY_ALIASES)) merged.set(source, [...targets]);
-	for (const [source, targets] of Object.entries(userAliasCandidates)) {
-		merged.set(source, Array.from(new Set([...(merged.get(source) ?? []), ...targets])));
-	}
-	for (const [source, targets] of Object.entries(extraCandidates)) {
-		merged.set(source, Array.from(new Set([...(merged.get(source) ?? []), ...targets])));
-	}
-	for (const [source, targets] of merged) {
-		const presentTargets = targets.filter((target) => hasTerm(target) && !OVERBROAD_ALIAS_TARGETS.has(target));
-		if (presentTargets.length > 0) aliases.set(source, presentTargets);
+	for (const [source, rawTargets] of Object.entries(candidates)) {
+		const targets = [...new Set(rawTargets
+			.map(normalizeToken)
+			.filter((target) => target && !OVERBROAD_TARGETS.has(target) && hasTerm(target)))];
+		if (targets.length > 0) aliases.set(normalizeToken(source), Object.freeze(targets));
 	}
 	return aliases;
 }
@@ -110,14 +96,16 @@ export function buildCatalogAliases(hasTerm: (term: string) => boolean, extraCan
 export function expandQueryTokens(tokens: readonly string[], aliases: QueryAliasMap): string[] {
 	const expanded: string[] = [];
 	const seen = new Set<string>();
-	const add = (token: string): void => {
-		if (seen.has(token)) return;
+	for (const rawToken of tokens) {
+		const token = normalizeToken(rawToken);
+		if (!token || seen.has(token)) continue;
 		seen.add(token);
 		expanded.push(token);
-	};
-	for (const token of tokens) {
-		add(token);
-		for (const alias of aliases.get(token) ?? []) add(alias);
+		for (const target of aliases.get(token) ?? []) {
+			if (seen.has(target)) continue;
+			seen.add(target);
+			expanded.push(target);
+		}
 	}
 	return expanded;
 }

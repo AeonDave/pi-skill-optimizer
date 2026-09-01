@@ -181,19 +181,41 @@ export function usageRecordSignature(payload: unknown, names: readonly string[])
 	return collectSkillUsageEvidence(payload, names).map((entry) => entry.key).sort().join("\n");
 }
 
-export function selectPinnedSkills(stats: SkillUsageStats, limit: number, now = Date.now()): string[] {
-	if (limit <= 0) return [];
-	const dayMs = 24 * 60 * 60 * 1000;
-	return Object.entries(stats)
-		.map(([name, entry]) => {
-			const ageDays = Math.max(0, (now - entry.lastUsed) / dayMs);
-			const recency = 1 / (1 + ageDays);
-			const frequency = Math.log1p(entry.count);
-			return { name, score: frequency + recency };
-		})
-		.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
-		.slice(0, limit)
-		.map((entry) => entry.name);
+export const DEFAULT_USAGE_HALF_LIFE_DAYS = 30;
+
+export interface UsagePriorOptions {
+	now?: number;
+	halfLifeDays?: number;
+	minimumScore?: number;
+}
+
+/**
+ * Frequency is useful evidence only while it is recent. Exponential decay
+ * prevents an old high count from becoming a permanent routing decision.
+ */
+export function scoreSkillUsage(
+	entry: SkillUsageEntry,
+	now = Date.now(),
+	halfLifeDays = DEFAULT_USAGE_HALF_LIFE_DAYS,
+): number {
+	if (entry.count <= 0 || entry.lastUsed <= 0) return 0;
+	const safeHalfLife = Math.max(1, halfLifeDays);
+	const ageDays = Math.max(0, now - entry.lastUsed) / 86_400_000;
+	return Math.log1p(entry.count) * 2 ** (-ageDays / safeHalfLife);
+}
+
+export function buildUsagePrior(
+	stats: SkillUsageStats,
+	options: UsagePriorOptions = {},
+): Record<string, number> {
+	const now = options.now ?? Date.now();
+	const halfLifeDays = options.halfLifeDays ?? DEFAULT_USAGE_HALF_LIFE_DAYS;
+	const minimumScore = Math.max(0, options.minimumScore ?? 1e-6);
+	const entries = Object.entries(stats)
+		.map(([name, entry]) => [name, scoreSkillUsage(entry, now, halfLifeDays)] as const)
+		.filter(([, score]) => score >= minimumScore)
+		.sort(([leftName, leftScore], [rightName, rightScore]) => rightScore - leftScore || leftName.localeCompare(rightName));
+	return Object.fromEntries(entries);
 }
 
 /**

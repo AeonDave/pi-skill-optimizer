@@ -1,274 +1,341 @@
-# Benchmark report
+# AUTO benchmark
 
-This document reports the deterministic synthetic benchmark and the final fresh
-real-corpus evaluation for `pi-skill-optimizer`. It describes measured behavior,
-not a claim of quality superiority or statistical equivalence between modes.
+This document defines the benchmark contract and records the current real-corpus evidence for AUTO. Earlier discovery architectures are not comparable and are intentionally excluded.
 
-## Final real-corpus snapshot
+## Published snapshot
+
+Status: **completed**
 
 | Item | Value |
 | --- | --- |
-| Run date | 2026-07-22 |
-| Corpus | Anonymized real catalog and observations |
-| Catalog size | 332 skills |
-| Skill cases | 24 observed cases |
-| Tool-output cases | 3 real outputs |
-| Evaluator model | `openai-codex/gpt-5.6-luna` |
-| Reasoning | Off |
-| Model execution | 87 fresh calls, 0 resume-cache hits, 0 invalid-response retries |
-| RTK | 0.42.4 |
-| Project safety | **PASS** |
-| External RTK safety | **FAIL** |
+| Anonymized cases | 8 |
+| Distinct skills | 332 |
+| Real-provider work | 31 Luna calls |
+| Provider-reported cache reads | 0 |
+| Invalid-response retries | 0 |
+| Project safety gate | **PASS** |
+| RTK external-comparator safety gate | **FAIL** |
 
-The fresh-run requirement matters: no model response was reused from the resume
-cache, and malformed judge output did not require a retry.
+No raw request, catalog, output, path, account identifier, hostname, or private corpus record is published.
 
-## Methodology
+## Discovery results
 
-### Corpus construction and privacy
+| Metric | Baseline | AUTO | Absolute change | Relative change |
+| --- | ---: | ---: | ---: | ---: |
+| Provider input | 28,177 tokens | 5,215 tokens | -22,962 tokens | **-81.5%** |
+| Stable skill base | 106,966 bytes | 11,993 bytes | -94,973 bytes | **-88.8%** |
+| End-model skill recall | 38% | 50% | **+12 pp** | - |
+| Overlay/prefetch recall | - | 58% | - | - |
+| Request overlay | - | 8,676 bytes | - | - |
+| Stable-base byte gate | - | PASS | - | - |
 
-The corpus is derived from a real Pi skill catalog, explicit observed skill-use
-evidence, and real tool output. Before evaluation, the builder replaces sensitive
-paths and common personal or secret-bearing forms, assigns salted stable IDs, and
-emits no reversal mapping. The evaluator receives the anonymized corpus rather
-than the original private session material.
+End-model recall and overlay/prefetch recall measure different stages. The 58% value is not added to the 50% value and is not an end-to-end score. Exact local loading through a registered `skill_search` name is a resolver invariant; it does not imply that the model will discover or select that name.
 
-Anonymization reduces disclosure risk but is not a proof of anonymity. Queries,
-tool output, unusual terminology, and combinations of facts may still be
-identifying. The salt, corpus, catalog, runtime capture, model cache, and full JSON
-report are therefore private local artifacts and must be reviewed before sharing.
-
-### Skill evaluation
-
-Each of the 24 observed queries is evaluated against the same 332-skill catalog in
-three modes:
-
-| Mode | Catalog presented to the evaluator |
-| --- | --- |
-| `off` | Original catalog |
-| `compact` | Every retained skill has a compact intent description |
-| `hybrid` | Relevant skills remain full; the tail is compacted according to signal and fallback rules |
-
-For each mode, the evaluator model selects skills from the rendered catalog. The
-model is given only allowed skill names, and its response is parsed as strict JSON.
-Invalid output is retried instead of being silently interpreted as an empty
-selection.
-
-Actual input-token counts come from provider usage for the complete anonymized
-evaluator request, including evaluator instructions, the anonymized query, and the
-rendered catalog. They are not token counts for the catalog in isolation. The
-numbers are exact for this anonymized corpus, model, and run only.
-
-### Output evaluation
-
-The three output cases cover one grep output, one log output, and one git-log
-output. Four variants are measured:
-
-| Variant | Meaning |
-| --- | --- |
-| `raw` | Original output |
-| `smart` | Project evidence-aware deterministic reduction |
-| `extract` | Project model-assisted extraction with conservative fallback |
-| `RTK` | Output produced by external RTK 0.42.4 |
-
-Candidate bytes measure the returned output itself. Judge-input tokens measure the
-entire fixed judge request, including its instructions, reference evidence, and
-candidate output. They are not standalone candidate token counts, so byte ratios
-and judge-input-token ratios answer different questions.
-
-## Metric definitions
-
-| Metric | Definition |
-| --- | --- |
-| Actual anonymized input tokens | Provider-reported input usage for the complete anonymized skill-selection request |
-| Catalog bytes | UTF-8 size of the rendered catalog |
-| Model micro recall | Observed positive skill labels selected, aggregated across all labels |
-| Any-hit rate | Cases where the model selected at least one observed positive label |
-| Full exposure | Observed positive labels whose skill retained its full description |
-| Intent exposure | Observed positive labels retaining at least a compact intent description |
-| Loadability | Observed positive labels whose rendered entry still resolves to its skill file |
-| Exact evidence recall | Literal reference evidence retained in returned output |
-| Semantic evidence recall | Reference evidence judged semantically present in returned output |
-
-### Label semantics and bias
-
-Skill labels are conservative positive observations: a label records a skill that
-was explicitly mentioned or observed as used. An unlabelled skill is not a
-negative label, and the labelled set is not asserted to be the unique or complete
-optimal solution. Model recall therefore measures recovery of observed positives,
-not overall task correctness or the absence of unnecessary selections.
-
-The cases reflect one real catalog and one user's observed workload. Topic mix,
-prior skill choices, phrasing, and repeated catalog structure can bias both labels
-and evaluator behavior. The small corpus is useful for paired engineering checks,
-but not for population-level inference.
-
-## Skill results
-
-| Mode | Avg actual anonymized input tokens | Token reduction | Avg catalog bytes | Model micro recall | Any-hit | Full exposure | Intent exposure | Loadability |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `off` | 28,212 | Baseline | 108,784 | 34% | 42% | 100% | Not separately reported | 100% |
-| `compact` | 15,414 | 45.4% vs `off` | 59,379 | 37% | 42% | 37% | 100% | 100% |
-| `hybrid` | 10,363 | 63.3% vs `off` | 36,286 | 34% | 42% | 49% | 56.3% | 100% |
-
-`hybrid` used 32.8% fewer actual input tokens than `compact`. These percentages
-are computed from the displayed unrounded averages and describe this run only.
-The 34%, 37%, and 34% model-recall values must not be read as a ranking of mode
-quality: 24 positive-only cases and one model run do not establish superiority or
-equivalence. The stable 42% any-hit rate is descriptive, not a significance test.
-
-Loadability remained 100% in every mode. `compact` retained intent exposure for
-all observed positives, while `hybrid` traded more catalog reduction for 56.3%
-intent exposure and 49% full exposure on those positives.
+The stable-base gate confirms that unrelated requests did not change the query-independent AUTO prefix. Provider-reported cache reads were zero, so this run demonstrates deterministic bytes, not a cache-hit or cost improvement.
 
 ## Output results
 
-All recall values below are percentages.
+Three output cases were evaluated from identical raw inputs.
 
-| Output | Variant | Candidate bytes | Whole judge-input tokens | Exact evidence | Semantic evidence |
-| --- | --- | ---: | ---: | ---: | ---: |
-| grep | `raw` | 6,708 | 3,885 | 100 | 100 |
-| grep | `smart` | 5,702 | 3,543 | 100 | 100 |
-| grep | `extract` | 5,702 | 3,543 | 100 | 100 |
-| grep | `RTK` | 186 | 1,803 | 0 | 0 |
-| log | `raw` | 15,230 | 4,014 | 100 | 100 |
-| log | `smart` | 5,363 | 1,662 | 100 | 100 |
-| log | `extract` | 5,363 | 1,663 | 100 | 100 |
-| log | `RTK` | 658 | 509 | 0 | 33 |
-| git-log | `raw` | 4,197 | 1,228 | 100 | 100 |
-| git-log | `smart` | 4,197 | 1,230 | 100 | 100 |
-| git-log | `extract` | 4,197 | 1,228 | 100 | 100 |
-| git-log | `RTK` | 292 | 255 | 0 | 0 |
+| Pipeline | Case 1 | Case 2 | Case 3 | Total | Reduction | Exact evidence by case | Semantic evidence by case |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| Raw | 3,876 | 4,004 | 1,219 | 9,099 | - | 100% / 100% / 100% | 100% / 100% / 100% |
+| Smart | 3,532 | 1,653 | 1,218 | 6,403 | **29.6%** | 100% / 100% / 100% | 100% / 100% / 100% |
+| Guarded extraction | 3,533 | 1,650 | 1,219 | 6,402 | **29.6%** | 100% / 100% / 100% | 100% / 100% / 100% |
+| RTK 0.42.4 | 1,793 | 500 | 244 | 2,537 | **72.1%** | 0% / 0% / 0% | 0% / 33% / 0% |
 
-The extractor accepted none of its three attempted reductions. Two attempts fell
-back to the safe `smart` result because required evidence was not retained; one
-fell back to the original because the benefit was insufficient. The returned
-project outputs therefore kept 100% exact and semantic evidence in all three
-cases. This is conservative fallback behavior, not evidence that extraction is
-generally ineffective.
+Project smart and guarded-extraction paths retained 100% exact and semantic evidence. Both passed the project safety gate.
 
-RTK produced substantially smaller candidates, but exact evidence recall was 0%
-for all three cases and semantic recall was 33% only for the log case. That makes
-the separately reported external RTK safety result **FAIL** for this corpus. It is
-not a general assessment of RTK, and it does not change the project's own safety
-result.
+RTK 0.42.4 is an external size comparator. Its smaller output did not retain the evidence required by this benchmark, so the external-comparator safety gate failed. This result applies only to RTK 0.42.4, these three cases, and this evidence definition. It is not a general assessment of RTK or its command-output use.
 
-## Safety contract
+Guarded extraction is accepted only when it is an ordered verbatim subsequence, retains protected evidence, clears both saving thresholds, and has a recoverable complete archive. Any rejection falls back to smart processing and then to the original.
 
-The benchmark treats the following as blocking project invariants:
+## Evaluation questions
 
-- `off` must preserve the original catalog.
-- Retained skill names must remain ordered and discoverable.
-- Every retained skill must remain loadable through an explicit location or the
-  declared shared path convention.
-- Skills selected for promotion must retain their full description.
-- Compact descriptions must contain only ordered text extracted from the original
-  description; truncation must be explicit.
-- Re-optimizing an already transformed catalog must be idempotent.
-- Project output reduction must preserve the required exact and semantic evidence
-  after fallback.
+The benchmark asks:
 
-All project invariants passed in the final fresh run. RTK is evaluated as an
-external comparison with its own safety status; an external failure is reported
-but does not masquerade as a project-runtime failure.
+1. Does every eligible skill remain visible and exactly loadable?
+2. Is the stable base byte-identical across unrelated human requests?
+3. Does bounded prefetch improve first-turn recall without changing that base?
+4. Can `skill_search` recover relevant tail skills through bounded pagination?
+5. Can `tool_search` defer schemas without making required tools unavailable?
+6. Do output and history reductions preserve protected evidence and exact recovery?
+7. Is every accepted serialized transformation smaller?
+8. What do providers report for tokens, cache reads, cache writes, and cost?
 
-## Deterministic synthetic benchmark
+## Data and privacy contract
 
-The synthetic benchmark is separate from the real-corpus model evaluation. It is
-deterministic and is intended to catch regressions in invariants and routing under
-controlled inputs.
+### Deterministic synthetic suite
 
-| Scenario | Result |
+The repository-local suite covers:
+
+- regular and irregular skill roots;
+- duplicate and near-duplicate names and descriptions;
+- typos, Unicode, empty queries, and unrelated queries;
+- critical, usage-weighted, configured, and excluded skills;
+- ties, ambiguous neighborhoods, and budget boundaries;
+- Anthropic, OpenAI Chat and Responses, Gemini, and Mistral request shapes;
+- dynamic tool schemas, pagination, activation, and already-used protection;
+- plain text, logs, tables, source, JSON, and adversarial evidence placement.
+
+Synthetic cases enforce invariants and regressions. They do not measure real-user quality.
+
+### Private real corpus
+
+`npm run corpus:build` creates an explicit local corpus of real catalogs, sanitized human requests, tool schemas, and tool outputs. Collection never runs in an ordinary Pi hook.
+
+A publishable evaluation corpus must:
+
+- replace identifying values with keyed irreversible identifiers;
+- remove absolute paths, credentials, hostnames, account names, and repository secrets;
+- retain only structure required for routing and evidence checks;
+- use human-reviewed labels rather than generated profile queries;
+- pass validation before any remote call;
+- remain under `.pi/skill-optimizer/benchmark/`;
+- never be committed or published raw.
+
+Remote evaluation receives only validated, sanitized cases.
+
+## Discovery protocol
+
+### Stable base
+
+Render the AUTO index for every catalog under unrelated requests and supported provider shapes.
+
+Blocking invariants:
+
+- unchanged catalog, profile, and configuration produce identical bytes;
+- the AUTO marker appears exactly once;
+- every eligible name appears exactly once;
+- no filesystem location appears;
+- all catalogs in a request share one soft intent budget until their combined all-name floors are reached;
+- a second transformation preserves the already transformed reference.
+
+Reported metrics:
+
+```text
+base_bytes
+base_provider_tokens
+all_name_recall
+byte_stability_rate
+path_leak_count
+```
+
+### Human-input prefetch
+
+Use only labeled human text as the query. Compare expected skills with full verbatim definitions appended to the latest genuine human block.
+
+Blocking invariants:
+
+- tool and function results never become query text;
+- assistant text, injected context, and image metadata never become query text;
+- empty input creates no ranking signal;
+- only the latest genuine human text block changes;
+- the AUTO marker prevents a second append;
+- no valid human target means identity;
+- descriptions stay verbatim and in source order;
+- count and character budgets are deterministic.
+
+Reported metrics:
+
+```text
+overlay_recall_at_budget
+overlay_precision
+overlay_bytes
+overlay_provider_tokens
+false_promotion_rate
+```
+
+### Skill search and loading
+
+`skill_search` is evaluated independently of proactive prefetch. Expected results come from human-reviewed corpus labels, not generated profile queries.
+
+Measure:
+
+- Recall@1, Recall@3, Recall@5, MRR, and nDCG;
+- exact-name recovery under bounded spelling variation;
+- pagination completeness and duplicate rate;
+- cursor rejection after query or fingerprint changes;
+- exact-load success for registered names;
+- rejection of unknown names, traversal, and symlink escape;
+- response bytes for search, resource, and location actions.
+
+Search-followed-by-load and multi-page sequences are included.
+
+## Dynamic-tool protocol
+
+Use small and large tool catalogs with human-reviewed required-tool labels.
+
+Blocking invariants:
+
+- core, configured, and already used tools remain active;
+- inactive schemas are absent from the initial provider request;
+- `tool_search` remains active while searchable definitions remain;
+- activation makes selected tools callable in the same session;
+- activation is additive and cannot strand an active provider tool loop;
+- schema indexing work and response pagination remain bounded;
+- weak, empty, or unrelated routing signal fails open to every permitted tool.
+
+Fail-open protects availability but can preserve the full tool-schema cost for that request. The benchmark must report this case rather than treating it as a discovery saving.
+
+Reported metrics:
+
+```text
+tool_recall
+initial_tool_schema_bytes
+activated_tool_schema_bytes
+tool_search_calls
+activation_failures
+```
+
+## Output protocol
+
+Each case records original bytes, returned bytes, archive status, recovery result, protected evidence, and reducer path.
+
+### Smart reduction
+
+Test plain text, logs, tables, source, JSON, Unicode, UTF-8 byte boundaries, and adversarial evidence placement.
+
+Required properties:
+
+- activation thresholds use UTF-8 bytes rather than JavaScript character count;
+- protected evidence remains present;
+- byte and line thresholds are not hard caps, and protected evidence may exceed them;
+- output clears absolute and relative saving thresholds;
+- archive failure returns the original;
+- `retrieve_output` reproduces the original and honors line bounds;
+- provider-facing text contains no archive location;
+- a second pass is not larger or more destructive.
+
+### Columnar JSON
+
+Use homogeneous object arrays with reordered keys, missing keys, nested values, Unicode, nulls, and metadata-like values.
+
+Required properties:
+
+- decoding is exact under JSON semantics;
+- column and row ordering are preserved;
+- protected evidence prevents conversion;
+- heterogeneous arrays remain unchanged;
+- the complete serialized representation is smaller.
+
+### Guarded extraction
+
+Measure accepted and rejected candidates. Acceptance requires:
+
+- ordered verbatim subsequence validation;
+- complete protected-evidence retention;
+- both saving thresholds;
+- a valid local archive;
+- deterministic fallback through smart processing to the original.
+
+Provider input, output, and cost are reported separately from deterministic saved bytes. A rejected candidate is a successful safety decision, not a reduction.
+
+### RTK pairing
+
+| Result class | Expected owner |
 | --- | --- |
-| Skill catalog | 284 synthetic skills |
-| Hybrid catalog reduction | 67% characters saved |
-| Relevance cases | 8/8 passed |
-| Name retention | 100% |
-| Loadability | 100% |
-| Fuzzing | 3,000 iterations |
-| Output fixture | 600 lines, 66,885 bytes |
-| Output extraction reduction | 99% |
-| Output evidence retention | 100% |
+| Shell result already handled by RTK | RTK only |
+| Shell result not handled by RTK | AUTO eligible |
+| Read, web, MCP, and other eligible result | AUTO eligible |
+| Already reduced result | Neither runs again |
 
-Synthetic results establish deterministic behavior on generated fixtures. They do
-not substitute for representative real workloads or human task-quality review.
+AUTO alone, RTK alone, and paired behavior are compared on identical raw output. Returned size and protected-evidence recall are reported per result class.
 
-## Reproduction
+### History deduplication
 
-Install and validate the pure project first:
+The first large successful result remains intact. Only later exact copies become opaque, recoverable references. Errors, images, mixed media, small results, and protected evidence remain unchanged. A second pass cannot increase mutation.
+
+## Provider and cache accounting
+
+Persistent telemetry v3 records:
+
+```text
+requests
+input
+output
+cacheRead
+cacheWrite
+totalCost
+```
+
+Only provider usage fields are authoritative for tokens, cache behavior, and cost. Characters, UTF-8 bytes, and characters-per-token conversions are secondary measurements.
+
+A cache experiment must:
+
+1. Send the same stable prefix across distinct human requests.
+2. Record the exact serialized prefix hash.
+3. Record provider usage and cost.
+4. Separate first-write, later-read, and uncached observations where available.
+5. Report unavailable counters as unavailable, not zero.
+6. Keep provider results separate before aggregation.
+
+OpenAI, Anthropic, and Gemini expose different cache semantics. Stable bytes make caching possible but do not prove a hit.
+
+## Scale boundary
+
+This benchmark covers 332 skills, not an unbounded catalog.
+
+AUTO keeps every eligible name in the stable index. Consequently, the minimum base size is the sum of framing plus all rendered names across the request. Intent text shares one request-global budget, but the combined all-name information floors grow linearly and can exceed `catalogBudgetChars`.
+
+A 100,000-skill catalog is not demonstrated here and may still be too large. Supporting that scale efficiently requires resolver-only discovery, namespaces, sharding, or a server-side paginated index. Those approaches change the current guarantee that every name is visible in the base prompt.
+
+The benchmark also does not establish reduction of arbitrary system prompts or ordinary conversation history. The project targets recognized skill catalogs, dynamic tool definitions, eligible tool results, and exact duplicate history results.
+
+## Execution
+
+### Local blocking gates
 
 ```bash
-npm install
 npm run typecheck
 npm test
 npm run bench
+npm run bench:output
 ```
 
-Capture a local catalog, build the private anonymized corpus, and run a fresh real
-evaluation:
+`npm run bench` covers discovery, loading, determinism, pagination, provider normalization, identity, and fuzz invariants. `npm run bench:output` covers byte safety, evidence, archive recovery, columnar round trips, extraction guards, history behavior, and RTK ownership.
+
+### Private real-model workflow
 
 ```bash
-pi -e ./scripts/capture-catalog-extension.ts
-npx tsx scripts/build-real-corpus.ts
-npx tsx scripts/evaluate-real-corpus.ts
+npm run corpus:build
+npm run bench:real
 ```
 
-The evaluator performs provider calls and requires the corresponding Pi/model
-authentication. A fresh comparable run must omit `--resume-model-cache`; enabling
-that flag is useful for interrupted local work but produces separately labelled
-resume-cache telemetry.
+These commands may send sanitized material to a real provider and incur cost. They are never invoked by `npm test`.
 
-The deterministic output fixture can also be run directly:
+### Captured-request measurement
 
 ```bash
-npx tsx scripts/output-bench.ts
+npm run measure <capture.json>
 ```
 
-## Local artifacts
+Measure exact serialized characters and UTF-8 bytes. Token conversions are estimates unless they come from provider usage.
 
-The real benchmark writes private artifacts below
-`.pi/skill-optimizer/benchmark/`:
+## Publication checklist
 
-| Path | Contents |
-| --- | --- |
-| `catalog.json` | Sanitized captured catalog |
-| `corpus.json` | Anonymized skill and output cases |
-| `runtime.json` | Captured runtime/tool availability metadata |
-| `model-cache.json` | Optional evaluator response cache |
-| `real-report.json` | Full machine-readable report |
-| `salt` | Private salt used for stable anonymized identifiers |
+Before publishing a new result:
 
-Keep the directory private by default. `BENCHMARK.md` is the intentionally small,
-reviewed summary suitable for source control; it does not embed raw cases.
+- record commit, date, runtime, provider, model revision, corpus revision, and seed;
+- run paired variants against identical sanitized inputs;
+- keep ordering, concurrency, and retry policy fixed;
+- separate deterministic gates from model-quality metrics;
+- state failed and unavailable fields;
+- retain numerators and denominators behind published percentages;
+- publish no raw input, output, secret, identifier, hostname, or path;
+- carry no result from an earlier architecture into the AUTO table.
 
-## Limitations
+## Primary references
 
-- One 332-skill catalog does not represent other installations or catalog mixes.
-- Twenty-four positive-only skill cases cannot measure precision, unnecessary
-  selections, end-task success, or population-level effects.
-- Three outputs do not cover the diversity of commands, failures, encodings, or
-  evidence shapes seen in practice.
-- One model with reasoning disabled does not establish behavior for other models,
-  providers, reasoning settings, or future model revisions.
-- Model judgments and selections can vary between fresh runs.
-- Provider token counts apply only to the complete anonymized evaluator requests
-  from this run; they are not counts for the original private requests.
-- Output candidate bytes and whole judge-input tokens are not interchangeable
-  compression metrics.
-- Exact and semantic evidence oracles protect known reference evidence, not every
-  possible downstream use of an output.
-- The RTK comparison reflects version 0.42.4 and these three fixtures only.
+These sources guide the protocol; they are not project benchmark evidence.
 
-## Conclusions and next steps
-
-The measured token reduction is material for this anonymized catalog, and the
-project's discovery, loadability, idempotence, and returned-output safety gates all
-passed. The observational recall values are mixed and too limited to support a
-quality ranking. The output extractor behaved conservatively by rejecting all
-three unsafe or low-benefit attempts, while the external RTK comparison sacrificed
-the benchmark's required evidence on these fixtures.
-
-Useful next steps are to expand the corpus across users, domains, providers, and
-catalog sizes; add negative and ambiguity labels; repeat fresh runs for variance;
-add blinded human task-quality review; broaden output types; and record candidate-
-only tokenizer measurements separately from whole judge-request usage.
+- [Pi skills](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)
+- [Pi extensions and dynamic tools](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)
+- [OpenAI tool search](https://developers.openai.com/api/docs/guides/tools-tool-search)
+- [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)
+- [Anthropic tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
+- [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+- [Gemini context caching](https://ai.google.dev/gemini-api/docs/caching)
+- [MCP tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
+- [MCP resources](https://modelcontextprotocol.io/specification/2025-06-18/server/resources)
+- [OpenAI Codex skills](https://developers.openai.com/codex/skills)

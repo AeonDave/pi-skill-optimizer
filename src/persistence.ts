@@ -14,21 +14,39 @@ import {
 	fsyncSync,
 	mkdirSync,
 	openSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
+	lstatSync,
 	statSync,
 	unlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { EMPTY_PROFILE, mergeProfiles, normalizeProfile, type SkillOptimizerProfile } from "./profile.ts";
-import { addExtractionTelemetry, addSavings, EMPTY_EXTRACTION_TELEMETRY, EMPTY_SAVINGS, normalizeExtractionTelemetry, normalizeStatsFile, toStatsFile, type ExtractionTelemetry, type SavingsByArea } from "./stats.ts";
+import { addExtractionTelemetry, addProviderCacheTelemetry, addSavings, EMPTY_EXTRACTION_TELEMETRY, EMPTY_PROVIDER_CACHE_TELEMETRY, EMPTY_SAVINGS, normalizeExtractionTelemetry, normalizeProviderCacheTelemetry, normalizeStatsFile, toStatsFile, type ExtractionTelemetry, type ProviderCacheTelemetry, type SavingsByArea } from "./stats.ts";
 import { mergeUsageStats, normalizeUsageFile, pruneUsageStats, toUsageFile, type SkillUsageStats, type UsagePruneOptions } from "./usage.ts";
 
 const LOCK_WAIT_MS = 250;
 const LOCK_STALE_MS = 30_000;
 const LOCK_SLEEP = new Int32Array(new SharedArrayBuffer(4));
+
+const OUTPUT_ARCHIVE_ID_PREFIX = "sko:";
+const OUTPUT_ARCHIVE_DIGEST_RE = /^[A-Za-z0-9_-]{43}$/;
+const OUTPUT_ARCHIVE_FILE_RE = /^([A-Za-z0-9_-]{43})\.txt$/;
+const DEFAULT_OUTPUT_ARCHIVE_DIR = join(tmpdir(), "pi-skill-optimizer", "outputs");
+export const DEFAULT_OUTPUT_ARCHIVE_TTL_MS = 24 * 60 * 60 * 1_000;
+
+export interface TemporaryOutputArchiveOptions {
+	/** Internal storage root. IDs never contain this path. */
+	directory?: string;
+	/** Clock override for deterministic cleanup and tests. */
+	now?: number;
+	/** Archive lifetime. Defaults to 24 hours. */
+	ttlMs?: number;
+}
 
 export interface StoredProfile {
 	exists: boolean;
@@ -235,12 +253,40 @@ export function loadExtractionTelemetryFile(path: string): ExtractionTelemetry {
 	return parsed === undefined ? { ...EMPTY_EXTRACTION_TELEMETRY } : normalizeExtractionTelemetry(parsed);
 }
 
+export function loadProviderCacheTelemetryFile(path: string): ProviderCacheTelemetry {
+	const parsed = readJson(path);
+	return parsed === undefined ? { ...EMPTY_PROVIDER_CACHE_TELEMETRY } : normalizeProviderCacheTelemetry(parsed);
+}
+
 export interface SavedStats {
 	savings: SavingsByArea;
 	extraction: ExtractionTelemetry;
+	cache: ProviderCacheTelemetry;
 }
 
-export function saveStatsDeltas(path: string, savingsDelta: SavingsByArea, extractionDelta: ExtractionTelemetry): SavedStats {
+/** Load all v1-v3 statistics with a single read, suitable for runtime snapshots. */
+export function loadStatsSnapshot(path: string): SavedStats {
+	const parsed = readJson(path);
+	if (parsed === undefined) {
+		return {
+			savings: { ...EMPTY_SAVINGS },
+			extraction: { ...EMPTY_EXTRACTION_TELEMETRY },
+			cache: { ...EMPTY_PROVIDER_CACHE_TELEMETRY },
+		};
+	}
+	return {
+		savings: normalizeStatsFile(parsed),
+		extraction: normalizeExtractionTelemetry(parsed),
+		cache: normalizeProviderCacheTelemetry(parsed),
+	};
+}
+
+export function saveStatsDeltas(
+	path: string,
+	savingsDelta: SavingsByArea,
+	extractionDelta: ExtractionTelemetry,
+	cacheDelta: ProviderCacheTelemetry = EMPTY_PROVIDER_CACHE_TELEMETRY,
+): SavedStats {
 	return withFileLocks([path], () => {
 		const parsed = readJson(path);
 		const savings = addSavings(parsed === undefined ? { ...EMPTY_SAVINGS } : normalizeStatsFile(parsed), savingsDelta);
@@ -248,8 +294,12 @@ export function saveStatsDeltas(path: string, savingsDelta: SavingsByArea, extra
 			parsed === undefined ? { ...EMPTY_EXTRACTION_TELEMETRY } : normalizeExtractionTelemetry(parsed),
 			extractionDelta,
 		);
-		writeJsonAtomic(path, toStatsFile(savings, Date.now(), extraction));
-		return { savings, extraction };
+		const cache = addProviderCacheTelemetry(
+			parsed === undefined ? { ...EMPTY_PROVIDER_CACHE_TELEMETRY } : normalizeProviderCacheTelemetry(parsed),
+			cacheDelta,
+		);
+		writeJsonAtomic(path, toStatsFile(savings, Date.now(), extraction, cache));
+		return { savings, extraction, cache };
 	});
 }
 
@@ -257,29 +307,132 @@ export function saveStatsDelta(path: string, delta: SavingsByArea): SavingsByAre
 	return saveStatsDeltas(path, delta, EMPTY_EXTRACTION_TELEMETRY).savings;
 }
 
-/** Best-effort archive for a reduced tool result. */
-export function saveTemporaryOutput(text: string): string | undefined {
-	for (let attempt = 0; attempt < 3; attempt++) {
-		const path = join(tmpdir(), `sko-output-${process.pid}-${randomBytes(16).toString("hex")}.txt`);
-		let fd: number | undefined;
-		let created = false;
+/** Atomically merge one authoritative `message_end` usage delta into stats v3. */
+export function saveProviderCacheTelemetryDelta(path: string, delta: ProviderCacheTelemetry): ProviderCacheTelemetry {
+	return saveStatsDeltas(path, EMPTY_SAVINGS, EMPTY_EXTRACTION_TELEMETRY, delta).cache;
+}
+
+function archiveDirectory(options: TemporaryOutputArchiveOptions): string {
+	return options.directory ?? DEFAULT_OUTPUT_ARCHIVE_DIR;
+}
+
+function archiveNow(options: TemporaryOutputArchiveOptions): number {
+	return typeof options.now === "number" && Number.isFinite(options.now) ? options.now : Date.now();
+}
+
+function archiveTtl(options: TemporaryOutputArchiveOptions): number {
+	return typeof options.ttlMs === "number" && Number.isFinite(options.ttlMs) && options.ttlMs >= 0
+		? options.ttlMs
+		: DEFAULT_OUTPUT_ARCHIVE_TTL_MS;
+}
+
+function outputDigest(value: string | Buffer): string {
+	return createHash("sha256").update(value).digest("base64url");
+}
+
+function digestFromArchiveId(id: string): string | undefined {
+	if (!id.startsWith(OUTPUT_ARCHIVE_ID_PREFIX)) return undefined;
+	const digest = id.slice(OUTPUT_ARCHIVE_ID_PREFIX.length);
+	return OUTPUT_ARCHIVE_DIGEST_RE.test(digest) ? digest : undefined;
+}
+
+function outputArchivePath(directory: string, digest: string): string {
+	return join(directory, `${digest}.txt`);
+}
+
+/**
+ * Archive a full tool output and return a provider-safe content-addressed handle.
+ * The handle contains only a SHA-256 digest, never a local path. Saving identical
+ * content returns the same handle and refreshes its TTL.
+ */
+export function saveTemporaryOutput(text: string, options: TemporaryOutputArchiveOptions = {}): string | undefined {
+	const directory = archiveDirectory(options);
+	const now = archiveNow(options);
+	const digest = outputDigest(text);
+	const id = `${OUTPUT_ARCHIVE_ID_PREFIX}${digest}`;
+	const path = outputArchivePath(directory, digest);
+	try {
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
 		try {
-			fd = openSync(path, "wx", 0o600);
-			created = true;
+			const info = lstatSync(path);
+			if (!info.isFile() || info.isSymbolicLink()) return undefined;
+			const stored = readFileSync(path);
+			if (outputDigest(stored) === digest) {
+				const timestamp = new Date(now);
+				utimesSync(path, timestamp, timestamp);
+				return id;
+			}
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+		}
+
+		const temp = join(directory, `.${process.pid}-${randomBytes(12).toString("hex")}.tmp`);
+		let fd: number | undefined;
+		try {
+			fd = openSync(temp, "wx", 0o600);
 			writeFileSync(fd, text, "utf8");
 			fsyncSync(fd);
 			closeSync(fd);
 			fd = undefined;
-			return path;
-		} catch (err) {
+			renameSync(temp, path);
+			const timestamp = new Date(now);
+			utimesSync(path, timestamp, timestamp);
+			return id;
+		} finally {
 			if (fd !== undefined) {
 				try { closeSync(fd); } catch { /* best effort */ }
 			}
-			if (created) {
-				try { unlinkSync(path); } catch { /* best effort */ }
+			try { unlinkSync(temp); } catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "ENOENT") { /* best effort */ }
 			}
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") return undefined;
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+/** Resolve an opaque archive handle to verified text, or undefined if invalid/expired. */
+export function resolveTemporaryOutput(id: string, options: TemporaryOutputArchiveOptions = {}): string | undefined {
+	const digest = digestFromArchiveId(id);
+	if (!digest) return undefined;
+	const path = outputArchivePath(archiveDirectory(options), digest);
+	try {
+		const info = lstatSync(path);
+		if (!info.isFile() || info.isSymbolicLink()) return undefined;
+		if (archiveNow(options) - info.mtimeMs > archiveTtl(options)) {
+			try { unlinkSync(path); } catch { /* best effort */ }
+			return undefined;
+		}
+		const stored = readFileSync(path);
+		if (outputDigest(stored) !== digest) return undefined;
+		return stored.toString("utf8");
+	} catch {
+		return undefined;
+	}
+}
+
+/** Remove only recognized content archives older than the configured TTL. */
+export function cleanupTemporaryOutputs(options: TemporaryOutputArchiveOptions = {}): number {
+	const directory = archiveDirectory(options);
+	const now = archiveNow(options);
+	const ttl = archiveTtl(options);
+	let removed = 0;
+	let entries;
+	try {
+		entries = readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
+	} catch {
+		return 0;
+	}
+	for (const entry of entries) {
+		if (typeof entry === "string" || !entry.isFile() || !OUTPUT_ARCHIVE_FILE_RE.test(entry.name)) continue;
+		const path = join(directory, entry.name);
+		try {
+			if (now - statSync(path).mtimeMs <= ttl) continue;
+			unlinkSync(path);
+			removed += 1;
+		} catch {
+			// Concurrent resolution or cleanup is harmless.
 		}
 	}
-	return undefined;
+	return removed;
 }

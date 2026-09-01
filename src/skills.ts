@@ -1,25 +1,5 @@
-/**
- * Pure skill-catalog intelligence — no Pi imports, fully unit-testable.
- *
- * Pi inlines an `<available_skills>` catalog (one `<skill>` entry — name,
- * description, location — per installed skill) into every request. This is the
- * Level-1 *discovery* layer of Anthropic's progressive-disclosure design: enough
- * for the model to know a skill exists and when to use it, without loading its
- * body. With hundreds of skills it is the dominant input-token cost.
- *
- * This module rewrites that catalog instead of nuking it, so skills stay
- * discoverable:
- *   - `compact`: keep every skill, trim each description to its intent sentence.
- *   - `hybrid` : lexically score skills against the request's own query, keep the
- *                top-K relevant ones at full description, compact the long tail.
- *
- * The scorer is dependency-free BM25-style lexical matching over the catalog
- * itself (skill descriptions are keyword-dense — "RSA", "SMB", "hashcat" — so
- * lexical routing is strong); embeddings are a later upgrade. No filesystem
- * access: the catalog in the request is self-contained.
- */
-
-import { buildCatalogAliases, expandQueryTokens, getUserAliasRevision, type QueryAliasMap } from "./aliases.ts";
+import { createHash } from "node:crypto";
+import { buildCatalogAliases, expandQueryTokens, type QueryAliasMap } from "./aliases.ts";
 import { EMPTY_PROFILE, type SkillOptimizerProfile } from "./profile.ts";
 
 export interface Skill {
@@ -28,549 +8,1003 @@ export interface Skill {
 	location: string;
 }
 
-/** What to do with the `<available_skills>` catalog. */
-export type SkillMode = "off" | "compact" | "hybrid";
-
-/** How non-selected (tail) skills are rendered in `hybrid` mode. */
-export type TailStyle = "name" | "intent";
-
-export interface SkillTransformOptions {
-	/** Only `compact` and `hybrid` are handled here; `off` is handled by the caller. */
-	mode: "compact" | "hybrid";
-	/** hybrid: how many relevant skills keep their full description + explicit location. */
-	topK: number;
-	/** hybrid tail style: `name` (cheapest) or `intent` (name + short description). */
-	tail: TailStyle;
-	/** The request's query text, used to rank skills in `hybrid` mode. */
-	query: string;
-	/** User-specific init profile: aliases, synthetic queries, critical skills. */
-	profile?: SkillOptimizerProfile;
-	/** Usage-derived skills that should stay fully described. */
-	pinnedSkills?: readonly string[];
-	/** User allowlist: always render these skills full (name + description + location). */
-	alwaysFull?: readonly string[];
-	/** User denylist: drop these skills from the catalog entirely (exact name or `prefix*`). */
+export interface StableCatalogOptions {
 	never?: readonly string[];
-	/**
-	 * Soft cap for full renders selected by ordinary relevance. Critical, pinned,
-	 * always-full, and adaptive ambiguity selections may exceed it. Defaults to a
-	 * conservative ceiling that only affects pathological descriptions. Set to 0
-	 * to disable the cap.
-	 */
-	fullRenderBudgetChars?: number;
+	intentMaxChars?: number;
+	budgetChars?: number;
 }
 
-export interface SkillTransformResult {
+export interface CatalogBudgetOutcome {
+	requestedChars: number;
+	usedChars: number;
+	floorChars: number;
+	intentCount: number;
+	nameOnlyCount: number;
+	overBudgetChars: number;
+}
+
+export interface StableCatalogResult {
 	text: string;
 	removedChars: number;
-	/** Names kept at full description (hybrid), for diagnostics. */
-	selected: string[];
+	skills: Skill[];
+	fingerprint: string;
+	budget: CatalogBudgetOutcome;
 }
 
-const BLOCK_RE = /<available_skills>([\s\S]*?)<\/available_skills>/g;
-const SKILL_RE =
-	/<skill>\s*<name>([\s\S]*?)<\/name>\s*(?:<description>([\s\S]*?)<\/description>\s*)?(?:<location>([\s\S]*?)<\/location>\s*)?<\/skill>/g;
-const MAX_CATALOG_CACHE_ENTRIES = 16;
-const TRANSFORMED_CATALOG_MARKER = "<!--skill-optimizer-->";
+export interface SkillPrefetchOptions {
+	profile?: SkillOptimizerProfile;
+	usagePrior?: Readonly<Record<string, number>> | ReadonlyMap<string, number>;
+	always?: readonly string[];
+	never?: readonly string[];
+	targetTopK?: number;
+	minTopK?: number;
+	maxTopK?: number;
+	fullRenderBudgetChars?: number;
+	fuzzyCandidateLimit?: number;
+}
 
-/** Minimal stopword set (EN + a few IT, since prompts may be Italian). IDF handles the rest. */
+export type RankReason = "exact" | "lexical" | "fuzzy" | "profile" | "usage";
+
+export interface RankedSkill {
+	skill: Skill;
+	score: number;
+	lexicalScore: number;
+	exactScore: number;
+	fuzzyScore: number;
+	usageScore: number;
+	reasons: RankReason[];
+	marginalChars: number;
+}
+
+export interface SkillPrefetchPlan {
+	query: string;
+	fingerprint: string;
+	hasSignal: boolean;
+	confidence: number;
+	selected: Skill[];
+	selectedNames: string[];
+	ranked: RankedSkill[];
+	marginalChars: number;
+	skippedForBudget: string[];
+}
+
+export interface SkillSearchOptions extends SkillPrefetchOptions {
+	cursor?: string;
+	pageSize?: number;
+	intentMaxChars?: number;
+}
+
+export interface SkillSearchItem {
+	name: string;
+	intent: string;
+	score: number;
+	confidence: number;
+	reasons: RankReason[];
+}
+
+export interface SkillSearchResult {
+	query: string;
+	fingerprint: string;
+	confidence: number;
+	total: number;
+	items: SkillSearchItem[];
+	nextCursor?: string;
+}
+
+export type SkillDescriptionIssueCode =
+	| "too_long"
+	| "near_empty"
+	| "missing_routing"
+	| "duplicate_description";
+
+export interface SkillDescriptionIssue {
+	name: string;
+	code: SkillDescriptionIssueCode;
+	descriptionChars: number;
+	relatedSkill?: string;
+}
+
+export interface SkillDescriptionAuditOptions {
+	maxChars?: number;
+	minChars?: number;
+	duplicateThreshold?: number;
+}
+
+export interface SkillDescriptionAudit {
+	skillCount: number;
+	issueCount: number;
+	counts: Record<SkillDescriptionIssueCode, number>;
+	estimatedReducibleChars: number;
+	issues: SkillDescriptionIssue[];
+}
+
+export interface SkillCatalogOptimizationResult extends StableCatalogResult {
+	plan: SkillPrefetchPlan;
+}
+
+export const DEFAULT_FULL_RENDER_BUDGET_CHARS = 12_000;
+export const DEFAULT_CATALOG_BUDGET_CHARS = 12_000;
+export const DEFAULT_INTENT_MAX_CHARS = 96;
+const AUTO_MARKER = "<!--skill-optimizer:auto:v2-->";
+const CATALOG_RE = /<available_skills\b[^>]*>([\s\S]*?)<\/available_skills>/gi;
+const XML_SKILL_RE = /<skill\b[^>]*>([\s\S]*?)<\/skill>/gi;
+const INDEX_RE = /<skill_index\b[^>]*>([\s\S]*?)<\/skill_index>/gi;
+const FIELD_NAMES = ["name", "intent", "description", "queries"] as const;
+type FieldName = typeof FIELD_NAMES[number];
+
+const FIELD_WEIGHTS: Readonly<Record<FieldName, number>> = {
+	name: 5,
+	intent: 2.4,
+	description: 1,
+	queries: 2,
+};
+const FIELD_B: Readonly<Record<FieldName, number>> = {
+	name: 0.2,
+	intent: 0.5,
+	description: 0.72,
+	queries: 0.45,
+};
+
 const STOPWORDS = new Set([
-	"the", "a", "an", "and", "or", "for", "with", "to", "of", "in", "on", "at", "is", "are", "be",
-	"this", "that", "it", "as", "by", "from", "you", "your", "me", "my", "how", "do", "does", "can",
-	"use", "used", "using", "when", "what", "which", "please", "help", "need", "want", "get", "make",
-	"la", "il", "lo", "le", "un", "una", "di", "che", "per", "con", "come", "mi", "si", "non", "e", "o",
+	"about", "after", "again", "also", "and", "are", "con", "come", "che", "da", "del", "della",
+	"delle", "dei", "degli", "di", "do", "does", "for", "from", "gli", "how", "il", "in", "into",
+	"is", "it", "la", "le", "lo", "nel", "nella", "of", "on", "or", "per", "please", "questo", "that",
+	"the", "this", "to", "un", "una", "use", "using", "with",
 ]);
 
-interface CatalogAnalysis {
-	skills: Skill[];
-	skillTokenSets: Array<ReadonlySet<string>>;
-	nameTokenSets: Array<ReadonlySet<string>>;
-	fuzzyLabelSets: Array<ReadonlyArray<ReadonlySet<string>>>;
-	negativeHintTokenSets: Array<ReadonlySet<string>>;
-	termFreqs: Array<ReadonlyMap<string, number>>;
-	docLengths: number[];
-	avgDocLength: number;
-	df: ReadonlyMap<string, number>;
-	aliases: QueryAliasMap;
+function decodeXml(text: string): string {
+	return text
+		.replace(/&lt;/g, "<")
+		.replace(/&gt;/g, ">")
+		.replace(/&quot;/g, '"')
+		.replace(/&#39;|&apos;/g, "'")
+		.replace(/&amp;/g, "&");
 }
 
-interface CatalogCacheEntry {
-	key: string;
-	analysis: CatalogAnalysis;
+function encodeXml(text: string): string {
+	return text
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
 }
 
-// The analysis necessarily owns parsed catalog text. Cache only a compact
-// fingerprint beside it instead of retaining a second copy of the raw catalog.
-const catalogCache: CatalogCacheEntry[] = [];
-let catalogCacheAliasRevision = -1;
+function readTag(body: string, tag: string): string {
+	const match = body.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
+	return match ? decodeXml(match[1].trim()) : "";
+}
 
-const FUZZY_SIMILARITY_THRESHOLD = 0.8;
-const MIN_FUZZY_LABEL_CHARS = 5;
-const MAX_FUZZY_LABEL_CHARS = 80;
-const MAX_FUZZY_QUERY_TOKENS = 32;
-const MAX_FUZZY_QUERY_WINDOW = 5;
+function escapeTsv(text: string): string {
+	return text.replace(/\\/g, "\\\\").replace(/\t/g, "\\t").replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+}
 
-/** Default only constrains unusually large full descriptions. */
-export const DEFAULT_FULL_RENDER_BUDGET_CHARS = 12_000;
-
-/** Lowercase, remove entity escapes, split on non-alphanumerics, keep letter-bearing tokens len >= 2. */
-export function tokenize(text: string): string[] {
-	const cleaned = text
-		.toLowerCase()
-		.replace(/&[a-z]+;/g, " ")
-		.replace(/&#\d+;/g, " ");
-	const out: string[] = [];
-	for (const raw of cleaned.split(/[^a-z0-9]+/)) {
-		if (raw.length < 2 || !/[a-z]/.test(raw) || STOPWORDS.has(raw)) continue;
-		out.push(raw);
+function unescapeTsv(text: string): string {
+	let out = "";
+	for (let index = 0; index < text.length; index += 1) {
+		if (text[index] !== "\\" || index + 1 >= text.length) {
+			out += text[index];
+			continue;
+		}
+		const next = text[index + 1];
+		index += 1;
+		out += next === "t" ? "\t" : next === "r" ? "\r" : next === "n" ? "\n" : next;
 	}
 	return out;
 }
 
-/** Parse the inner text of an `<available_skills>` block into skills (in order). */
-export function parseSkills(inner: string): Skill[] {
-	const skills: Skill[] = [];
-	SKILL_RE.lastIndex = 0;
-	let match: RegExpExecArray | null;
-	while ((match = SKILL_RE.exec(inner)) !== null) {
-		skills.push({
-			name: match[1].trim(),
-			description: (match[2] ?? "").trim(),
-			location: (match[3] ?? "").trim(),
+function clamp(value: number, min: number, max: number): number {
+	return Math.min(max, Math.max(min, value));
+}
+
+function unique<T>(values: Iterable<T>): T[] {
+	return [...new Set(values)];
+}
+
+function normalizedPhrase(text: string): string {
+	return tokenize(text).join(" ");
+}
+
+export function tokenize(text: string): string[] {
+	const normalized = decodeXml(text)
+		.replace(/github/gi, " github ")
+		.replace(/([\p{Ll}\d])([\p{Lu}])/gu, "$1 $2")
+		.normalize("NFKD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.toLocaleLowerCase("en-US")
+		.replace(/[_/\\.-]+/g, " ");
+	const matches = normalized.match(/[\p{L}\p{N}][\p{L}\p{N}+#]*/gu) ?? [];
+	return matches.filter((token) =>
+		token.length >= 2
+		&& !/^\d+$/.test(token)
+		&& !STOPWORDS.has(token)
+	);
+}
+
+export function parseSkills(text: string): Skill[] {
+	const xmlSkills: Skill[] = [];
+	for (const match of text.matchAll(XML_SKILL_RE)) {
+		const body = match[1];
+		const name = readTag(body, "name");
+		if (!name) continue;
+		xmlSkills.push({
+			name,
+			description: readTag(body, "description"),
+			location: readTag(body, "location"),
 		});
 	}
-	return skills;
-}
+	if (xmlSkills.length > 0) return xmlSkills;
 
-function profileSignature(profile: SkillOptimizerProfile): string {
-	return JSON.stringify({
-		aliases: profile.aliases,
-		queries: profile.queries,
-		negativeHints: profile.negativeHints,
-	});
-}
-
-/** Compact dual-hash fingerprint for bounded cache lookup keys. */
-function fingerprint(text: string): string {
-	let fnv = 0x811c9dc5;
-	let mixed = 0x9e3779b9;
-	for (let i = 0; i < text.length; i++) {
-		const code = text.charCodeAt(i);
-		fnv = Math.imul(fnv ^ code, 0x01000193);
-		mixed = Math.imul(mixed ^ code, 0x5bd1e995);
-		mixed ^= mixed >>> 13;
-	}
-	return `${text.length.toString(36)}:${(fnv >>> 0).toString(36)}:${(mixed >>> 0).toString(36)}`;
-}
-
-function tokenCounts(tokens: readonly string[]): ReadonlyMap<string, number> {
-	const counts = new Map<string, number>();
-	for (const token of tokens) counts.set(token, (counts.get(token) ?? 0) + 1);
-	return counts;
-}
-
-function fuzzyTrigrams(value: string): ReadonlySet<string> | null {
-	const normalized = value.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, MAX_FUZZY_LABEL_CHARS);
-	if (normalized.length < MIN_FUZZY_LABEL_CHARS) return null;
-	const grams = new Set<string>();
-	for (let i = 0; i <= normalized.length - 3; i++) grams.add(normalized.slice(i, i + 3));
-	return grams;
-}
-
-function trigramSimilarity(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
-	let intersection = 0;
-	const [small, large] = left.size <= right.size ? [left, right] : [right, left];
-	for (const gram of small) if (large.has(gram)) intersection += 1;
-	return (2 * intersection) / (left.size + right.size);
-}
-
-function buildQueryFuzzySets(queryTokens: readonly string[]): ReadonlySet<string>[] {
-	const tokens = queryTokens.slice(0, MAX_FUZZY_QUERY_TOKENS);
-	const labels = new Set<string>();
-	for (let start = 0; start < tokens.length; start++) {
-		let joined = "";
-		for (let width = 1; width <= MAX_FUZZY_QUERY_WINDOW && start + width <= tokens.length; width++) {
-			joined += tokens[start + width - 1];
-			if (joined.length >= MIN_FUZZY_LABEL_CHARS) labels.add(joined);
-		}
-	}
-	const sets: ReadonlySet<string>[] = [];
-	for (const label of labels) {
-		const grams = fuzzyTrigrams(label);
-		if (grams) sets.push(grams);
-	}
-	return sets;
-}
-
-function analyzeSkills(skills: readonly Skill[], profile: SkillOptimizerProfile = EMPTY_PROFILE): CatalogAnalysis {
-	const docTokens = skills.map((s) => tokenize(`${s.name} ${s.description} ${(profile.queries[s.name] ?? []).join(" ")}`));
-	const skillTokenSets = docTokens.map((tokens) => new Set(tokens));
-	const nameTokenSets = skills.map((s) => new Set(tokenize(s.name)));
-	const negativeHintTokenSets = skills.map((s) => new Set(tokenize((profile.negativeHints[s.name] ?? []).join(" "))));
-	const termFreqs = docTokens.map(tokenCounts);
-	const docLengths = docTokens.map((tokens) => Math.max(1, tokens.length));
-	const avgDocLength = docLengths.reduce((sum, length) => sum + length, 0) / Math.max(1, docLengths.length);
-	const df = new Map<string, number>();
-	for (const set of skillTokenSets) for (const term of set) df.set(term, (df.get(term) ?? 0) + 1);
-	const aliases = buildCatalogAliases((term) => df.has(term), profile.aliases);
-	const fuzzyLabelSets = skills.map((skill, i) => {
-		const labels = new Set<string>([skill.name]);
-		for (const [source, targets] of aliases) {
-			if (targets.some((target) => skillTokenSets[i].has(target))) labels.add(source);
-		}
-		const sets: ReadonlySet<string>[] = [];
-		for (const label of labels) {
-			const grams = fuzzyTrigrams(label);
-			if (grams) sets.push(grams);
-		}
-		return sets;
-	});
-	return { skills: [...skills], skillTokenSets, nameTokenSets, fuzzyLabelSets, negativeHintTokenSets, termFreqs, docLengths, avgDocLength, df, aliases };
-}
-
-function analyzeCatalog(inner: string, profile: SkillOptimizerProfile): CatalogAnalysis {
-	const aliasRevision = getUserAliasRevision();
-	if (aliasRevision !== catalogCacheAliasRevision) {
-		catalogCache.length = 0;
-		catalogCacheAliasRevision = aliasRevision;
-	}
-	const key = `${fingerprint(inner)}:${fingerprint(profileSignature(profile))}`;
-	const cachedIndex = catalogCache.findIndex((entry) => entry.key === key);
-	if (cachedIndex >= 0) {
-		const cached = catalogCache[cachedIndex]!;
-		catalogCache.splice(cachedIndex, 1);
-		catalogCache.push(cached);
-		return cached.analysis;
-	}
-	const analysis = analyzeSkills(parseSkills(inner), profile);
-	catalogCache.push({ key, analysis });
-	if (catalogCache.length > MAX_CATALOG_CACHE_ENTRIES) catalogCache.shift();
-	return analysis;
-}
-
-function scoreAnalysis(analysis: CatalogAnalysis, queryTokens: readonly string[]): number[] {
-	const n = analysis.skills.length;
-	const idf = (term: string): number => Math.log(1 + (n - (analysis.df.get(term) ?? 0) + 0.5) / ((analysis.df.get(term) ?? 0) + 0.5));
-	const queryTerms = new Set(expandQueryTokens(queryTokens, analysis.aliases));
-	const k1 = 1.2;
-	const b = 0.75;
-	const lexicalScores = analysis.termFreqs.map((counts, i) => {
-		let score = 0;
-		for (const term of queryTerms) {
-			const tf = counts.get(term) ?? 0;
-			if (tf > 0) {
-				const normalized = tf + k1 * (1 - b + b * (analysis.docLengths[i] / analysis.avgDocLength));
-				score += idf(term) * ((tf * (k1 + 1)) / normalized);
-			}
-			if (analysis.nameTokenSets[i].has(term)) score += 2 * idf(term);
-			if (analysis.negativeHintTokenSets[i].has(term)) score -= idf(term);
-		}
-		return score;
-	});
-
-	// Exact lexical routing remains authoritative when it covers the query. The
-	// fuzzy path is deliberately limited to weak lexical cases, names, and alias
-	// sources so descriptions cannot create broad semantic false positives.
-	const maxLexical = Math.max(0, ...lexicalScores);
-	const matchedTerms = Array.from(queryTerms).filter((term) => analysis.df.has(term)).length;
-	const lexicalCoverage = queryTerms.size === 0 ? 0 : matchedTerms / queryTerms.size;
-	if (maxLexical > 0 && lexicalCoverage >= 2 / 3) return lexicalScores;
-
-	const queryFuzzySets = buildQueryFuzzySets(queryTokens);
-	if (queryFuzzySets.length === 0) return lexicalScores;
-	const fuzzyScores = analysis.fuzzyLabelSets.map((labels) => {
-		let best = 0;
-		for (const querySet of queryFuzzySets) {
-			for (const labelSet of labels) best = Math.max(best, trigramSimilarity(querySet, labelSet));
-		}
-		return best >= FUZZY_SIMILARITY_THRESHOLD ? best : 0;
-	});
-	if (!fuzzyScores.some((score) => score > 0)) return lexicalScores;
-	if (maxLexical === 0) {
-		return fuzzyScores.map((score, i) => (lexicalScores[i] < 0 ? lexicalScores[i] : score));
-	}
-
-	// Blend two [0, 1] signals instead of adding incompatible BM25 and trigram
-	// magnitudes. A high-confidence name match wins a weak generic lexical hit.
-	return lexicalScores.map((score, i) => {
-		if (score < 0) return score;
-		const lexical = score / maxLexical;
-		const fuzzy = fuzzyScores[i];
-		return 0.35 * lexical + 0.65 * fuzzy;
-	});
-}
-
-/**
- * BM25-style relevance of each skill to the query, with a name-match boost for
- * terms that match the skill *name* (a strong intent signal). Returns one score
- * per skill, in input order.
- */
-export function scoreSkills(skills: readonly Skill[], queryTokens: readonly string[]): number[] {
-	return scoreAnalysis(analyzeSkills(skills), queryTokens);
-}
-
-export interface SelectRelevantOptions {
-	targetTopK: number;
-	minTopK?: number;
-	maxTopK?: number;
-	adaptive?: boolean;
-	closeScoreRatio?: number;
-}
-
-/** Indices of the top-K skills with a positive score, best first. */
-export function selectRelevant(scores: readonly number[], options: number | SelectRelevantOptions): number[] {
-	const opts: SelectRelevantOptions = typeof options === "number" ? { targetTopK: options, adaptive: false } : options;
-	const ranked = scores
-		.map((score, i) => ({ score, i }))
-		.filter((x) => x.score > 0)
-		.sort((a, b) => b.score - a.score);
-	if (ranked.length === 0) return [];
-	if (!opts.adaptive) return ranked.slice(0, Math.max(0, opts.targetTopK)).map((x) => x.i);
-
-	const maxTopK = Math.max(0, opts.maxTopK ?? opts.targetTopK);
-	const minTopK = Math.min(maxTopK, Math.max(0, opts.minTopK ?? opts.targetTopK));
-	let keep = Math.min(maxTopK, Math.max(minTopK, opts.targetTopK));
-	if (keep === 0) return [];
-	const closeScoreRatio = opts.closeScoreRatio ?? 0.75;
-	while (keep < Math.min(maxTopK, ranked.length) && ranked[keep].score >= ranked[keep - 1].score * closeScoreRatio) {
-		keep += 1;
-	}
-	return ranked.slice(0, keep).map((x) => x.i);
-}
-
-/** Routing-signal keywords: the "when to use this skill" clause is the strongest tail signal. */
-const ROUTING_KEYWORDS = /\b(use (this )?(skill )?when|use when|use for|use to|trigger on|invoke when|activate (when|for)|use after|use before)\b/i;
-const ROUTING_SENTENCE = /([^.!?\n]*\b(use (this )?(skill )?when|use when|use for|use to|trigger on|invoke when|activate (when|for)|use after|use before)\b[^.!?\n]*[.!?]?)/i;
-
-/**
- * Trim a description to its first sentence (capped at maxChars on a word boundary),
- * then append the routing clause ("Use when …") if the first sentence lacks one —
- * the routing signal is what makes a tail skill discoverable. It never
- * paraphrases or replaces the first sentence; it only truncates to the budget.
- */
-export function compactDescription(description: string, maxChars: number): string {
-	const trimmed = description.trim();
-	const budget = Math.max(0, Math.floor(maxChars));
-	if (!trimmed || budget === 0) return "";
-	const cap = (s: string, limit: number): string => {
-		if (limit <= 0) return "";
-		if (s.length <= limit) return s;
-		if (limit === 1) return "…";
-		const raw = s.slice(0, limit - 1);
-		const boundary = raw.replace(/\s+\S*$/, "").trimEnd();
-		return `${boundary || raw}…`.slice(0, limit);
-	};
-	const firstMatch = trimmed.match(/^([\s\S]*?[.!?])(\s|$)/);
-	const first = firstMatch ? firstMatch[1] : trimmed;
-	if (ROUTING_KEYWORDS.test(first)) return cap(first, budget);
-	const routing = trimmed.match(ROUTING_SENTENCE)?.[1].trim();
-	if (!routing || first.includes(routing)) return cap(first, budget);
-	const combined = `${first} ${routing}`;
-	if (combined.length <= budget) return combined;
-	if (budget < 3) return cap(first, budget);
-
-	// Keep both original clauses within one final budget; routing gets up to half
-	// reserved, while unused first-clause space flows back to the routing clause.
-	const reservedRouting = Math.min(routing.length, Math.max(1, Math.floor((budget - 1) / 2)));
-	const firstPart = cap(first, budget - reservedRouting - 1);
-	const separatorLength = firstPart ? 1 : 0;
-	const routingPart = cap(routing, budget - firstPart.length - separatorLength);
-	if (!firstPart) return routingPart;
-	if (!routingPart) return firstPart;
-	return `${firstPart} ${routingPart}`;
-}
-
-/** Tail descriptions cap (internal): a short intent line, not the full text. */
-const INTENT_CHARS = 80;
-
-/** True if `name` matches any pattern: exact, or `prefix*` wildcard. */
-function nameMatches(name: string, patterns: readonly string[]): boolean {
-	for (const pattern of patterns) {
-		if (pattern.endsWith("*")) {
-			if (name.startsWith(pattern.slice(0, -1))) return true;
-		} else if (name === pattern) {
-			return true;
-		}
-	}
-	return false;
-}
-
-/** Root dir of a location iff it follows the `<root>/<name>/SKILL.md` convention, else null. */
-function derivableRoot(location: string, name: string): string | null {
-	const match = location.match(/^(.*)[\\/]([^\\/]+)[\\/]SKILL\.md$/i);
-	if (!match || match[2] !== name) return null;
-	return match[1];
-}
-
-function renderFull(skill: Skill): string {
-	const lines = ["  <skill>", `    <name>${skill.name}</name>`];
-	if (skill.description) lines.push(`    <description>${skill.description}</description>`);
-	if (skill.location) lines.push(`    <location>${skill.location}</location>`);
-	lines.push("  </skill>");
-	return lines.join("\n");
-}
-
-/**
- * Render a tail skill. Drops the `<location>` when it is derivable from the
- * `<root>/<name>/SKILL.md` convention (the path note declares the roots), but
- * keeps an explicit `<location>` for irregular paths so the skill stays loadable.
- */
-function renderTail(skill: Skill, tail: TailStyle): { text: string; droppedRoot: string | null } {
-	const lines = ["  <skill>", `    <name>${skill.name}</name>`];
-	if (tail === "intent" && skill.description) lines.push(`    <description>${compactDescription(skill.description, INTENT_CHARS)}</description>`);
-	let droppedRoot: string | null = null;
-	if (skill.location) {
-		const root = derivableRoot(skill.location, skill.name);
-		if (root) droppedRoot = root;
-		else lines.push(`    <location>${skill.location}</location>`);
-	}
-	lines.push("  </skill>");
-	return { text: lines.join("\n"), droppedRoot };
-}
-
-/** One-line note so the model can load a tail skill whose location was dropped. */
-function pathNote(roots: readonly string[]): string {
-	return `  <skill_path_note>Skills listed without a location field are stored at {root}/{name}/SKILL.md (roots: ${roots.join(" | ")}). Read that file to load one, or run /skill:name.</skill_path_note>`;
-}
-
-/**
- * Rewrite the `<available_skills>` block inside `text` per the options. Returns
- * the original text (and `removedChars: 0`) when there is no catalog or no skills.
- *
- * `hybrid` keeps the top-K query-relevant skills (plus critical/pinned/alwaysFull)
- * at full description + explicit location, and renders the rest as the `tail`
- * style with the location replaced by a single path note — so every surviving
- * skill stays loadable. `compact` renders every skill as a short intent tail.
- * Skills matched by `never` are dropped entirely.
- */
-export function transformSkillsInText(text: string, opts: SkillTransformOptions): SkillTransformResult {
-	let changed = false;
-	const selected: string[] = [];
-	const selectedSet = new Set<string>();
-	const profile = opts.profile ?? EMPTY_PROFILE;
-	const pinned = new Set(opts.pinnedSkills ?? []);
-	const critical = new Set(profile.critical);
-	const always = new Set(opts.alwaysFull ?? []);
-	const never = opts.never ?? [];
-	BLOCK_RE.lastIndex = 0;
-	const next = text.replace(BLOCK_RE, (block, inner: string) => {
-		if (block.includes(TRANSFORMED_CATALOG_MARKER)) return block;
-		const analysis = analyzeCatalog(inner, profile);
-		const skills = analysis.skills;
-		if (skills.length === 0) return block;
-
-		const excluded = skills.map((skill) => never.length > 0 && nameMatches(skill.name, never));
-		const fullSet = new Set<number>();
-		const orderedFull: number[] = [];
-		const markFull = (i: number): void => {
-			if (excluded[i] || fullSet.has(i)) return;
-			fullSet.add(i);
-			orderedFull.push(i);
-		};
-		let hasLexicalSignal = false;
-		if (opts.mode === "hybrid") {
-			const scores = scoreAnalysis(analysis, tokenize(opts.query));
-			hasLexicalSignal = scores.some((score) => score > 0);
-			const ranked = selectRelevant(scores, {
-				targetTopK: opts.topK,
-				minTopK: opts.topK,
-				maxTopK: Math.ceil(opts.topK * 1.5),
-				adaptive: true,
+	const indexed: Skill[] = [];
+	for (const match of text.matchAll(INDEX_RE)) {
+		const decoded = decodeXml(match[1]);
+		for (const rawLine of decoded.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			const columns = line.split("\t").map(unescapeTsv);
+			const name = columns[0]?.trim() ?? "";
+			if (!name) continue;
+			indexed.push({
+				name,
+				description: columns[1]?.trim() ?? "",
+				location: columns[2]?.trim() ?? "",
 			});
-			const budgetOption = opts.fullRenderBudgetChars;
-			const fullBudget = budgetOption === 0 || budgetOption === Number.POSITIVE_INFINITY
-					? Number.POSITIVE_INFINITY
-					: typeof budgetOption === "number" && Number.isFinite(budgetOption) && budgetOption > 0
-						? Math.floor(budgetOption)
-						: DEFAULT_FULL_RENDER_BUDGET_CHARS;
-			const ordinaryCount = Math.min(Math.max(0, Math.floor(opts.topK)), ranked.length);
-			let spent = 0;
-			for (let position = 0; position < ordinaryCount; position++) {
-				const i = ranked[position];
-				const skill = skills[i];
-				if (critical.has(skill.name) || pinned.has(skill.name) || always.has(skill.name)) {
-					markFull(i);
-					continue;
-				}
-				const cost = renderFull(skill).length;
-				if (spent + cost > fullBudget) break;
-				markFull(i);
-				spent += cost;
-			}
-			// Adaptive selections beyond topK are ambiguity guardrails. They are
-			// intentionally outside the budget because pruning a close alternative
-			// would trade routing quality for a nominal cap.
-			for (let position = ordinaryCount; position < ranked.length; position++) markFull(ranked[position]);
 		}
-		skills.forEach((skill, i) => {
-			if (critical.has(skill.name) || pinned.has(skill.name) || always.has(skill.name)) markFull(i);
-		});
+	}
+	return indexed;
+}
 
-		const tailStyle: TailStyle = opts.mode === "compact" || !hasLexicalSignal ? "intent" : opts.tail;
-		const usedRoots: string[] = [];
-		const seenRoots = new Set<string>();
-		const entries: string[] = [];
-		skills.forEach((skill, i) => {
-			if (excluded[i]) return;
-			if (fullSet.has(i)) {
-				entries.push(renderFull(skill));
-				return;
-			}
-			const { text: entry, droppedRoot } = renderTail(skill, tailStyle);
-			if (droppedRoot && !seenRoots.has(droppedRoot)) {
-				seenRoots.add(droppedRoot);
-				usedRoots.push(droppedRoot);
-			}
-			entries.push(entry);
-		});
+function truncateAtWord(text: string, maxChars: number): string {
+	if (maxChars <= 0) return "";
+	if (text.length <= maxChars) return text;
+	if (maxChars <= 3) return text.slice(0, maxChars);
+	const boundary = text.lastIndexOf(" ", maxChars - 3);
+	return `${text.slice(0, boundary >= Math.floor(maxChars / 2) ? boundary : maxChars - 3).trimEnd()}...`;
+}
 
-		const metadata = [`  ${TRANSFORMED_CATALOG_MARKER}`];
-		if (usedRoots.length > 0) metadata.push(pathNote(usedRoots));
-		const rebuilt = `<available_skills>\n${metadata.join("\n")}\n${entries.join("\n")}\n</available_skills>`;
-		if (rebuilt.length >= block.length) return block;
-		for (const i of orderedFull) {
-			const name = skills[i].name;
-			if (selectedSet.has(name)) continue;
-			selectedSet.add(name);
-			selected.push(name);
+export function compactDescription(description: string, maxChars: number): string {
+	const clean = decodeXml(description).replace(/\s+/g, " ").trim();
+	if (!clean || maxChars <= 0) return "";
+	const sentences = clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.map((part) => part.trim()) ?? [clean];
+	const lead = sentences[0] ?? clean;
+	const routing = sentences.slice(1).find((sentence) => /\b(?:apply|load|trigger|use)\s+when\b/i.test(sentence));
+	if (!routing) return truncateAtWord(lead, maxChars);
+	if (lead === routing) return truncateAtWord(lead, maxChars);
+	const combined = `${lead} ${routing}`;
+	if (combined.length <= maxChars) return combined;
+	const separator = " ";
+	const minimumLead = Math.min(32, Math.max(12, Math.floor(maxChars * 0.4)));
+	const routeBudget = Math.max(0, maxChars - minimumLead - separator.length);
+	const shortRoute = truncateAtWord(routing, routeBudget);
+	const leadBudget = Math.max(0, maxChars - shortRoute.length - separator.length);
+	return truncateAtWord(`${truncateAtWord(lead, leadBudget)}${separator}${shortRoute}`.trim(), maxChars);
+}
+
+function matchesPattern(name: string, patterns: readonly string[]): boolean {
+	const lower = name.toLocaleLowerCase("en-US");
+	return patterns.some((rawPattern) => {
+		const pattern = rawPattern.trim().toLocaleLowerCase("en-US");
+		if (!pattern) return false;
+		return pattern.endsWith("*") ? lower.startsWith(pattern.slice(0, -1)) : lower === pattern;
+	});
+}
+
+function denseRow(skill: Skill, intentMaxChars = DEFAULT_INTENT_MAX_CHARS): string {
+	const fields = [
+		escapeTsv(skill.name),
+		escapeTsv(compactDescription(skill.description, intentMaxChars)),
+	];
+	while (fields.length > 1 && fields.at(-1) === "") fields.pop();
+	return fields.map(encodeXml).join("\t");
+}
+
+function renderStableBlock(skills: readonly Skill[], intentLimits: readonly number[]): string {
+	const rows = skills.map((skill, index) => denseRow(skill, intentLimits[index] ?? 0)).join("\n");
+	return [
+		"<available_skills>",
+		AUTO_MARKER,
+		"<skill_resolver>Load full instructions for any listed name with skill_search.</skill_resolver>",
+		'<skill_index format="tsv" columns="name,intent">',
+		rows,
+		"</skill_index>",
+		"</available_skills>",
+	].join("\n");
+}
+
+function canonicalSkillData(skills: readonly Skill[]): string {
+	return skills.map((skill) =>
+		`${skill.name.length}:${skill.name}${skill.description.length}:${skill.description}`
+	).join("");
+}
+
+export function catalogFingerprint(skills: readonly Skill[]): string {
+	return createHash("sha256").update(canonicalSkillData(skills), "utf8").digest("hex");
+}
+
+export function renderStableSkillCatalog(text: string, options: StableCatalogOptions = {}): StableCatalogResult {
+	const never = options.never ?? [];
+	const intentMaxChars = clamp(Math.trunc(options.intentMaxChars ?? DEFAULT_INTENT_MAX_CHARS), 24, 240);
+	const requestedChars = Math.max(0, Math.trunc(options.budgetChars ?? DEFAULT_CATALOG_BUDGET_CHARS));
+	const blocks = [...text.matchAll(CATALOG_RE)].map((match, blockIndex) => {
+		const inner = match[1];
+		const parsed = parseSkills(inner);
+		const retained = parsed.filter((skill) => !matchesPattern(skill.name, never));
+		return {
+			blockIndex,
+			inner,
+			marked: inner.includes(AUTO_MARKER),
+			parsed,
+			retained,
+			intentLimits: retained.map(() => 0),
+		};
+	});
+	const rawBlocks = blocks.filter((block) => !block.marked && block.parsed.length > 0);
+	const floorChars = rawBlocks.reduce((sum, block) =>
+		sum + renderStableBlock(block.retained, block.intentLimits).length, 0);
+	let remaining = Math.max(0, requestedChars - floorChars);
+	const candidates = rawBlocks.flatMap((block) => block.retained
+		.map((skill, skillIndex) => {
+			if (!skill.description) return undefined;
+			const floor = denseRow(skill, 0).length;
+			const full = denseRow(skill, intentMaxChars).length;
+			return {
+				block,
+				skill,
+				skillIndex,
+				cost: full - floor,
+			};
+		})
+		.filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== undefined))
+		.sort((left, right) =>
+			left.cost - right.cost
+			|| left.skill.name.localeCompare(right.skill.name)
+			|| left.block.blockIndex - right.block.blockIndex
+			|| left.skillIndex - right.skillIndex
+		);
+	const deferred: typeof candidates = [];
+	for (const candidate of candidates) {
+		if (candidate.cost <= remaining) {
+			candidate.block.intentLimits[candidate.skillIndex] = intentMaxChars;
+			remaining -= candidate.cost;
+		} else {
+			deferred.push(candidate);
+		}
+	}
+	// Spend a useful remainder on one partial intent rather than padding or
+	// exceeding the cap. The binary search accounts for XML/TSV escaping.
+	if (remaining > 4) {
+		for (const candidate of deferred) {
+			const floor = denseRow(candidate.skill, 0).length;
+			let low = 24;
+			let high = intentMaxChars;
+			let best = 0;
+			while (low <= high) {
+				const middle = Math.floor((low + high) / 2);
+				const cost = denseRow(candidate.skill, middle).length - floor;
+				if (cost <= remaining) {
+					best = middle;
+					low = middle + 1;
+				} else {
+					high = middle - 1;
+				}
+			}
+			if (best > 0 && denseRow(candidate.skill, best).length > floor) {
+				candidate.block.intentLimits[candidate.skillIndex] = best;
+				remaining -= denseRow(candidate.skill, best).length - floor;
+				break;
+			}
+		}
+	}
+	const allSkills: Skill[] = [];
+	let changed = false;
+	let blockCursor = 0;
+	let usedChars = 0;
+	let intentCount = 0;
+	let nameOnlyCount = 0;
+	const next = text.replace(CATALOG_RE, (block, inner: string) => {
+		const state = blocks[blockCursor++];
+		if (!state || state.parsed.length === 0) return block;
+		allSkills.push(...state.retained);
+		if (state.marked) {
+			usedChars += block.length;
+			for (const skill of state.retained) {
+				if (skill.description) intentCount += 1;
+				else nameOnlyCount += 1;
+			}
+			return block;
+		}
+		const rebuilt = renderStableBlock(state.retained, state.intentLimits);
+		usedChars += rebuilt.length;
+		for (const limit of state.intentLimits) {
+			if (limit > 0) intentCount += 1;
+			else nameOnlyCount += 1;
 		}
 		changed = true;
 		return rebuilt;
 	});
-	if (!changed) return { text, removedChars: 0, selected: [] };
-	return { text: next, removedChars: text.length - next.length, selected };
+	const deduplicated = [...new Map(allSkills.map((skill) => [skill.name, skill])).values()];
+	return {
+		text: changed ? next : text,
+		removedChars: changed ? Math.max(0, text.length - next.length) : 0,
+		skills: deduplicated,
+		fingerprint: catalogFingerprint(deduplicated),
+		budget: {
+			requestedChars,
+			usedChars,
+			floorChars,
+			intentCount,
+			nameOnlyCount,
+			overBudgetChars: Math.max(0, usedChars - requestedChars),
+		},
+	};
 }
 
-/**
- * Pull the query text from an Anthropic-style `messages` array: the first user
- * text (the session task) plus the latest user text (the current step). Tool
- * results and non-text blocks are skipped, so during a tool-use loop the query
- * stays the original task — which keeps the rewritten prompt stable within a turn.
- */
-export function extractQuery(messages: unknown, maxChars = 2000): string {
-	if (maxChars <= 0) return "";
-	if (!Array.isArray(messages)) return "";
-	const userTexts: string[] = [];
-	for (const message of messages) {
-		if (!message || typeof message !== "object") continue;
-		const m = message as { role?: unknown; content?: unknown };
-		if (m.role !== "user") continue;
-		if (typeof m.content === "string") {
-			if (m.content.trim()) userTexts.push(m.content);
-		} else if (Array.isArray(m.content)) {
-			const text = m.content
-				.filter((b): b is { type: "text"; text: string } => !!b && (b as { type?: unknown }).type === "text" && typeof (b as { text?: unknown }).text === "string")
-				.map((b) => b.text)
-				.join(" ");
-			if (text.trim()) userTexts.push(text);
+interface TermDocument {
+	fields: Record<FieldName, Map<string, number>>;
+	allTerms: Set<string>;
+	nameTerms: Set<string>;
+	intentTerms: Set<string>;
+	aliasLabels: string[];
+}
+
+interface CatalogAnalysis {
+	skills: readonly Skill[];
+	documents: TermDocument[];
+	df: Map<string, number>;
+	averageLengths: Record<FieldName, number>;
+	aliases: QueryAliasMap;
+	profile: SkillOptimizerProfile;
+	fingerprint: string;
+}
+
+const ANALYSIS_CACHE_MAX = 8;
+const analysisCache = new Map<string, CatalogAnalysis>();
+
+function termFrequency(tokens: readonly string[]): Map<string, number> {
+	const out = new Map<string, number>();
+	for (const token of tokens) out.set(token, (out.get(token) ?? 0) + 1);
+	return out;
+}
+
+function stableObject(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(stableObject);
+	if (!value || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+		.sort(([a], [b]) => a.localeCompare(b))
+		.map(([key, item]) => [key, stableObject(item)]));
+}
+
+function profileFingerprint(profile: SkillOptimizerProfile): string {
+	return createHash("sha256").update(JSON.stringify(stableObject(profile)), "utf8").digest("hex");
+}
+
+function routingIntent(description: string): string {
+	return compactDescription(description, DEFAULT_INTENT_MAX_CHARS);
+}
+
+function analyzeCatalog(skills: readonly Skill[], profile: SkillOptimizerProfile): CatalogAnalysis {
+	const fingerprint = catalogFingerprint(skills);
+	const cacheKey = `${fingerprint}:${profileFingerprint(profile)}`;
+	const cached = analysisCache.get(cacheKey);
+	if (cached) {
+		analysisCache.delete(cacheKey);
+		analysisCache.set(cacheKey, cached);
+		return cached;
+	}
+
+	const documents = skills.map((skill): TermDocument => {
+		const fields: Record<FieldName, Map<string, number>> = {
+			name: termFrequency(tokenize(skill.name)),
+			intent: termFrequency(tokenize(routingIntent(skill.description))),
+			description: termFrequency(tokenize(skill.description)),
+			queries: termFrequency((profile.queries[skill.name] ?? []).flatMap(tokenize)),
+		};
+		const allTerms = new Set(FIELD_NAMES.flatMap((field) => [...fields[field].keys()]));
+		return {
+			fields,
+			allTerms,
+			nameTerms: new Set(fields.name.keys()),
+			intentTerms: new Set(fields.intent.keys()),
+			aliasLabels: [],
+		};
+	});
+	const df = new Map<string, number>();
+	for (const document of documents) {
+		for (const term of document.allTerms) df.set(term, (df.get(term) ?? 0) + 1);
+	}
+	const aliases = buildCatalogAliases((term) => df.has(term));
+	for (const document of documents) {
+		for (const [source, targets] of aliases) {
+			if (targets.some((target) => document.allTerms.has(target))) document.aliasLabels.push(source);
 		}
 	}
-	if (userTexts.length === 0) return "";
-	const first = userTexts[0];
-	const last = userTexts[userTexts.length - 1];
-	if (first === last) return first.slice(0, maxChars);
-	const separator = "\n";
-	if (last.length + separator.length >= maxChars) return last.slice(-maxChars);
-	const firstBudget = maxChars - last.length - separator.length;
-	return `${first.slice(0, firstBudget)}${separator}${last}`;
+	const averageLengths = Object.fromEntries(FIELD_NAMES.map((field) => {
+		const total = documents.reduce((sum, document) =>
+			sum + [...document.fields[field].values()].reduce((count, frequency) => count + frequency, 0), 0);
+		return [field, Math.max(1, total / Math.max(1, documents.length))];
+	})) as Record<FieldName, number>;
+	const analysis: CatalogAnalysis = { skills, documents, df, averageLengths, aliases, profile, fingerprint };
+	analysisCache.set(cacheKey, analysis);
+	while (analysisCache.size > ANALYSIS_CACHE_MAX) analysisCache.delete(analysisCache.keys().next().value as string);
+	return analysis;
+}
+
+function bm25fScore(analysis: CatalogAnalysis, index: number, terms: readonly string[]): number {
+	const document = analysis.documents[index];
+	const count = Math.max(1, analysis.documents.length);
+	let score = 0;
+	for (const term of unique(terms)) {
+		const documentFrequency = analysis.df.get(term) ?? 0;
+		if (documentFrequency === 0) continue;
+		let weightedFrequency = 0;
+		for (const field of FIELD_NAMES) {
+			const values = document.fields[field];
+			const frequency = values.get(term) ?? 0;
+			if (frequency === 0) continue;
+			const length = [...values.values()].reduce((sum, value) => sum + value, 0);
+			const normalization = 1 - FIELD_B[field] + FIELD_B[field] * (length / analysis.averageLengths[field]);
+			weightedFrequency += FIELD_WEIGHTS[field] * frequency / Math.max(0.2, normalization);
+		}
+		const idf = Math.log(1 + (count - documentFrequency + 0.5) / (documentFrequency + 0.5));
+		score += idf * (weightedFrequency * 2.2) / (weightedFrequency + 1.2);
+	}
+	return score;
+}
+
+function exactScore(analysis: CatalogAnalysis, index: number, query: string, rawTerms: readonly string[]): number {
+	const skill = analysis.skills[index];
+	const document = analysis.documents[index];
+	const queryPhrase = normalizedPhrase(query);
+	const namePhrase = normalizedPhrase(skill.name);
+	let score = 0;
+	if (namePhrase && (queryPhrase === namePhrase || queryPhrase.includes(namePhrase))) score = 12;
+	else if (document.nameTerms.size > 0 && [...document.nameTerms].every((term) => rawTerms.includes(term))) score = 8;
+	else if (rawTerms.some((term) => document.nameTerms.has(term))) score = 3;
+	for (const example of analysis.profile.queries[skill.name] ?? []) {
+		const examplePhrase = normalizedPhrase(example);
+		if (examplePhrase && (queryPhrase === examplePhrase || queryPhrase.includes(examplePhrase))) score = Math.max(score, 7);
+	}
+	if (rawTerms.some((term) => document.aliasLabels.includes(term))) score = Math.max(score, 4);
+	return score;
+}
+
+function trigrams(text: string): Set<string> {
+	const normalized = text.replace(/\s+/g, "");
+	const out = new Set<string>();
+	if (normalized.length < 3) return out;
+	for (let index = 0; index <= normalized.length - 3; index += 1) out.add(normalized.slice(index, index + 3));
+	return out;
+}
+
+function dice(left: Set<string>, right: Set<string>): number {
+	if (left.size === 0 || right.size === 0) return 0;
+	let intersection = 0;
+	for (const value of left) if (right.has(value)) intersection += 1;
+	return 2 * intersection / (left.size + right.size);
+}
+
+function terminalLabelSegment(value: string): string {
+	return value.normalize("NFKC").toLowerCase().match(/[\p{L}\p{N}]+/gu)?.at(-1) ?? "";
+}
+
+function fuzzyScores(
+	analysis: CatalogAnalysis,
+	query: string,
+	rawTerms: readonly string[],
+	coverage: number,
+	limit: number,
+): number[] {
+	const scores = analysis.skills.map(() => 0);
+	if (rawTerms.length === 0 || coverage >= 0.6 || limit <= 0) return scores;
+	const queryLabels = rawTerms.filter((term) => term.length >= 5);
+	if (queryLabels.length === 0) return scores;
+	const querySuffix = terminalLabelSegment(query);
+	for (let index = 0; index < analysis.documents.length; index += 1) {
+		const skill = analysis.skills[index];
+		const labels = unique([
+			normalizedPhrase(skill.name).replace(/\s+/g, ""),
+			...tokenize(skill.name),
+			...analysis.documents[index].aliasLabels,
+		]).filter((label) => label.length >= 5);
+		let best = 0;
+		for (const queryLabel of queryLabels) {
+			const queryTrigrams = trigrams(queryLabel);
+			for (const label of labels) best = Math.max(best, dice(queryTrigrams, trigrams(label)));
+		}
+		if (best >= 0.56) {
+			const nameSuffix = terminalLabelSegment(skill.name);
+			scores[index] = querySuffix && nameSuffix === querySuffix ? Math.min(1, best + 0.08) : best;
+		}
+	}
+	const candidates = scores
+		.map((score, index) => ({ score, index }))
+		.filter(({ score }) => score > 0)
+		.sort((a, b) => b.score - a.score || a.index - b.index);
+	for (const candidate of candidates.slice(limit)) scores[candidate.index] = 0;
+	return scores;
+}
+
+function isUsageMap(
+	prior: NonNullable<SkillPrefetchOptions["usagePrior"]>,
+): prior is ReadonlyMap<string, number> {
+	return typeof (prior as { get?: unknown }).get === "function";
+}
+
+function usageValue(prior: SkillPrefetchOptions["usagePrior"], name: string): number {
+	if (!prior) return 0;
+	const value = isUsageMap(prior) ? prior.get(name) : prior[name];
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function addRrfSignal(
+	out: number[],
+	values: readonly number[],
+	weight: number,
+	eligible?: ReadonlySet<number>,
+): void {
+	const ranked = values
+		.map((value, index) => ({ value, index }))
+		.filter(({ value, index }) => value > 0 && (!eligible || eligible.has(index)))
+		.sort((a, b) => b.value - a.value || a.index - b.index);
+	for (let rank = 0; rank < ranked.length; rank += 1) {
+		out[ranked[rank].index] += weight / (60 + rank + 1);
+	}
+}
+
+function skillClusters(profile: SkillOptimizerProfile): Map<string, string[]> {
+	const out = new Map<string, string[]>();
+	for (const [cluster, names] of Object.entries(profile.clusters)) {
+		for (const name of names) out.set(name, [...(out.get(name) ?? []), cluster]);
+	}
+	return out;
+}
+
+function diversityOrder(
+	ranked: readonly RankedSkill[],
+	profile: SkillOptimizerProfile,
+	prefixLimit: number,
+): RankedSkill[] {
+	const remaining = [...ranked];
+	const ordered: RankedSkill[] = [];
+	const clusterCounts = new Map<string, number>();
+	const clusters = skillClusters(profile);
+	const limit = clamp(Math.trunc(prefixLimit), 0, ranked.length);
+	while (remaining.length > 0 && ordered.length < limit) {
+		let bestIndex = 0;
+		let bestAdjusted = -Infinity;
+		for (let index = 0; index < remaining.length; index += 1) {
+			const repeated = (clusters.get(remaining[index].skill.name) ?? [])
+				.reduce((sum, cluster) => sum + (clusterCounts.get(cluster) ?? 0), 0);
+			const adjusted = remaining[index].score / (1 + repeated * 0.18);
+			if (adjusted > bestAdjusted) {
+				bestAdjusted = adjusted;
+				bestIndex = index;
+			}
+		}
+		const [picked] = remaining.splice(bestIndex, 1);
+		ordered.push(picked);
+		for (const cluster of clusters.get(picked.skill.name) ?? []) {
+			clusterCounts.set(cluster, (clusterCounts.get(cluster) ?? 0) + 1);
+		}
+	}
+	return ordered.length === ranked.length ? ordered : [...ordered, ...remaining];
+}
+
+function renderFullSkill(skill: Skill): string {
+	const parts = [
+		"  <skill>",
+		`    <name>${encodeXml(skill.name)}</name>`,
+	];
+	if (skill.description) parts.push(`    <description>${encodeXml(skill.description)}</description>`);
+	parts.push("  </skill>");
+	return parts.join("\n");
+}
+
+function marginalRenderChars(skill: Skill): number {
+	return Math.max(0, renderFullSkill(skill).length - denseRow(skill).length);
+}
+
+function emptyPlan(query: string, skills: readonly Skill[]): SkillPrefetchPlan {
+	return {
+		query,
+		fingerprint: catalogFingerprint(skills),
+		hasSignal: false,
+		confidence: 0,
+		selected: [],
+		selectedNames: [],
+		ranked: [],
+		marginalChars: 0,
+		skippedForBudget: [],
+	};
+}
+
+export function planSkillPrefetch(
+	skills: readonly Skill[],
+	query: string,
+	options: SkillPrefetchOptions = {},
+): SkillPrefetchPlan {
+	const profile = options.profile ?? EMPTY_PROFILE;
+	const never = options.never ?? [];
+	const available = skills.filter((skill) => !matchesPattern(skill.name, never));
+	if (available.length === 0) return emptyPlan(query, available);
+	const analysis = analyzeCatalog(available, profile);
+	const rawTerms = unique(tokenize(query));
+	const expandedTerms = expandQueryTokens(rawTerms, analysis.aliases);
+	const termMatches = rawTerms.filter((term) =>
+		analysis.df.has(term) || (analysis.aliases.get(term)?.length ?? 0) > 0
+	).length;
+	const coverage = rawTerms.length > 0 ? termMatches / rawTerms.length : 0;
+	const lexical = available.map((_, index) => bm25fScore(analysis, index, expandedTerms));
+	const exact = available.map((_, index) => exactScore(analysis, index, query, rawTerms));
+	const fuzzy = fuzzyScores(
+		analysis,
+		query,
+		rawTerms,
+		coverage,
+		clamp(Math.trunc(options.fuzzyCandidateLimit ?? 12), 0, 32),
+	);
+	const eligible = new Set<number>();
+	for (let index = 0; index < available.length; index += 1) {
+		if (lexical[index] > 0 || exact[index] > 0 || fuzzy[index] > 0) eligible.add(index);
+	}
+	const hasSignal = rawTerms.length > 0 && eligible.size > 0;
+	const usage = available.map((skill) => usageValue(options.usagePrior, skill.name));
+	const maximumUsage = Math.max(0, ...usage);
+	const normalizedUsage = usage.map((value) => maximumUsage > 0 ? value / maximumUsage : 0);
+	const fused = available.map(() => 0);
+	addRrfSignal(fused, lexical, 1.5);
+	addRrfSignal(fused, exact, 2.2);
+	addRrfSignal(fused, fuzzy, 0.8);
+	if (hasSignal) addRrfSignal(fused, normalizedUsage, 0.35, eligible);
+
+	for (let index = 0; index < available.length; index += 1) {
+		const negative = new Set((profile.negativeHints[available[index].name] ?? []).flatMap(tokenize));
+		if (rawTerms.some((term) => negative.has(term))) fused[index] *= 0.55;
+	}
+
+	let ranked = available
+		.map((skill, index): RankedSkill => {
+			const reasons: RankReason[] = [];
+			if (exact[index] > 0) reasons.push("exact");
+			if (lexical[index] > 0) reasons.push("lexical");
+			if (fuzzy[index] > 0) reasons.push("fuzzy");
+			if ((profile.queries[skill.name]?.length ?? 0) > 0 && lexical[index] > 0) reasons.push("profile");
+			if (normalizedUsage[index] > 0 && eligible.has(index)) reasons.push("usage");
+			return {
+				skill,
+				score: fused[index] * 100,
+				lexicalScore: lexical[index],
+				exactScore: exact[index],
+				fuzzyScore: fuzzy[index],
+				usageScore: normalizedUsage[index],
+				reasons,
+				marginalChars: marginalRenderChars(skill),
+			};
+		})
+		.filter((entry, index) => hasSignal && eligible.has(index) && entry.score > 0)
+		.sort((left, right) => right.score - left.score || right.exactScore - left.exactScore || left.skill.name.localeCompare(right.skill.name));
+	const minTopK = clamp(Math.trunc(options.minTopK ?? 3), 0, available.length);
+	const maxTopK = clamp(Math.trunc(options.maxTopK ?? 16), minTopK, available.length);
+	const targetTopK = clamp(Math.trunc(options.targetTopK ?? 8), minTopK, maxTopK);
+	ranked = diversityOrder(ranked, profile, maxTopK);
+
+	const top = ranked[0]?.score ?? 0;
+	const second = ranked[1]?.score ?? 0;
+	const gap = top > 0 ? clamp((top - second) / top, 0, 1) : 0;
+	const exactConfidence = (ranked[0]?.exactScore ?? 0) >= 7 ? 1 : (ranked[0]?.exactScore ?? 0) > 0 ? 0.5 : 0;
+	const confidence = hasSignal ? clamp(0.15 + 0.35 * coverage + 0.35 * exactConfidence + 0.15 * gap, 0, 1) : 0;
+	let desired = confidence >= 0.8
+		? minTopK
+		: confidence <= 0.35
+			? maxTopK
+			: targetTopK;
+	if (confidence < 0.8 && desired > 0 && ranked.length > desired) {
+		const boundary = ranked[desired - 1]?.score ?? 0;
+		while (desired < maxTopK && (ranked[desired]?.score ?? 0) >= boundary * 0.9) desired += 1;
+	}
+
+	const protectedNames = new Set([
+		...profile.critical,
+		...(options.always ?? []),
+	].filter((name) => available.some((skill) => skill.name === name)));
+	const selected: Skill[] = [];
+	const selectedNames = new Set<string>();
+	for (const skill of available) {
+		if (!protectedNames.has(skill.name)) continue;
+		selected.push(skill);
+		selectedNames.add(skill.name);
+	}
+	const budget = Math.max(0, Math.trunc(options.fullRenderBudgetChars ?? DEFAULT_FULL_RENDER_BUDGET_CHARS));
+	let marginalChars = selected.reduce((sum, skill) => sum + marginalRenderChars(skill), 0);
+	let ordinaryChars = 0;
+	let ordinaryCount = 0;
+	const skippedForBudget: string[] = [];
+	for (const entry of ranked) {
+		if (ordinaryCount >= desired) break;
+		if (selectedNames.has(entry.skill.name)) continue;
+		if (ordinaryChars + entry.marginalChars > budget) {
+			skippedForBudget.push(entry.skill.name);
+			continue;
+		}
+		selected.push(entry.skill);
+		selectedNames.add(entry.skill.name);
+		ordinaryChars += entry.marginalChars;
+		marginalChars += entry.marginalChars;
+		ordinaryCount += 1;
+	}
+	return {
+		query,
+		fingerprint: analysis.fingerprint,
+		hasSignal,
+		confidence,
+		selected,
+		selectedNames: selected.map((skill) => skill.name),
+		ranked,
+		marginalChars,
+		skippedForBudget,
+	};
+}
+
+export function renderSkillPrefetch(plan: SkillPrefetchPlan): string {
+	if (plan.selected.length === 0) return "";
+	return [
+		`<skill_prefetch catalog_sha256="${plan.fingerprint}">`,
+		"  <skill_resolver>Use skill_search(name) to load the full skill resource.</skill_resolver>",
+		...plan.selected.map(renderFullSkill),
+		"</skill_prefetch>",
+	].join("\n");
+}
+
+interface SearchCursorPayload {
+	v: 1;
+	f: string;
+	q: string;
+	o: number;
+	s: string;
+}
+
+function searchQueryFingerprint(query: string): string {
+	return createHash("sha256").update(query, "utf8").digest("hex");
+}
+
+function cursorSignature(fingerprint: string, queryHash: string, offset: number): string {
+	return createHash("sha256")
+		.update(`pi-skill-optimizer:cursor:v1\0${fingerprint}\0${queryHash}\0${offset}`, "utf8")
+		.digest("hex")
+		.slice(0, 24);
+}
+
+function encodeSearchCursor(fingerprint: string, queryHash: string, offset: number): string {
+	const payload: SearchCursorPayload = {
+		v: 1,
+		f: fingerprint,
+		q: queryHash,
+		o: offset,
+		s: cursorSignature(fingerprint, queryHash, offset),
+	};
+	return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function decodeSearchCursor(cursor: string, fingerprint: string, queryHash: string): number {
+	try {
+		const payload = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<SearchCursorPayload>;
+		if (
+			payload.v !== 1
+			|| payload.f !== fingerprint
+			|| payload.q !== queryHash
+			|| !Number.isSafeInteger(payload.o)
+			|| (payload.o ?? -1) < 0
+			|| payload.s !== cursorSignature(fingerprint, queryHash, payload.o as number)
+		) throw new Error("mismatch");
+		return payload.o as number;
+	} catch {
+		throw new RangeError("Invalid or stale skill search cursor");
+	}
+}
+
+export function searchSkillCatalog(
+	skills: readonly Skill[],
+	query: string,
+	options: SkillSearchOptions = {},
+): SkillSearchResult {
+	const plan = planSkillPrefetch(skills, query, options);
+	const pageSize = clamp(Math.trunc(options.pageSize ?? 10), 1, 50);
+	const queryHash = searchQueryFingerprint(query);
+	const offset = options.cursor
+		? decodeSearchCursor(options.cursor, plan.fingerprint, queryHash)
+		: 0;
+	const intentMaxChars = clamp(Math.trunc(options.intentMaxChars ?? DEFAULT_INTENT_MAX_CHARS), 24, 240);
+	const page = plan.ranked.slice(offset, offset + pageSize);
+	const topScore = plan.ranked[0]?.score ?? 0;
+	const items = page.map((entry): SkillSearchItem => ({
+		name: entry.skill.name,
+		intent: compactDescription(entry.skill.description, intentMaxChars),
+		score: entry.score,
+		confidence: entry.exactScore >= 12
+			? 1
+			: entry.exactScore >= 8
+				? Math.max(0.95, plan.confidence)
+				: clamp(plan.confidence * (topScore > 0 ? entry.score / topScore : 0), 0, 0.94),
+		reasons: [...entry.reasons],
+	}));
+	const nextOffset = offset + page.length;
+	return {
+		query,
+		fingerprint: plan.fingerprint,
+		confidence: plan.confidence,
+		total: plan.ranked.length,
+		items,
+		...(nextOffset < plan.ranked.length
+			? { nextCursor: encodeSearchCursor(plan.fingerprint, queryHash, nextOffset) }
+			: {}),
+	};
+}
+
+function jaccard(left: ReadonlySet<string>, right: ReadonlySet<string>): number {
+	if (left.size === 0 || right.size === 0) return 0;
+	let intersection = 0;
+	for (const value of left) if (right.has(value)) intersection += 1;
+	return intersection / (left.size + right.size - intersection);
+}
+
+export function auditSkillDescriptions(
+	skills: readonly Skill[],
+	options: SkillDescriptionAuditOptions = {},
+): SkillDescriptionAudit {
+	const maxChars = clamp(Math.trunc(options.maxChars ?? 600), 80, 10_000);
+	const minChars = clamp(Math.trunc(options.minChars ?? 24), 1, maxChars);
+	const duplicateThreshold = clamp(options.duplicateThreshold ?? 0.9, 0.7, 1);
+	const issues: SkillDescriptionIssue[] = [];
+	const tokenSets = skills.map((skill) => new Set(tokenize(skill.description)));
+	const routingPattern = /\b(?:apply|load|trigger|use)\s+when\b|\bwhen\s+(?:handling|reviewing|working|you|your)\b|\bfor\s+(?:requests?|tasks?|workflows?|cases?|projects?)\b/i;
+	let estimatedReducibleChars = 0;
+	for (let index = 0; index < skills.length; index += 1) {
+		const skill = skills[index];
+		const clean = skill.description.replace(/\s+/g, " ").trim();
+		if (clean.length > maxChars) {
+			issues.push({ name: skill.name, code: "too_long", descriptionChars: clean.length });
+			estimatedReducibleChars += clean.length - maxChars;
+		}
+		if (clean.length < minChars || tokenSets[index].size < 3) {
+			issues.push({ name: skill.name, code: "near_empty", descriptionChars: clean.length });
+		} else if (!routingPattern.test(clean)) {
+			issues.push({ name: skill.name, code: "missing_routing", descriptionChars: clean.length });
+		}
+		for (let previous = 0; previous < index; previous += 1) {
+			if (tokenSets[index].size < 5 || tokenSets[previous].size < 5) continue;
+			if (jaccard(tokenSets[index], tokenSets[previous]) < duplicateThreshold) continue;
+			issues.push({
+				name: skill.name,
+				code: "duplicate_description",
+				descriptionChars: clean.length,
+				relatedSkill: skills[previous].name,
+			});
+			break;
+		}
+	}
+	const counts: Record<SkillDescriptionIssueCode, number> = {
+		too_long: 0,
+		near_empty: 0,
+		missing_routing: 0,
+		duplicate_description: 0,
+	};
+	for (const issue of issues) counts[issue.code] += 1;
+	return {
+		skillCount: skills.length,
+		issueCount: issues.length,
+		counts,
+		estimatedReducibleChars,
+		issues,
+	};
+}
+
+export function optimizeSkillCatalog(
+	text: string,
+	query: string,
+	options: SkillPrefetchOptions & StableCatalogOptions = {},
+): SkillCatalogOptimizationResult {
+	const stable = renderStableSkillCatalog(text, options);
+	return {
+		...stable,
+		plan: planSkillPrefetch(stable.skills, query, options),
+	};
 }

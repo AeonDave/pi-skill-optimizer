@@ -19,12 +19,24 @@ export interface ExtractionTelemetry {
 	fallbackError: number;
 }
 
+/** Authoritative provider-reported usage. Token counts and cost are never estimated. */
+export interface ProviderCacheTelemetry {
+	requests: number;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalCost: number;
+}
+
 export interface StatsFile {
-	version: 2;
+	version: 3;
 	updatedAt: string;
 	/** Lifetime characters removed by optimization area. */
 	lifetime: SavingsByArea;
 	extraction: ExtractionTelemetry;
+	/** Lifetime provider-reported request, token, cache, and cost totals. */
+	cache: ProviderCacheTelemetry;
 }
 
 export const EMPTY_SAVINGS: SavingsByArea = { skills: 0, tools: 0, output: 0 };
@@ -35,9 +47,21 @@ export const EMPTY_EXTRACTION_TELEMETRY: ExtractionTelemetry = {
 	fallbackSavings: 0,
 	fallbackError: 0,
 };
+export const EMPTY_PROVIDER_CACHE_TELEMETRY: ProviderCacheTelemetry = {
+	requests: 0,
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalCost: 0,
+};
 
 function nonNeg(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function nonNegCost(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 export function normalizeSavings(value: unknown): SavingsByArea {
@@ -63,6 +87,22 @@ export function normalizeExtractionTelemetry(value: unknown): ExtractionTelemetr
 		fallbackEvidence: nonNeg(source.fallbackEvidence),
 		fallbackSavings: nonNeg(source.fallbackSavings),
 		fallbackError: nonNeg(source.fallbackError),
+	};
+}
+
+/** Read v3 cache telemetry, or return an empty snapshot for v1/v2 files. */
+export function normalizeProviderCacheTelemetry(value: unknown): ProviderCacheTelemetry {
+	const outer = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+	const source = outer.cache && typeof outer.cache === "object" && !Array.isArray(outer.cache)
+		? outer.cache as Record<string, unknown>
+		: outer;
+	return {
+		requests: nonNeg(source.requests),
+		input: nonNeg(source.input),
+		output: nonNeg(source.output),
+		cacheRead: nonNeg(source.cacheRead),
+		cacheWrite: nonNeg(source.cacheWrite),
+		totalCost: nonNegCost(source.totalCost),
 	};
 }
 
@@ -92,6 +132,17 @@ export function addExtractionTelemetry(a: ExtractionTelemetry, b: ExtractionTele
 	};
 }
 
+export function addProviderCacheTelemetry(a: ProviderCacheTelemetry, b: ProviderCacheTelemetry): ProviderCacheTelemetry {
+	return {
+		requests: a.requests + b.requests,
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+		totalCost: a.totalCost + b.totalCost,
+	};
+}
+
 export function subtractExtractionTelemetry(a: ExtractionTelemetry, b: ExtractionTelemetry): ExtractionTelemetry {
 	return {
 		attempts: Math.max(0, a.attempts - b.attempts),
@@ -99,6 +150,17 @@ export function subtractExtractionTelemetry(a: ExtractionTelemetry, b: Extractio
 		fallbackEvidence: Math.max(0, a.fallbackEvidence - b.fallbackEvidence),
 		fallbackSavings: Math.max(0, a.fallbackSavings - b.fallbackSavings),
 		fallbackError: Math.max(0, a.fallbackError - b.fallbackError),
+	};
+}
+
+export function subtractProviderCacheTelemetry(a: ProviderCacheTelemetry, b: ProviderCacheTelemetry): ProviderCacheTelemetry {
+	return {
+		requests: Math.max(0, a.requests - b.requests),
+		input: Math.max(0, a.input - b.input),
+		output: Math.max(0, a.output - b.output),
+		cacheRead: Math.max(0, a.cacheRead - b.cacheRead),
+		cacheWrite: Math.max(0, a.cacheWrite - b.cacheWrite),
+		totalCost: Math.max(0, a.totalCost - b.totalCost),
 	};
 }
 
@@ -110,6 +172,7 @@ export function toStatsFile(
 	lifetime: SavingsByArea,
 	now = Date.now(),
 	extraction: ExtractionTelemetry = EMPTY_EXTRACTION_TELEMETRY,
+	cache: ProviderCacheTelemetry = EMPTY_PROVIDER_CACHE_TELEMETRY,
 ): StatsFile {
-	return { version: 2, updatedAt: new Date(now).toISOString(), lifetime, extraction };
+	return { version: 3, updatedAt: new Date(now).toISOString(), lifetime, extraction, cache };
 }

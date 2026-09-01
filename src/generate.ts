@@ -109,12 +109,63 @@ export function parseJsonObject(text: string): unknown {
 	throw new Error("model response did not contain a JSON object");
 }
 
-/** Split `items` into consecutive groups of at most `size` (one group when `size <= 0`). */
-export function chunk<T>(items: readonly T[], size: number): T[][] {
-	if (size <= 0) return [items.slice()];
-	const out: T[][] = [];
-	for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-	return out;
+export const DEFAULT_INIT_BATCH_MAX_SKILLS = 80;
+export const DEFAULT_INIT_BATCH_MAX_UTF8_BYTES = 32 * 1_024;
+export const DEFAULT_INIT_BATCH_MAX_ATTEMPTS = 2;
+
+export interface SkillBatchLimits {
+	maxSkills: number;
+	maxUtf8Bytes: number;
+	maxAttempts?: number;
+}
+
+interface NormalizedSkillBatchLimits {
+	maxSkills: number;
+	maxUtf8Bytes: number;
+	maxAttempts: number;
+}
+
+function positiveInteger(value: number, fallback: number): number {
+	return Number.isFinite(value) && value > 0 ? Math.max(1, Math.floor(value)) : fallback;
+}
+
+function normalizeBatchLimits(value: SkillBatchLimits): NormalizedSkillBatchLimits {
+	return {
+		maxSkills: positiveInteger(value.maxSkills, DEFAULT_INIT_BATCH_MAX_SKILLS),
+		maxUtf8Bytes: positiveInteger(value.maxUtf8Bytes, DEFAULT_INIT_BATCH_MAX_UTF8_BYTES),
+		maxAttempts: positiveInteger(value.maxAttempts ?? DEFAULT_INIT_BATCH_MAX_ATTEMPTS, DEFAULT_INIT_BATCH_MAX_ATTEMPTS),
+	};
+}
+
+/** Exact UTF-8 weight of the complete skill line sent by init. */
+export function skillBatchUtf8Bytes(skill: SkillRef): number {
+	return Buffer.byteLength(`- ${skill.name}: ${skill.description}\n`, "utf8");
+}
+
+/**
+ * Deterministically partition skills in input order by both count and UTF-8
+ * weight. A single oversized skill is kept intact in its own batch.
+ */
+export function batchSkillsByWeight(
+	items: readonly SkillRef[],
+	limits: SkillBatchLimits,
+): SkillRef[][] {
+	const normalized = normalizeBatchLimits(limits);
+	const batches: SkillRef[][] = [];
+	let batch: SkillRef[] = [];
+	let bytes = 0;
+	for (const skill of items) {
+		const weight = skillBatchUtf8Bytes(skill);
+		if (batch.length > 0 && (batch.length >= normalized.maxSkills || bytes + weight > normalized.maxUtf8Bytes)) {
+			batches.push(batch);
+			batch = [];
+			bytes = 0;
+		}
+		batch.push(skill);
+		bytes += weight;
+	}
+	if (batch.length > 0) batches.push(batch);
+	return batches;
 }
 
 /** Outcome of interpreting a single batch's model response. */
@@ -131,6 +182,18 @@ function readProcessedSkills(value: unknown): string[] | undefined {
 		.filter((name): name is string => typeof name === "string")
 		.map((name) => name.trim())
 		.filter(Boolean))];
+}
+
+/** Keep only fields in the current generated-profile contract. */
+function generatedProfileFields(value: unknown): unknown {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const record = value as Record<string, unknown>;
+	return {
+		critical: record.critical,
+		queries: record.queries,
+		clusters: record.clusters,
+		negativeHints: record.negativeHints,
+	};
 }
 
 /**
@@ -160,7 +223,7 @@ export function interpretBatchResponse(response: ModelResponse): BatchResponseOu
 	if (!processedSkills || processedSkills.length === 0) {
 		return { status: "failed", reason: "omitted explicit processedSkills coverage", retryable: true };
 	}
-	return { status: "ok", profile: normalizeProfile(parsed), processedSkills };
+	return { status: "ok", profile: normalizeProfile(generatedProfileFields(parsed)), processedSkills };
 }
 
 /** Result of a batched profile generation: the merged partial plus which skills landed. */
@@ -176,7 +239,7 @@ export interface GeneratedBatchProfile {
 }
 
 /**
- * Run `runBatch` over `targetSkills` in groups of `batchSize`, merging the profiles
+ * Run `runBatch` over deterministic count- and UTF-8-bounded groups, merging the profiles
  * of the batches that succeed. `runBatch` returns the parsed+normalized profile for a
  * batch, or `undefined` if that batch failed (the caller is expected to have logged why).
  * Returns `undefined` only when *every* batch failed, so a single bad batch never loses
@@ -184,21 +247,25 @@ export interface GeneratedBatchProfile {
  */
 export async function generateProfileInBatches(
 	targetSkills: readonly SkillRef[],
-	batchSize: number,
-	runBatch: (batch: SkillRef[], index: number, total: number) => Promise<GeneratedBatchProfile | undefined>,
+	limits: SkillBatchLimits,
+	runBatch: (batch: SkillRef[], index: number, total: number, attempt: number) => Promise<GeneratedBatchProfile | undefined>,
 ): Promise<BatchGenerationResult | undefined> {
-	const batches = chunk(targetSkills, batchSize);
+	const normalizedLimits = normalizeBatchLimits(limits);
+	const batches = batchSkillsByWeight(targetSkills, normalizedLimits);
 	const partials: SkillOptimizerProfile[] = [];
 	const applied = new Set<string>();
 	for (let i = 0; i < batches.length; i++) {
 		const batch = batches[i];
-		const generated = await runBatch(batch, i, batches.length);
-		if (!generated) continue;
 		const expected = new Set(batch.map((skill) => skill.name));
-		const covered = new Set(generated.processedSkills);
-		if (covered.size !== expected.size || [...covered].some((name) => !expected.has(name))) continue;
-		partials.push(generated.profile);
-		for (const name of expected) applied.add(name);
+		for (let attempt = 1; attempt <= normalizedLimits.maxAttempts; attempt++) {
+			const generated = await runBatch(batch, i, batches.length, attempt);
+			if (!generated) continue;
+			const covered = new Set(generated.processedSkills);
+			if (covered.size !== expected.size || [...covered].some((name) => !expected.has(name))) continue;
+			partials.push(generated.profile);
+			for (const name of expected) applied.add(name);
+			break;
+		}
 	}
 	if (partials.length === 0) return undefined;
 	const partial = partials.reduce((acc, p) => mergeProfiles(acc, p), EMPTY_PROFILE);

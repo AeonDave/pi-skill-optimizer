@@ -17,6 +17,25 @@ interface RequestEnvelope {
 	contents?: unknown;
 }
 
+const TEXT_MESSAGE_ROLES = new Set(["user", "assistant"]);
+const TEXT_BLOCK_TYPES = new Set(["text", "input_text", "output_text", "message"]);
+const NON_HUMAN_BLOCK_TYPES = new Set([
+	"tool_result",
+	"tool_output",
+	"function_call",
+	"function_call_output",
+	"function_response",
+	"computer_call_output",
+	"item_reference",
+	"context",
+	"context_reference",
+]);
+
+/** Synthetic context-mode messages are transport context, not user intent. */
+function isInjectedContextText(value: string): boolean {
+	return value.trimStart().toLowerCase().startsWith("context-mode active.");
+}
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	return value !== null && typeof value === "object" ? value as Record<string, unknown> : undefined;
 }
@@ -43,21 +62,49 @@ function collectToolCalls(record: Record<string, unknown>, used: Set<string>): v
 	}
 }
 
-function collectContent(value: unknown, text: string[], used: Set<string>): void {
+function appendText(value: string, text: string[], allowText: boolean): void {
+	if (allowText && value.trim() && !isInjectedContextText(value)) text.push(value);
+}
+
+function isNonHumanContentRecord(record: Record<string, unknown>, type?: string): boolean {
+	const isToolPayload = type !== undefined && (
+		NON_HUMAN_BLOCK_TYPES.has(type)
+		|| type.endsWith("_call_output")
+		|| type.endsWith("_tool_result")
+		|| type.endsWith("_tool_output")
+	);
+	return isToolPayload
+		|| record.functionResponse !== undefined
+		|| record.function_response !== undefined
+		|| record.toolResult !== undefined
+		|| record.tool_result !== undefined;
+}
+
+function collectContent(value: unknown, text: string[], used: Set<string>, allowText: boolean): void {
 	if (typeof value === "string") {
-		text.push(value);
+		appendText(value, text, allowText);
 		return;
 	}
 	if (Array.isArray(value)) {
-		for (const item of value) collectContent(item, text, used);
+		for (const item of value) collectContent(item, text, used, allowText);
 		return;
 	}
 	const record = asRecord(value);
 	if (!record) return;
 	collectToolCalls(record, used);
-	if (typeof record.text === "string") text.push(record.text);
-	if (record.content !== undefined) collectContent(record.content, text, used);
-	if (record.parts !== undefined) collectContent(record.parts, text, used);
+
+	const type = typeof record.type === "string" ? record.type.toLowerCase() : undefined;
+	if (isNonHumanContentRecord(record, type)) return;
+
+	// Typed provider blocks are allowlisted. An untyped `{ text }` is the
+	// canonical Gemini text part; message wrappers may contain content/parts.
+	if ((type === undefined || TEXT_BLOCK_TYPES.has(type)) && typeof record.text === "string") {
+		appendText(record.text, text, allowText);
+	}
+	if (type === undefined || type === "message") {
+		if (record.content !== undefined) collectContent(record.content, text, used, allowText);
+		if (record.parts !== undefined) collectContent(record.parts, text, used, allowText);
+	}
 }
 
 function normalizeRole(value: unknown, fallback?: string): string | undefined {
@@ -89,13 +136,14 @@ function collectItem(
 	if (!record) return;
 	const fragments: string[] = [];
 	collectToolCalls(record, usedToolNames);
-	if (record.content !== undefined) collectContent(record.content, fragments, usedToolNames);
-	if (record.parts !== undefined) collectContent(record.parts, fragments, usedToolNames);
+	const role = normalizeRole(record.role, fallbackRole);
+	const allowText = role !== undefined && TEXT_MESSAGE_ROLES.has(role);
+	if (record.content !== undefined) collectContent(record.content, fragments, usedToolNames, allowText);
+	if (record.parts !== undefined) collectContent(record.parts, fragments, usedToolNames, allowText);
 	if (record.content === undefined && record.parts === undefined && typeof record.text === "string") {
-		fragments.push(record.text);
+		appendText(record.text, fragments, allowText);
 	}
 	const text = fragments.join(" ");
-	const role = normalizeRole(record.role, fallbackRole);
 	if (role && text.trim()) {
 		const sourceId = messageSourceId(record);
 		messages.push(sourceId === undefined ? { role, text } : { role, text, sourceId });
@@ -127,14 +175,111 @@ export function normalizeRequest(payload: unknown): NormalizedRequest {
 	return { messages, usedToolNames };
 }
 
-/** Build the stable first-user + latest-user ranking query from normalized history. */
+/** Build the routing query from the latest genuine human turn only. */
 export function extractRequestQuery(request: NormalizedRequest, maxChars = 2000): string {
 	if (maxChars <= 0) return "";
-	const userTexts = request.messages.filter((message) => message.role === "user").map((message) => message.text);
-	if (userTexts.length === 0) return "";
-	const first = userTexts[0];
-	const last = userTexts[userTexts.length - 1];
-	if (first === last) return first.slice(0, maxChars);
-	if (last.length + 1 >= maxChars) return last.slice(-maxChars);
-	return `${first.slice(0, maxChars - last.length - 1)}\n${last}`;
+	for (let index = request.messages.length - 1; index >= 0; index--) {
+		const message = request.messages[index];
+		if (message.role === "user" && !isInjectedContextText(message.text)) return message.text.slice(0, maxChars);
+	}
+	return "";
+}
+
+function containsMarker(value: unknown, marker: string, seen = new WeakSet<object>()): boolean {
+	if (typeof value === "string") return value.includes(marker);
+	if (!value || typeof value !== "object" || seen.has(value)) return false;
+	seen.add(value);
+	if (Array.isArray(value)) return value.some((item) => containsMarker(item, marker, seen));
+	return Object.values(value as Record<string, unknown>).some((item) => containsMarker(item, marker, seen));
+}
+
+function appendedText(value: string, appendix: string, marker?: string): string | undefined {
+	if (!value.trim() || isInjectedContextText(value) || (marker && value.includes(marker))) return undefined;
+	const addition = marker && !appendix.includes(marker) ? `${marker}\n${appendix}` : appendix;
+	return `${value}${value.endsWith("\n") ? "" : "\n"}${addition}`;
+}
+
+function appendToContent(value: unknown, appendix: string, marker?: string): unknown | undefined {
+	if (typeof value === "string") return appendedText(value, appendix, marker);
+	if (Array.isArray(value)) {
+		for (let i = value.length - 1; i >= 0; i--) {
+			const updated = appendToContent(value[i], appendix, marker);
+			if (updated === undefined) continue;
+			const next = value.slice();
+			next[i] = updated;
+			return next;
+		}
+		return undefined;
+	}
+	const record = asRecord(value);
+	if (!record) return undefined;
+	const type = typeof record.type === "string" ? record.type.toLowerCase() : undefined;
+	if (isNonHumanContentRecord(record, type)) return undefined;
+	if (type !== undefined && type !== "text" && type !== "input_text") return undefined;
+	if (typeof record.text !== "string") return undefined;
+	const text = appendedText(record.text, appendix, marker);
+	return text === undefined ? undefined : { ...record, text };
+}
+
+function appendToMessage(value: unknown, fallbackRole: string | undefined, appendix: string, marker?: string): unknown | undefined {
+	if (typeof value === "string") {
+		return fallbackRole === "user" ? appendedText(value, appendix, marker) : undefined;
+	}
+	const record = asRecord(value);
+	if (!record) return undefined;
+	const role = normalizeRole(record.role, fallbackRole);
+	if (role !== "user") return undefined;
+	const type = typeof record.type === "string" ? record.type.toLowerCase() : undefined;
+	if (isNonHumanContentRecord(record, type)) return undefined;
+	for (const key of ["parts", "content"] as const) {
+		if (record[key] === undefined) continue;
+		const updated = appendToContent(record[key], appendix, marker);
+		if (updated !== undefined) return { ...record, [key]: updated };
+	}
+	if (typeof record.text === "string") {
+		const text = appendedText(record.text, appendix, marker);
+		if (text !== undefined) return { ...record, text };
+	}
+	return undefined;
+}
+
+function appendToItems(items: readonly unknown[], fallbackRole: string | undefined, appendix: string, marker?: string): unknown[] | undefined {
+	for (let i = items.length - 1; i >= 0; i--) {
+		const updated = appendToMessage(items[i], fallbackRole, appendix, marker);
+		if (updated === undefined) continue;
+		const next = items.slice();
+		next[i] = updated;
+		return next;
+	}
+	return undefined;
+}
+
+/**
+ * Append a cache-stable overlay to the latest genuine human text across canonical
+ * Anthropic, OpenAI Chat/Responses, Gemini, and Mistral request shapes. Only the
+ * path to the target text is cloned. Tool outputs and injected context are never
+ * targets. Returns the original reference when no target exists or marker is present.
+ */
+export function appendToLatestHumanInput(payload: unknown, appendix: string, marker?: string): unknown {
+	if (!appendix || (marker && containsMarker(payload, marker))) return payload;
+	if (Array.isArray(payload)) return appendToItems(payload, undefined, appendix, marker) ?? payload;
+	const envelope = asRecord(payload);
+	if (!envelope) return payload;
+
+	if (Array.isArray(envelope.contents)) {
+		const contents = appendToItems(envelope.contents, undefined, appendix, marker);
+		if (contents) return { ...envelope, contents };
+	}
+	if (Array.isArray(envelope.input)) {
+		const input = appendToItems(envelope.input, "user", appendix, marker);
+		if (input) return { ...envelope, input };
+	} else if (typeof envelope.input === "string") {
+		const input = appendedText(envelope.input, appendix, marker);
+		if (input !== undefined) return { ...envelope, input };
+	}
+	if (Array.isArray(envelope.messages)) {
+		const messages = appendToItems(envelope.messages, undefined, appendix, marker);
+		if (messages) return { ...envelope, messages };
+	}
+	return payload;
 }

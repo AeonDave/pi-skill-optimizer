@@ -1,8 +1,8 @@
-/** Pure evaluation helpers for real, labeled skill-catalog corpora. */
+/** Pure evaluation helpers for paired baseline/auto skill-catalog corpora. */
 
 import { parseSkills, type Skill } from "./skills.ts";
 
-export type EvaluationMode = "off" | "compact" | "hybrid";
+export type EvaluationArm = "baseline" | "auto";
 export type SkillExposure = "full" | "intent" | "name-only" | "missing";
 
 export interface RequiredGroup {
@@ -41,46 +41,48 @@ export interface CoverageMetric {
 }
 
 export interface RequiredGroupMetrics {
-	full: CoverageMetric;
-	intent: CoverageMetric;
-	loadable: CoverageMetric;
-	promoted: CoverageMetric;
+	baseFull: CoverageMetric;
+	baseIntent: CoverageMetric;
+	baseLoadable: CoverageMetric;
+	overlay: CoverageMetric;
+	prefetch: CoverageMetric;
 	modelSelected: CoverageMetric | null;
-	allGroupsFull: boolean | null;
-	allGroupsIntent: boolean | null;
-	allGroupsLoadable: boolean | null;
-	allGroupsPromoted: boolean | null;
+	allGroupsBaseFull: boolean | null;
+	allGroupsBaseIntent: boolean | null;
+	allGroupsBaseLoadable: boolean | null;
+	allGroupsOverlay: boolean | null;
+	allGroupsPrefetched: boolean | null;
 	allGroupsModelSelected: boolean | null;
 }
 
-/** Counts produced by an authoritative tokenizer. No token estimate is inferred here. */
+/** Counts produced by an authoritative tokenizer. No estimate is inferred. */
 export interface ExactTokenCounts {
 	tokenizer: string;
 	before: number;
 	after: number;
 }
 
-export interface ModeEvaluationInput {
-	mode: EvaluationMode;
-	/** Catalog-bearing text before optimization. */
+export interface ArmEvaluationInput {
+	arm: EvaluationArm;
+	/** Full catalog before auto rendering. */
 	originalText: string;
-	/** The corresponding catalog-bearing text after optimization. */
-	renderedText: string;
+	/** Query-independent prompt-cache base for this arm. */
+	baseText: string;
+	/** Query-specific eager prefetch surface; empty for baseline. */
+	overlayText: string;
 	requiredGroups: readonly RequiredGroup[];
-	/** `OptimizeResult.selected`, used to measure full-promotion recall and integrity. */
-	selectedSkillNames: readonly string[];
+	/** Names selected by the prefetch planner, independently of overlay parsing. */
+	prefetchedSkillNames: readonly string[];
 	/** Downstream model skill choices, when independently observed. */
 	modelSelectedSkillNames?: readonly string[];
-	/** Original full serialized payload when byte metrics should cover more than the catalog text. */
 	originalSerializedText?: string;
-	/** Rendered full serialized payload paired with `originalSerializedText`. */
 	renderedSerializedText?: string;
-	/** True iff the first optimize call returned its original input reference. */
-	identityPreserved: boolean;
-	/** Text produced by optimizing the first result again with the same configuration. */
-	reoptimizedText: string;
-	/** True iff the second optimize call returned its first-pass input reference. */
-	reoptimizedIdentity: boolean;
+	/** True iff base rendering preserved the caller's original input identity. */
+	baseIdentityPreserved: boolean;
+	/** Base produced by applying stable rendering a second time. */
+	reoptimizedBaseText: string;
+	/** True iff the second base pass was an identity no-op. */
+	reoptimizedBaseIdentity: boolean;
 	exactTokenCounts?: ExactTokenCounts;
 }
 
@@ -95,36 +97,43 @@ export interface SafetyReport {
 	checks: SafetyCheck[];
 }
 
-export interface ModeEvaluation {
-	mode: EvaluationMode;
+export interface ArmEvaluation {
+	arm: EvaluationArm;
 	analysis: SkillStateAnalysis;
 	coverage: RequiredGroupMetrics;
-	fullCount: number;
-	intentCount: number;
-	nameOnlyCount: number;
-	missingCount: number;
+	overlaySkillNames: string[];
+	prefetchedSkillNames: string[];
+	baseFullCount: number;
+	baseIntentCount: number;
+	baseNameOnlyCount: number;
+	baseMissingCount: number;
+	overlayCount: number;
+	prefetchCount: number;
 	bytesBefore: number;
+	baseBytes: number;
+	overlayBytes: number;
 	bytesAfter: number;
 	bytesSaved: number;
 	exactTokenCounts?: ExactTokenCounts & { saved: number };
 	safety: SafetyReport;
-	renderedText: string;
+	baseText: string;
+	overlayText: string;
 }
 
 export interface EvaluationCaseInput {
 	id: string;
-	/** Stable catalog/project key used for compact cache-stability grouping. */
+	/** Stable project/catalog key used for base-cache grouping. */
 	catalogKey?: string;
 	originalText: string;
 	requiredGroups: readonly RequiredGroup[];
 	originalSerializedText?: string;
-	modes: readonly Omit<ModeEvaluationInput, "originalText" | "requiredGroups" | "originalSerializedText">[];
+	arms: readonly Omit<ArmEvaluationInput, "originalText" | "requiredGroups" | "originalSerializedText">[];
 }
 
 export interface EvaluationCaseResult {
 	id: string;
 	catalogKey: string;
-	modes: Record<EvaluationMode, ModeEvaluation>;
+	arms: Record<EvaluationArm, ArmEvaluation>;
 }
 
 export interface Distribution {
@@ -152,62 +161,65 @@ export interface ExactTokenAggregate {
 	saved: Distribution;
 }
 
-export interface ModeAggregate {
-	mode: EvaluationMode;
+export interface ArmAggregate {
+	arm: EvaluationArm;
 	samples: number;
 	bytesBefore: Distribution;
+	baseBytes: Distribution;
+	overlayBytes: Distribution;
 	bytesAfter: Distribution;
 	bytesSaved: Distribution;
-	fullCount: Distribution;
+	baseFullCount: Distribution;
+	overlayCount: Distribution;
+	prefetchCount: Distribution;
 	exactTokensByTokenizer: Record<string, ExactTokenAggregate>;
-	fullRecall: RecallAggregate;
-	intentRecall: RecallAggregate;
-	loadableRecall: RecallAggregate;
-	promotionRecall: RecallAggregate;
+	baseFullRecall: RecallAggregate;
+	baseIntentRecall: RecallAggregate;
+	baseLoadableRecall: RecallAggregate;
+	overlayRecall: RecallAggregate;
+	prefetchRecall: RecallAggregate;
 	modelSelectedRecall: RecallAggregate;
 }
 
-export interface PairedModeAggregate {
-	from: EvaluationMode;
-	to: EvaluationMode;
+export interface PairedArmAggregate {
+	from: "baseline";
+	to: "auto";
 	samples: number;
-	/** Positive means `to` retained fewer UTF-8 bytes than `from`. */
-	bytesSavedByTo: Distribution;
-	/** Positive means `to` rendered more skills full than `from`. */
-	fullCountChange: Distribution;
-	/** Token deltas are grouped so counts from different tokenizers are never mixed. */
-	exactTokensSavedByTo: Record<string, Distribution>;
+	/** Positive means auto retained fewer complete eager-request UTF-8 bytes. */
+	bytesSavedByAuto: Distribution;
+	/** Positive means auto retained fewer query-independent base bytes. */
+	baseBytesSavedByAuto: Distribution;
+	/** Query-specific bytes added by auto's eager overlay. */
+	overlayBytesAddedByAuto: Distribution;
+	exactTokensSavedByAuto: Record<string, Distribution>;
 }
 
-export interface CompactCacheStability {
-	/** Null means fewer than two cases shared a catalog, so stability was not measured. */
+export interface BaseCacheStability {
+	/** Null means fewer than two cases shared a catalog. */
 	passed: boolean | null;
 	comparedCatalogs: number;
 	unstableCatalogKeys: string[];
 }
 
 export interface EvaluationAggregate {
-	modes: Record<EvaluationMode, ModeAggregate>;
-	pairs: {
-		offToCompact: PairedModeAggregate;
-		offToHybrid: PairedModeAggregate;
-		compactToHybrid: PairedModeAggregate;
-	};
-	compactCacheStability: CompactCacheStability;
+	arms: Record<EvaluationArm, ArmAggregate>;
+	pair: PairedArmAggregate;
+	baseCacheStability: BaseCacheStability;
 	hardSafetyPassed: boolean;
-	safetyFailures: Array<{ caseId: string; mode: EvaluationMode; check: string; detail?: string }>;
+	safetyFailures: Array<{ caseId: string; arm: EvaluationArm; check: string; detail?: string }>;
 }
 
 interface ParsedBlock {
 	inner: string;
 	skills: Skill[];
 	roots: Set<string>;
+	resolverBacked: boolean;
 }
 
 const CATALOG_RE = /<available_skills>([\s\S]*?)<\/available_skills>/g;
 const PATH_NOTE_RE = /<skill_path_note>([\s\S]*?)<\/skill_path_note>/g;
 
-/** Independent benchmark oracle. These patterns intentionally do not import the runtime reducer. */
+/** Independent benchmark oracle; intentionally separate from the runtime reducer. */
 const EVALUATION_EVIDENCE_PATTERNS: readonly RegExp[] = [
 	/\b(?:error|failed|failure|fatal|panic|exception|traceback|warning|warn|denied|timed?\s*out)\b/i,
 	/^\s*(?:at\s+\S|Caused by:|File\s+["'][^"']+["'],\s+line\s+\d+)/i,
@@ -219,12 +231,11 @@ const EVALUATION_EVIDENCE_PATTERNS: readonly RegExp[] = [
 	/\b(?:[45]\d{2}|E\d{2,}|ENOENT|EACCES|EPERM|ECONNREFUSED|ETIMEDOUT)\b/,
 ];
 
-/** Collect every independently recognized evidence occurrence, without a silent cap. */
 export function collectIndependentEvidenceLines(text: string): string[] {
 	return text.split(/\r?\n/).filter((line) => EVALUATION_EVIDENCE_PATTERNS.some((pattern) => pattern.test(line)));
 }
 
-/** Strict parser for model-judge arrays. Invalid JSON and unknown labels are errors, not empty selections. */
+/** Invalid JSON and unknown labels are errors, never empty selections. */
 export function parseStrictAllowedSelection(text: string, field: string, allowed: ReadonlySet<string>): string[] {
 	let source = text.trim();
 	const fenced = source.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
@@ -253,17 +264,12 @@ export function parseStrictAllowedSelection(text: string, field: string, allowed
 
 export function descriptionIsExtractedVerbatim(original: string, rendered: string): boolean {
 	if (!rendered.trim()) return true;
-
 	const sourceWords = Array.from(original.matchAll(/[\p{L}\p{N}]+/gu), (match) => match[0]);
 	const renderedWords = Array.from(rendered.matchAll(/[\p{L}\p{N}]+/gu), (match) => {
 		const end = (match.index ?? 0) + match[0].length;
-		return {
-			value: match[0],
-			truncated: /^[^\p{L}\p{N}]*…/u.test(rendered.slice(end)),
-		};
+		return { value: match[0], truncated: /^[^\p{L}\p{N}]*…/u.test(rendered.slice(end)) };
 	});
 	if (renderedWords.length === 0) return original.trim().length > 0 && /^…+$/u.test(rendered.trim());
-
 	let sourceIndex = 0;
 	for (const word of renderedWords) {
 		while (sourceIndex < sourceWords.length) {
@@ -292,7 +298,14 @@ function parseCatalogBlocks(text: string): ParsedBlock[] {
 		inner: match[1],
 		skills: parseSkills(match[1]),
 		roots: pathRoots(match[1]),
+		resolverBacked: match[1].includes("<!--skill-optimizer:auto:v2-->"),
 	}));
+}
+
+function parseOverlaySkills(text: string): Skill[] {
+	if (!text.trim()) return [];
+	const blocks = parseCatalogBlocks(text);
+	return blocks.length > 0 ? blocks.flatMap((block) => block.skills) : parseSkills(text);
 }
 
 function derivableRoot(location: string, name: string): string | null {
@@ -313,10 +326,10 @@ function multisetEqual(left: readonly string[], right: readonly string[]): boole
 	return counts.size === 0;
 }
 
-/** Derive every original skill's rendered exposure and loadability. */
-export function deriveSkillStates(originalText: string, renderedText: string): SkillStateAnalysis {
+/** Derive every original skill's exposure and loadability in the stable base. */
+export function deriveSkillStates(originalText: string, baseText: string): SkillStateAnalysis {
 	const originalBlocks = parseCatalogBlocks(originalText);
-	const renderedBlocks = parseCatalogBlocks(renderedText);
+	const renderedBlocks = parseCatalogBlocks(baseText);
 	const states: SkillRenderState[] = [];
 	const unexpectedNames: string[] = [];
 	const originalNames = originalBlocks.flatMap((block) => block.skills.map((skill) => skill.name));
@@ -352,7 +365,8 @@ export function deriveSkillStates(originalText: string, renderedText: string): S
 			const hasExplicitLocation = !!rendered?.location;
 			const explicitLocation = hasExplicitLocation && rendered.location === original.location;
 			const locationFromNote = !hasExplicitLocation && root !== null && (renderedBlock?.roots.has(root) ?? false);
-			const loadable = !!rendered && (explicitLocation || locationFromNote);
+			const locationFromResolver = !!rendered && (renderedBlock?.resolverBacked ?? false);
+			const loadable = !!rendered && (explicitLocation || locationFromNote || locationFromResolver);
 			states.push({
 				key: `${blockIndex}:${original.name}:${occurrence}`,
 				blockIndex,
@@ -392,11 +406,11 @@ function coverageMetric(groups: readonly RequiredGroup[], covered: (name: string
 	return { covered: count, total: groups.length, recall: groups.length === 0 ? null : count / groups.length };
 }
 
-/** Evaluate multi-label requirements, including alternative skills in each group. */
 export function evaluateRequiredGroups(
 	states: readonly SkillRenderState[],
 	groups: readonly RequiredGroup[],
-	promotedSkillNames: readonly string[],
+	overlaySkillNames: readonly string[],
+	prefetchedSkillNames: readonly string[],
 	modelSelectedSkillNames?: readonly string[],
 ): RequiredGroupMetrics {
 	const byName = new Map<string, SkillRenderState[]>();
@@ -406,25 +420,28 @@ export function evaluateRequiredGroups(
 		byName.set(state.name, entries);
 	}
 	const has = (name: string, predicate: (state: SkillRenderState) => boolean): boolean => (byName.get(name) ?? []).some(predicate);
-	const full = coverageMetric(groups, (name) => has(name, (state) => state.state === "full"));
-	const intent = coverageMetric(groups, (name) => has(name, (state) => state.state === "full" || state.state === "intent"));
-	const loadable = coverageMetric(groups, (name) => has(name, (state) => state.loadable));
-	const promotedSet = new Set(promotedSkillNames);
-	const promoted = coverageMetric(groups, (name) => promotedSet.has(name));
-	const modelSelected = modelSelectedSkillNames === undefined
-		? null
-		: coverageMetric(groups, (name) => new Set(modelSelectedSkillNames).has(name));
+	const overlaySet = new Set(overlaySkillNames);
+	const prefetchSet = new Set(prefetchedSkillNames);
+	const modelSet = modelSelectedSkillNames === undefined ? undefined : new Set(modelSelectedSkillNames);
+	const baseFull = coverageMetric(groups, (name) => has(name, (state) => state.state === "full"));
+	const baseIntent = coverageMetric(groups, (name) => has(name, (state) => state.state === "full" || state.state === "intent"));
+	const baseLoadable = coverageMetric(groups, (name) => has(name, (state) => state.loadable));
+	const overlay = coverageMetric(groups, (name) => overlaySet.has(name));
+	const prefetch = coverageMetric(groups, (name) => prefetchSet.has(name));
+	const modelSelected = modelSet === undefined ? null : coverageMetric(groups, (name) => modelSet.has(name));
 	const all = (metric: CoverageMetric): boolean | null => metric.total === 0 ? null : metric.covered === metric.total;
 	return {
-		full,
-		intent,
-		loadable,
-		promoted,
+		baseFull,
+		baseIntent,
+		baseLoadable,
+		overlay,
+		prefetch,
 		modelSelected,
-		allGroupsFull: all(full),
-		allGroupsIntent: all(intent),
-		allGroupsLoadable: all(loadable),
-		allGroupsPromoted: all(promoted),
+		allGroupsBaseFull: all(baseFull),
+		allGroupsBaseIntent: all(baseIntent),
+		allGroupsBaseLoadable: all(baseLoadable),
+		allGroupsOverlay: all(overlay),
+		allGroupsPrefetched: all(prefetch),
 		allGroupsModelSelected: modelSelected ? all(modelSelected) : null,
 	};
 }
@@ -442,65 +459,100 @@ function validateExactTokens(value: ExactTokenCounts | undefined): (ExactTokenCo
 	return { ...value, saved: value.before - value.after };
 }
 
-/** Evaluate one mode artifact produced by the caller's real optimize pass. */
-export function evaluateMode(input: ModeEvaluationInput): ModeEvaluation {
+function combinedText(baseText: string, overlayText: string): string {
+	return overlayText.trim() ? `${baseText}\n\n${overlayText}` : baseText;
+}
+
+function overlayIsVerbatim(originalText: string, overlayText: string, overlaySkills: readonly Skill[]): boolean {
+	const originals = parseCatalogBlocks(originalText).flatMap((block) => block.skills);
+	const resolverBacked = overlayText.includes("<skill_prefetch");
+	return overlaySkills.every((rendered) => originals.some((original) =>
+		original.name === rendered.name
+		&& original.description === rendered.description
+		&& (original.location === rendered.location || (resolverBacked && rendered.location === ""))));
+}
+
+/** Evaluate one artifact while keeping stable-base and eager-overlay metrics separate. */
+export function evaluateArm(input: ArmEvaluationInput): ArmEvaluation {
 	if ((input.originalSerializedText === undefined) !== (input.renderedSerializedText === undefined)) {
 		throw new Error("originalSerializedText and renderedSerializedText must be provided together");
 	}
-	const analysis = deriveSkillStates(input.originalText, input.renderedText);
-	const coverage = evaluateRequiredGroups(analysis.states, input.requiredGroups, input.selectedSkillNames, input.modelSelectedSkillNames);
+	const analysis = deriveSkillStates(input.originalText, input.baseText);
+	const overlaySkills = parseOverlaySkills(input.overlayText);
+	const overlaySkillNames = overlaySkills.map((skill) => skill.name);
+	const prefetchedSkillNames = [...input.prefetchedSkillNames];
+	const coverage = evaluateRequiredGroups(
+		analysis.states,
+		input.requiredGroups,
+		overlaySkillNames,
+		prefetchedSkillNames,
+		input.modelSelectedSkillNames,
+	);
 	const stateCount = (state: SkillExposure): number => analysis.states.filter((entry) => entry.state === state).length;
-	const selectedFullVerbatim = input.selectedSkillNames.every((name) =>
-		analysis.states.some((state) => state.name === name && state.state === "full" && state.descriptionVerbatim && state.locationVerbatim));
 	const descriptionsExtractive = analysis.states
 		.filter((state) => state.state !== "missing")
 		.every((state) => state.descriptionExtractedVerbatim);
+	const overlayVerbatim = overlayIsVerbatim(input.originalText, input.overlayText, overlaySkills);
+	const overlayPrefetchIntegrity = multisetEqual(overlaySkillNames, prefetchedSkillNames);
 	const checks: SafetyCheck[] = [
-		{ name: "name-preservation", passed: analysis.namesPreserved, detail: analysis.namesPreserved ? undefined : "rendered names differ from the original multiset" },
-		{ name: "order-preservation", passed: analysis.orderPreserved, detail: analysis.orderPreserved ? undefined : "skill order changed" },
-		{ name: "full-description-verbatim", passed: selectedFullVerbatim, detail: selectedFullVerbatim ? undefined : "a selected skill is not a verbatim full render" },
-		{ name: "tail-description-extractive", passed: descriptionsExtractive, detail: descriptionsExtractive ? undefined : "a rendered description contains text not extracted verbatim and in order from the original" },
-		{ name: "loadability", passed: analysis.namesPreserved && analysis.allRetainedLoadable, detail: analysis.namesPreserved && analysis.allRetainedLoadable ? undefined : "a retained skill is missing or not loadable" },
+		{ name: "base-name-preservation", passed: analysis.namesPreserved, detail: analysis.namesPreserved ? undefined : "base names differ from the original multiset" },
+		{ name: "base-order-preservation", passed: analysis.orderPreserved, detail: analysis.orderPreserved ? undefined : "base skill order changed" },
+		{ name: "base-description-extractive", passed: descriptionsExtractive, detail: descriptionsExtractive ? undefined : "base description contains non-extractive text" },
+		{ name: "base-loadability", passed: analysis.namesPreserved && analysis.allRetainedLoadable, detail: analysis.namesPreserved && analysis.allRetainedLoadable ? undefined : "a base skill is missing or not loadable" },
+		{ name: "overlay-verbatim", passed: overlayVerbatim, detail: overlayVerbatim ? undefined : "overlay contains an unknown or rewritten skill" },
+		{ name: "overlay-prefetch-integrity", passed: overlayPrefetchIntegrity, detail: overlayPrefetchIntegrity ? undefined : "overlay names differ from the prefetch plan" },
 		{
-			name: "idempotence",
-			passed: input.reoptimizedText === input.renderedText && input.reoptimizedIdentity,
-			detail: input.reoptimizedText === input.renderedText && input.reoptimizedIdentity ? undefined : "second pass changed text or did not preserve identity",
+			name: "base-idempotence",
+			passed: input.reoptimizedBaseText === input.baseText && input.reoptimizedBaseIdentity,
+			detail: input.reoptimizedBaseText === input.baseText && input.reoptimizedBaseIdentity ? undefined : "second stable-base pass changed text or identity",
 		},
 	];
-	if (input.mode === "off") {
-		const passed = input.renderedText === input.originalText && input.identityPreserved;
-		checks.push({ name: "off-identity", passed, detail: passed ? undefined : "off mode changed text or reference identity" });
+	if (input.arm === "baseline") {
+		const passed = input.baseText === input.originalText
+			&& input.baseIdentityPreserved
+			&& input.overlayText.trim().length === 0
+			&& prefetchedSkillNames.length === 0;
+		checks.push({ name: "baseline-identity", passed, detail: passed ? undefined : "baseline changed the catalog or added prefetch content" });
 	}
 	const beforeText = input.originalSerializedText ?? input.originalText;
-	const afterText = input.renderedSerializedText ?? input.renderedText;
+	const afterText = input.renderedSerializedText ?? combinedText(input.baseText, input.overlayText);
 	const bytesBefore = utf8Bytes(beforeText);
+	const baseBytes = utf8Bytes(input.baseText);
+	const overlayBytes = utf8Bytes(input.overlayText);
 	const bytesAfter = utf8Bytes(afterText);
 	return {
-		mode: input.mode,
+		arm: input.arm,
 		analysis,
 		coverage,
-		fullCount: stateCount("full"),
-		intentCount: stateCount("intent"),
-		nameOnlyCount: stateCount("name-only"),
-		missingCount: stateCount("missing"),
+		overlaySkillNames,
+		prefetchedSkillNames,
+		baseFullCount: stateCount("full"),
+		baseIntentCount: stateCount("intent"),
+		baseNameOnlyCount: stateCount("name-only"),
+		baseMissingCount: stateCount("missing"),
+		overlayCount: overlaySkillNames.length,
+		prefetchCount: prefetchedSkillNames.length,
 		bytesBefore,
+		baseBytes,
+		overlayBytes,
 		bytesAfter,
 		bytesSaved: bytesBefore - bytesAfter,
 		...(input.exactTokenCounts ? { exactTokenCounts: validateExactTokens(input.exactTokenCounts) } : {}),
 		safety: { passed: checks.every((check) => check.passed), checks },
-		renderedText: input.renderedText,
+		baseText: input.baseText,
+		overlayText: input.overlayText,
 	};
 }
 
-/** Evaluate the required off/compact/hybrid artifacts for one labeled query. */
+/** Evaluate exactly one baseline artifact and one auto artifact. */
 export function evaluateCase(input: EvaluationCaseInput): EvaluationCaseResult {
-	const modes = new Map(input.modes.map((mode) => [mode.mode, mode]));
-	for (const mode of ["off", "compact", "hybrid"] as const) {
-		if (!modes.has(mode)) throw new Error(`evaluation case ${input.id} is missing mode ${mode}`);
+	const arms = new Map(input.arms.map((arm) => [arm.arm, arm]));
+	for (const arm of ["baseline", "auto"] as const) {
+		if (!arms.has(arm)) throw new Error(`evaluation case ${input.id} is missing arm ${arm}`);
 	}
-	const evaluate = (mode: EvaluationMode): ModeEvaluation => evaluateMode({
-		...modes.get(mode)!,
-		mode,
+	const evaluate = (arm: EvaluationArm): ArmEvaluation => evaluateArm({
+		...arms.get(arm)!,
+		arm,
 		originalText: input.originalText,
 		requiredGroups: input.requiredGroups,
 		...(input.originalSerializedText === undefined ? {} : { originalSerializedText: input.originalSerializedText }),
@@ -508,7 +560,7 @@ export function evaluateCase(input: EvaluationCaseInput): EvaluationCaseResult {
 	return {
 		id: input.id,
 		catalogKey: input.catalogKey ?? input.originalText,
-		modes: { off: evaluate("off"), compact: evaluate("compact"), hybrid: evaluate("hybrid") },
+		arms: { baseline: evaluate("baseline"), auto: evaluate("auto") },
 	};
 }
 
@@ -524,7 +576,7 @@ export function distribution(values: readonly number[]): Distribution {
 }
 
 function aggregateRecall(
-	evaluations: readonly ModeEvaluation[],
+	evaluations: readonly ArmEvaluation[],
 	metric: (coverage: RequiredGroupMetrics) => CoverageMetric | null,
 ): RecallAggregate {
 	const values = evaluations.map((evaluation) => metric(evaluation.coverage)).filter((value): value is CoverageMetric => value !== null && value.total > 0);
@@ -540,7 +592,7 @@ function aggregateRecall(
 	};
 }
 
-function aggregateMode(mode: EvaluationMode, evaluations: readonly ModeEvaluation[]): ModeAggregate {
+function aggregateArm(arm: EvaluationArm, evaluations: readonly ArmEvaluation[]): ArmAggregate {
 	const tokenGroups = new Map<string, Array<ExactTokenCounts & { saved: number }>>();
 	for (const evaluation of evaluations) {
 		const tokens = evaluation.exactTokenCounts;
@@ -559,81 +611,82 @@ function aggregateMode(mode: EvaluationMode, evaluations: readonly ModeEvaluatio
 		};
 	}
 	return {
-		mode,
+		arm,
 		samples: evaluations.length,
 		bytesBefore: distribution(evaluations.map((value) => value.bytesBefore)),
+		baseBytes: distribution(evaluations.map((value) => value.baseBytes)),
+		overlayBytes: distribution(evaluations.map((value) => value.overlayBytes)),
 		bytesAfter: distribution(evaluations.map((value) => value.bytesAfter)),
 		bytesSaved: distribution(evaluations.map((value) => value.bytesSaved)),
-		fullCount: distribution(evaluations.map((value) => value.fullCount)),
+		baseFullCount: distribution(evaluations.map((value) => value.baseFullCount)),
+		overlayCount: distribution(evaluations.map((value) => value.overlayCount)),
+		prefetchCount: distribution(evaluations.map((value) => value.prefetchCount)),
 		exactTokensByTokenizer,
-		fullRecall: aggregateRecall(evaluations, (coverage) => coverage.full),
-		intentRecall: aggregateRecall(evaluations, (coverage) => coverage.intent),
-		loadableRecall: aggregateRecall(evaluations, (coverage) => coverage.loadable),
-		promotionRecall: aggregateRecall(evaluations, (coverage) => coverage.promoted),
+		baseFullRecall: aggregateRecall(evaluations, (coverage) => coverage.baseFull),
+		baseIntentRecall: aggregateRecall(evaluations, (coverage) => coverage.baseIntent),
+		baseLoadableRecall: aggregateRecall(evaluations, (coverage) => coverage.baseLoadable),
+		overlayRecall: aggregateRecall(evaluations, (coverage) => coverage.overlay),
+		prefetchRecall: aggregateRecall(evaluations, (coverage) => coverage.prefetch),
 		modelSelectedRecall: aggregateRecall(evaluations, (coverage) => coverage.modelSelected),
 	};
 }
 
-function aggregatePair(cases: readonly EvaluationCaseResult[], from: EvaluationMode, to: EvaluationMode): PairedModeAggregate {
+function aggregatePair(cases: readonly EvaluationCaseResult[]): PairedArmAggregate {
 	const tokenDeltas = new Map<string, number[]>();
 	for (const entry of cases) {
-		const left = entry.modes[from].exactTokenCounts;
-		const right = entry.modes[to].exactTokenCounts;
-		if (!left || !right || left.tokenizer !== right.tokenizer) continue;
-		const values = tokenDeltas.get(left.tokenizer) ?? [];
-		values.push(left.after - right.after);
-		tokenDeltas.set(left.tokenizer, values);
+		const baseline = entry.arms.baseline.exactTokenCounts;
+		const auto = entry.arms.auto.exactTokenCounts;
+		if (!baseline || !auto || baseline.tokenizer !== auto.tokenizer) continue;
+		const values = tokenDeltas.get(baseline.tokenizer) ?? [];
+		values.push(baseline.after - auto.after);
+		tokenDeltas.set(baseline.tokenizer, values);
 	}
 	return {
-		from,
-		to,
+		from: "baseline",
+		to: "auto",
 		samples: cases.length,
-		bytesSavedByTo: distribution(cases.map((entry) => entry.modes[from].bytesAfter - entry.modes[to].bytesAfter)),
-		fullCountChange: distribution(cases.map((entry) => entry.modes[to].fullCount - entry.modes[from].fullCount)),
-		exactTokensSavedByTo: Object.fromEntries([...tokenDeltas].map(([tokenizer, values]) => [tokenizer, distribution(values)])),
+		bytesSavedByAuto: distribution(cases.map((entry) => entry.arms.baseline.bytesAfter - entry.arms.auto.bytesAfter)),
+		baseBytesSavedByAuto: distribution(cases.map((entry) => entry.arms.baseline.baseBytes - entry.arms.auto.baseBytes)),
+		overlayBytesAddedByAuto: distribution(cases.map((entry) => entry.arms.auto.overlayBytes - entry.arms.baseline.overlayBytes)),
+		exactTokensSavedByAuto: Object.fromEntries([...tokenDeltas].map(([tokenizer, values]) => [tokenizer, distribution(values)])),
 	};
 }
 
-/** Aggregate paired cases without mixing catalogs, examples, or tokenizer families. */
+/** Aggregate paired cases without mixing catalogs or tokenizer families. */
 export function aggregateEvaluationCases(cases: readonly EvaluationCaseResult[]): EvaluationAggregate {
-	const compactByCatalog = new Map<string, Set<string>>();
+	const autoBasesByCatalog = new Map<string, Set<string>>();
 	const catalogCounts = new Map<string, number>();
 	for (const entry of cases) {
-		const outputs = compactByCatalog.get(entry.catalogKey) ?? new Set<string>();
-		outputs.add(entry.modes.compact.renderedText);
-		compactByCatalog.set(entry.catalogKey, outputs);
+		const outputs = autoBasesByCatalog.get(entry.catalogKey) ?? new Set<string>();
+		outputs.add(entry.arms.auto.baseText);
+		autoBasesByCatalog.set(entry.catalogKey, outputs);
 		catalogCounts.set(entry.catalogKey, (catalogCounts.get(entry.catalogKey) ?? 0) + 1);
 	}
 	const comparedCatalogs = [...catalogCounts.values()].filter((count) => count > 1).length;
-	const unstableCatalogKeys = [...compactByCatalog]
+	const unstableCatalogKeys = [...autoBasesByCatalog]
 		.filter(([key, outputs]) => (catalogCounts.get(key) ?? 0) > 1 && outputs.size > 1)
 		.map(([key]) => key);
 	const safetyFailures: EvaluationAggregate["safetyFailures"] = [];
 	for (const entry of cases) {
-		for (const mode of ["off", "compact", "hybrid"] as const) {
-			for (const check of entry.modes[mode].safety.checks) {
-				if (!check.passed) safetyFailures.push({ caseId: entry.id, mode, check: check.name, ...(check.detail ? { detail: check.detail } : {}) });
+		for (const arm of ["baseline", "auto"] as const) {
+			for (const check of entry.arms[arm].safety.checks) {
+				if (!check.passed) safetyFailures.push({ caseId: entry.id, arm, check: check.name, ...(check.detail ? { detail: check.detail } : {}) });
 			}
 		}
 	}
-	const compactCacheStability = {
+	const baseCacheStability: BaseCacheStability = {
 		passed: comparedCatalogs === 0 ? null : unstableCatalogKeys.length === 0,
 		comparedCatalogs,
 		unstableCatalogKeys,
 	};
 	return {
-		modes: {
-			off: aggregateMode("off", cases.map((entry) => entry.modes.off)),
-			compact: aggregateMode("compact", cases.map((entry) => entry.modes.compact)),
-			hybrid: aggregateMode("hybrid", cases.map((entry) => entry.modes.hybrid)),
+		arms: {
+			baseline: aggregateArm("baseline", cases.map((entry) => entry.arms.baseline)),
+			auto: aggregateArm("auto", cases.map((entry) => entry.arms.auto)),
 		},
-		pairs: {
-			offToCompact: aggregatePair(cases, "off", "compact"),
-			offToHybrid: aggregatePair(cases, "off", "hybrid"),
-			compactToHybrid: aggregatePair(cases, "compact", "hybrid"),
-		},
-		compactCacheStability,
-		hardSafetyPassed: safetyFailures.length === 0 && compactCacheStability.passed !== false,
+		pair: aggregatePair(cases),
+		baseCacheStability,
+		hardSafetyPassed: safetyFailures.length === 0 && baseCacheStability.passed !== false,
 		safetyFailures,
 	};
 }

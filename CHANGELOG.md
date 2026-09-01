@@ -1,104 +1,56 @@
 # Changelog
 
-All notable changes to this project are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/) and the project adheres to
-[Semantic Versioning](https://semver.org/).
+All notable changes are documented here.
 
 ## Unreleased
 
-## 1.1.0 - 2026-07-23
+## 2.0.0 - 2026-09-01
+
+### Added
+
+- One AUTO discovery pipeline with a stable TSV `name,intent` base and request-specific full-text overlay.
+- `skill_search` for paginated search, exact load, contained resources, and validated locations.
+- Paginated `tool_search` with Pi runtime activation and bounded proactive selection.
+- `retrieve_output` for bounded recovery of locally archived full results.
+- Content-addressed SHA-256 archives with opaque identifiers and TTL cleanup.
+- Monotonic history deduplication for later exact copies of large successful results.
+- Lossless columnar JSON guarded by exact internal round trip and never-larger acceptance.
+- Persistent provider telemetry v3 for requests, input, output, cache reads, cache writes, and total cost.
+- Catalog/profile static audit through `/skill-optimizer audit`.
 
 ### Changed
-- Added a shared provider-request normalizer for query extraction, system
-  surfaces, and Anthropic/OpenAI/Gemini tool-use history.
-- Added bounded typo recovery over skill names/profile aliases and bounded
-  JSON-schema terms for tool relevance scoring.
-- Added a configurable soft full-render budget that never caps critical, pinned,
-  explicitly protected, or ambiguity-guard skill selections.
-- Hardened tool-output reduction around real UTF-8 byte limits, protected
-  evidence with context, ordered-verbatim extraction validation, minimum benefit
-  floors, and the fail-open chain `extract -> smart -> original`.
-- Added bounded usage-history pruning that preserves critical and current pins,
-  plus separate output-attempt and fallback telemetry.
-- Added an opt-in private real-corpus pipeline: one-shot pre-optimization catalog
-  capture, irreversible local redaction, observed skill-read labels, real output
-  comparison against RTK, and authoritative Luna token/cache usage.
-- Limited public skill modes to `off`, `compact`, and `hybrid`, and clarified
-  that RTK is a recommended output companion rather than a runtime prerequisite.
-- Split exact serialized-character savings from estimated token equivalents in
-  diagnostics and measurement output.
+
+- AUTO is the sole public discovery contract. Former `off`, `compact`, `hybrid`, `drop`, and `relevance` choices are removed history.
+- The stable skill base is query-independent, path-free, byte-stable, and protected by an all-name floor.
+- Ranking combines BM25F, exact and bounded fuzzy signals, reciprocal-rank fusion, usage decay, and diversity.
+- Prefetch is a bounded latest-human overlay rather than a stable-prefix mutation.
+- Tool definitions activate on demand rather than being permanently sent or heuristically removed per request.
+- Request normalization shares a human-content allowlist across Anthropic, OpenAI Chat and Responses, Gemini, and Mistral.
+- Generated profiles contain only `critical`, `queries`, `clusters`, and `negativeHints`.
+- `init` batches by full UTF-8 weight and count, validates coverage and stop reason, and retries incomplete batches without truncation.
+- RTK coexistence is per result; only shell output RTK already handled steps aside.
+- Output limits use UTF-8 bytes and guarded extraction falls back through smart processing to the original.
+- Statistics and usage use lock-serialized additive deltas and atomic replacement.
+- Cache counters come only from provider usage; stable-prefix measurements no longer imply hits.
+- Benchmark results are reserved for a reproducible AUTO run.
 
 ### Fixed
-- Hybrid no-signal requests now retain compact intent, and repeated catalog
-  optimization is an identity operation that preserves loadability notes.
-- Tool relevance now fails open without a lexical match and protects tools used
-  in canonical provider histories.
-- Incomplete `init` batches remain retryable; profile version/scope handling and
-  generated JSON parsing no longer accept partial or misclassified data.
-- Profile, usage, and statistics state uses atomic replacement, with serialized
-  delta updates for concurrent writers.
-- Corrected boolean disable parsing, zero top-K selection, compact-description
-  bounds, path-note markup, scoped clusters, alias cache invalidation, and
-  conservative usage deduplication.
-- Benchmarks now enforce exact idempotence, discovery, and loadability
-  invariants, fuzzy recovery, soft budgets, cache stability, UTF-8 safety,
-  evidence recall, and hallucination rejection; provider normalization and usage
-  behavior have dedicated tests.
 
-## 1.0.1 - 2026-07-01
+- Tool and function results, assistant content, injected context, and image metadata cannot become routing queries.
+- Provider tool-use history is normalized before protection decisions.
+- Repeated overlay markers and requests without genuine human text preserve identity.
+- Exact skill and resource loading rejects unknown names, traversal, and symlink escape.
+- Recovery text no longer exposes archive paths, and recovery verifies archive identity.
+- Incomplete generation batches are not marked processed.
+- Concurrent profile, usage, and statistics writes cannot replace newer deltas with stale snapshots.
+- Columnar JSON preserves schema order, row order, nested values, Unicode, and protected evidence.
 
-### Fixed
-- `init` on a fresh machine with a large catalog no longer crashes the extension.
-  A full generation is now split into batches of `INIT_BATCH_SIZE` (80) skills
-  instead of one oversized request that came back `stopReason: "error"` and then
-  threw `"model response did not contain a JSON object"`, leaving no profile file
-  written. Per-batch `error`/`aborted`/`length`/non-JSON responses are reported and
-  skipped; a partial profile is still written and the skills from failed batches keep
-  their hashes dropped so the next `init` retries only them.
+### Privacy
 
-### Internal
-- Extracted the fragile profile-generation helpers out of `index.ts` into a pure,
-  unit-tested `src/generate.ts` (`responseText`, `stripCodeFences`, `parseJsonObject`,
-  `chunk`, `interpretBatchResponse`, `generateProfileInBatches`) and moved the
-  failed-batch hash bookkeeping into `profile.ts` as `computeFinalHashes`. Adds
-  `test/generate.test.ts` and a `computeFinalHashes` case in `test/profile.test.ts`.
+- Real-corpus construction remains explicit and private.
+- Identifiers are keyed and irreversible; sanitization rejects paths, credentials, and user-specific data.
+- Full archives remain local and expire under `outputArchiveTtlHours`.
 
-## 1.0.0
+## Historical releases
 
-First stable release.
-
-### Skills catalog
-- `hybrid` (default): dependency-free BM25 ranking over full descriptions;
-  top-K full and a compact tail with a shared `<skill_path_note>`.
-- `compact`: keep every skill, trimmed to its intent sentence; query-independent
-  (cache-stable).
-- Adaptive top-K, `alwaysFull` allowlist, `never` denylist, usage-based pinning,
-  and `init`-generated retrieval profiles (aliases, synthetic queries, critical
-  skills, clusters, negative hints).
-- Behavioural / always-on skills are classified into `critical` at `init` time
-  (opt-in/triggered modes excluded); tail `intent` keeps the routing clause
-  ("Use when …") not just the first sentence.
-
-### Tools array (opt-in)
-- `drop` (prefixes) and `relevance` (top-K) modes; core tools and tools already
-  used in the conversation are never dropped.
-
-### Tool-output reduction (transparent, at `tool_result`)
-- `smart` (default): deterministic head/tail + error/stack/exit-line keep with
-  counted elision; full output saved to a temp file. Free, cross-OS, CRLF-safe.
-- `extract` (opt-in): query-aware "intelligent grep" via the selected model
-  (verbatim selection, errors kept, fails open to `smart`); data-dump commands
-  excluded.
-
-### Provider-agnostic & ops
-- Rewrites the catalog wherever the provider puts the system prompt: Anthropic
-  `system`, Gemini `systemInstruction`, OpenAI Responses `instructions`,
-  OpenAI/Mistral `system`/`developer` messages, and tool descriptions.
-- Granular savings telemetry (skills / tools / output, session + lifetime) in
-  `/skill-optimizer`, persisted to `stats.json`.
-- Global + project `config.json` (project wins) with env overrides; profiles and
-  usage split global vs project; incremental, hash-based `init` with version-gated
-  full regeneration.
-- Auto-coexistence with `rtk`-style extensions: output reduction auto-deactivates
-  when an `rtk`-named extension is detected (skills/tools slimming stay active);
-  override with `outputDisableWithRtk`.
+Tags before AUTO contain the original experiments. Their strategies, configuration, and measurements do not describe the current contract; consult a tag only when maintaining an older installation.

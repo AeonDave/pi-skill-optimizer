@@ -1,213 +1,141 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { computeFinalHashes, diffSkills, hashSkill, mergeIncrementalProfile, mergeProfiles, normalizeProfile, pruneProfileNames, splitProfileByScope } from "../src/profile.ts";
-import { normalizeUsageFile, recordSkillUsage, selectPinnedSkills, selectUsageRecordSkills, toUsageFile, usageRecordSignature } from "../src/usage.ts";
+import {
+	computeFinalHashes,
+	diffSkills,
+	hashSkill,
+	mergeIncrementalProfile,
+	mergeProfiles,
+	normalizeProfile,
+	pruneProfileNames,
+	splitProfileByScope,
+} from "../src/profile.ts";
 
-test("normalizeProfile accepts enhanced init output and drops malformed fields", () => {
-	const profile = normalizeProfile({
-		aliases: { APK: ["Android app", "mobile"], bad: [1, ""] },
-		critical: ["hashcat", "hashcat", ""],
-		queries: { hashcat: ["crack ntlm", "offline password recovery"], bad: [1, ""] },
-		clusters: { crypto: ["rsactftool", "openssl"] },
-		negativeHints: { tcpdump: ["python tests"] },
-	});
-	assert.deepEqual(profile.aliases.apk, ["android", "app", "mobile"]);
-	assert.deepEqual(profile.critical, ["hashcat"]);
-	assert.deepEqual(profile.queries.hashcat, ["crack ntlm", "offline password recovery"]);
-	assert.deepEqual(profile.clusters.crypto, ["rsactftool", "openssl"]);
-	assert.deepEqual(profile.negativeHints.tcpdump, ["python tests"]);
-});
-
-test("normalizeProfile does not reinterpret structured fields as legacy aliases", () => {
-	const profile = normalizeProfile({ critical: ["test-driven-development"] });
-	assert.deepEqual(profile.aliases, {});
-	assert.deepEqual(profile.critical, ["test-driven-development"]);
-});
-
-test("mergeProfiles unions aliases, critical, and name-keyed records (project extends global)", () => {
-	const global = normalizeProfile({
-		aliases: { apk: ["android"] },
-		critical: ["test-driven-development"],
-		queries: { hashcat: ["crack ntlm"] },
-		clusters: { crypto: ["openssl"] },
-		negativeHints: { tcpdump: ["python tests"] },
-	});
-	const project = normalizeProfile({
-		aliases: { apk: ["mobile"], deploy: ["release"] },
-		critical: ["my-project-skill"],
-		queries: { "my-project-skill": ["run the project pipeline"] },
-		clusters: { crypto: ["rsactftool"] },
-	});
-	const merged = mergeProfiles(global, project);
-	assert.deepEqual(merged.aliases.apk.sort(), ["android", "mobile"]);
-	assert.deepEqual(merged.aliases.deploy, ["release"]);
-	assert.deepEqual(merged.critical.sort(), ["my-project-skill", "test-driven-development"]);
-	assert.deepEqual(merged.queries["my-project-skill"], ["run the project pipeline"]);
-	assert.deepEqual(merged.clusters.crypto.sort(), ["openssl", "rsactftool"]);
-});
-
-test("splitProfileByScope routes project-skill entries to the project slice, keeps aliases global", () => {
+test("normalizeProfile keeps only name-owned routing fields and ignores legacy aliases", () => {
 	const profile = normalizeProfile({
 		aliases: { apk: ["android"] },
-		critical: ["test-driven-development", "my-project-skill"],
-		queries: { hashcat: ["crack ntlm"], "my-project-skill": ["deploy demo"] },
-		clusters: { mix: ["hashcat", "my-project-skill"] },
-		negativeHints: { "my-project-skill": ["unrelated"] },
+		critical: [" alpha ", "alpha", 42],
+		queries: { alpha: [" deploy it ", "deploy it"], empty: [], bad: "x" },
+		clusters: { release: ["alpha", " beta "] },
+		negativeHints: { beta: [" unrelated "] },
 	});
-	const { global, project } = splitProfileByScope(profile, new Set(["my-project-skill"]));
-
-	assert.deepEqual(global.aliases.apk, ["android"]);
-	assert.deepEqual(global.critical, ["test-driven-development"]);
-	assert.ok("hashcat" in global.queries);
-	assert.ok(!("my-project-skill" in global.queries));
-	assert.deepEqual(global.clusters.mix, ["hashcat"]);
-
-	assert.deepEqual(project.aliases, {});
-	assert.deepEqual(project.critical, ["my-project-skill"]);
-	assert.deepEqual(project.queries["my-project-skill"], ["deploy demo"]);
-	assert.deepEqual(project.clusters.mix, ["my-project-skill"]);
-	assert.deepEqual(project.negativeHints["my-project-skill"], ["unrelated"]);
+	assert.deepEqual(profile, {
+		critical: ["alpha"],
+		queries: { alpha: ["deploy it"] },
+		clusters: { release: ["alpha", "beta"] },
+		negativeHints: { beta: ["unrelated"] },
+	});
+	assert.ok(!("aliases" in profile));
+	assert.deepEqual(normalizeProfile({ critical: ["critical"] }).critical, ["critical"]);
 });
 
-test("splitProfileByScope preserves global skills referenced only by clusters", () => {
-	const profile = normalizeProfile({ clusters: { crypto: ["openssl", "project-crypto"] } });
-	const { global, project } = splitProfileByScope(profile, new Set(["project-crypto"]));
-	assert.deepEqual(global.clusters.crypto, ["openssl"]);
-	assert.deepEqual(project.clusters.crypto, ["project-crypto"]);
+test("hashSkill is an unambiguous SHA-256 content fingerprint", () => {
+	const hash = hashSkill("alpha", "description");
+	assert.match(hash, /^[a-f0-9]{64}$/);
+	assert.notEqual(hash, hashSkill("alpha", "description changed"));
+	assert.notEqual(hashSkill("ab", "c"), hashSkill("a", "bc"));
 });
 
-test("hashSkill is stable for same input and changes when description changes", () => {
-	const a = hashSkill("rsactftool", "RSA recovery tool.");
-	assert.equal(a, hashSkill("rsactftool", "RSA recovery tool."));
-	assert.notEqual(a, hashSkill("rsactftool", "RSA recovery tool. Updated."));
-});
-
-test("diffSkills detects new, modified, and removed skills", () => {
+test("diffSkills finds modifications, additions, and removals", () => {
 	const stored = {
-		rsactftool: hashSkill("rsactftool", "RSA recovery tool."),
-		hashcat: hashSkill("hashcat", "GPU cracking."),
+		alpha: hashSkill("alpha", "old"),
+		removed: hashSkill("removed", "gone"),
 	};
-	const current = [
-		{ name: "rsactftool", description: "RSA recovery tool." }, // unchanged
-		{ name: "hashcat", description: "GPU cracking. Now with more formats." }, // modified
-		{ name: "nmap", description: "Port scanner." }, // new
-	];
-	const { changed, removed, hashes } = diffSkills(current, stored);
-	assert.deepEqual(changed.sort(), ["hashcat", "nmap"]);
-	assert.deepEqual(removed, []);
-	assert.equal(Object.keys(hashes).length, 3);
-
-	// dropping hashcat from the catalog marks it removed
-	const { removed: removed2 } = diffSkills([{ name: "rsactftool", description: "RSA recovery tool." }], stored);
-	assert.deepEqual(removed2, ["hashcat"]);
+	const result = diffSkills([
+		{ name: "alpha", description: "new" },
+		{ name: "beta", description: "added" },
+	], stored);
+	assert.deepEqual(result.changed, ["alpha", "beta"]);
+	assert.deepEqual(result.removed, ["removed"]);
+	assert.deepEqual(Object.keys(result.hashes), ["alpha", "beta"]);
 });
 
-test("computeFinalHashes drops failed skills so they re-run, keeps the rest, and no-ops on empty", () => {
-	const hashes = { a: "h1", b: "h2", c: "h3" };
-	const pruned = computeFinalHashes(hashes, ["b"]);
-	assert.deepEqual(pruned, { a: "h1", c: "h3" });
-	assert.ok(!("b" in pruned)); // next diffSkills sees 'b' as changed -> retried
-	assert.equal(computeFinalHashes(hashes, []), hashes); // same ref when nothing failed
-	assert.deepEqual(computeFinalHashes(hashes, ["x", "y"]), hashes); // unknown names are ignored
+test("computeFinalHashes removes only failed current skills and preserves identity otherwise", () => {
+	const hashes = { alpha: "a", beta: "b" };
+	assert.deepEqual(computeFinalHashes(hashes, ["beta"]), { alpha: "a" });
+	assert.equal(computeFinalHashes(hashes, []), hashes);
+	assert.equal(computeFinalHashes(hashes, ["unknown"]), hashes);
 });
 
-test("pruneProfileNames strips removed skills from critical, queries, clusters, hints", () => {
+test("pruneProfileNames removes every reference and drops empty clusters", () => {
 	const profile = normalizeProfile({
-		aliases: { apk: ["android"] },
-		critical: ["a", "b"],
-		queries: { a: ["qa"], b: ["qb"] },
-		clusters: { topic: ["a", "b"] },
-		negativeHints: { b: ["nb"] },
+		critical: ["alpha", "beta"],
+		queries: { alpha: ["a"], beta: ["b"] },
+		clusters: { mixed: ["alpha", "beta"], alpha_only: ["alpha"] },
+		negativeHints: { alpha: ["x"], beta: ["y"] },
 	});
-	const out = pruneProfileNames(profile, ["b"]);
-	assert.deepEqual(out.critical, ["a"]);
-	assert.ok(!("b" in out.queries));
-	assert.deepEqual(out.clusters.topic, ["a"]);
-	assert.ok(!("b" in out.negativeHints));
-	assert.deepEqual(out.aliases.apk, ["android"]); // aliases left (runtime-filtered)
+	const result = pruneProfileNames(profile, ["alpha"]);
+	assert.deepEqual(result, {
+		critical: ["beta"],
+		queries: { beta: ["b"] },
+		clusters: { mixed: ["beta"] },
+		negativeHints: { beta: ["y"] },
+	});
+	assert.equal(pruneProfileNames(result, []), result);
 });
 
-test("mergeIncrementalProfile replaces changed skills and keeps the rest", () => {
+test("mergeIncrementalProfile replaces refreshed ownership and ignores batch leakage", () => {
 	const base = normalizeProfile({
-		critical: ["keep", "was"],
-		queries: { keep: ["old keep"], was: ["old was"] },
-		clusters: { old: ["keep", "was"] },
-		negativeHints: { was: ["old hint"] },
+		critical: ["keep", "changed"],
+		queries: { keep: ["old keep"], changed: ["old changed"] },
+		clusters: { old: ["keep", "changed"] },
+		negativeHints: { keep: ["keep hint"], changed: ["old hint"] },
 	});
 	const partial = normalizeProfile({
-		critical: [], // 'was' is changed and the model no longer marks it critical
-		queries: { was: ["new was"], unexpected: ["must not leak"] },
-		clusters: { fresh: ["was"], unexpected: ["other"] },
-		negativeHints: { unexpected: ["must not leak"] },
+		critical: ["changed", "leaked"],
+		queries: { changed: ["new changed"], leaked: ["must not appear"] },
+		clusters: { fresh: ["changed", "leaked"] },
+		negativeHints: { changed: ["new hint"], leaked: ["must not appear"] },
 	});
-	const out = mergeIncrementalProfile(base, partial, ["was"]);
-	assert.deepEqual(out.queries.keep, ["old keep"]); // unchanged kept
-	assert.deepEqual(out.queries.was, ["new was"]); // changed replaced
-	assert.ok(out.critical.includes("keep")); // unchanged critical kept
-	assert.ok(!out.critical.includes("was")); // changed skill demoted per partial
-	assert.ok(!("was" in out.negativeHints)); // changed skill's stale hint dropped (none in partial)
-	assert.deepEqual(out.clusters.old, ["keep"]); // stale membership for changed skill removed
-	assert.deepEqual(out.clusters.fresh, ["was"]); // replacement membership accepted
-	assert.ok(!("unexpected" in out.queries));
-	assert.ok(!("unexpected" in out.clusters));
-	assert.ok(!("unexpected" in out.negativeHints));
+	const result = mergeIncrementalProfile(base, partial, ["changed"]);
+	assert.deepEqual(result, {
+		critical: ["keep", "changed"],
+		queries: { keep: ["old keep"], changed: ["new changed"] },
+		clusters: { old: ["keep"], fresh: ["changed"] },
+		negativeHints: { keep: ["keep hint"], changed: ["new hint"] },
+	});
+	assert.equal(mergeIncrementalProfile(base, partial, []), base);
 });
 
-test("usage stats record and select pinned skills by frequency plus recency", () => {
-	let stats = normalizeUsageFile(undefined);
-	stats = recordSkillUsage(stats, ["hashcat", "rsactftool"], 1_000_000);
-	stats = recordSkillUsage(stats, ["hashcat"], 2_000_000);
-	assert.equal(stats.hashcat.count, 2);
-	assert.equal(stats.rsactftool.count, 1);
-	const file = toUsageFile(stats, 2_000_000);
-	assert.equal(file.version, 1);
-	assert.deepEqual(normalizeUsageFile(file), stats);
-	assert.deepEqual(selectPinnedSkills(stats, 1, 2_000_000), ["hashcat"]);
+test("mergeProfiles unions global and project routing evidence deterministically", () => {
+	const base = normalizeProfile({
+		critical: ["alpha"],
+		queries: { alpha: ["one"] },
+		clusters: { family: ["alpha"] },
+		negativeHints: { alpha: ["avoid"] },
+	});
+	const override = normalizeProfile({
+		critical: ["beta"],
+		queries: { alpha: ["two"], beta: ["three"] },
+		clusters: { family: ["beta"] },
+		negativeHints: { alpha: ["skip"] },
+	});
+	assert.deepEqual(mergeProfiles(base, override), {
+		critical: ["alpha", "beta"],
+		queries: { alpha: ["one", "two"], beta: ["three"] },
+		clusters: { family: ["alpha", "beta"] },
+		negativeHints: { alpha: ["avoid", "skip"] },
+	});
 });
 
-test("usage recording keeps only explicit mentions or real skill tool uses", () => {
-	const selected = ["source-review-technique", "test-driven-development", "ctx-search"];
-	const messages = [
-		{
-			role: "user",
-			content: "Use source-review-technique for this review.",
-		},
-		{
-			role: "assistant",
-			content: [
-				{
-					type: "tool_use",
-					name: "Skill",
-					input: { skill: "test-driven-development" },
-				},
-			],
-		},
-	];
-	assert.deepEqual(selectUsageRecordSkills(messages, selected), ["source-review-technique", "test-driven-development"]);
-});
-
-test("usage recording ignores merely ranked skills", () => {
-	const selected = ["source-review-technique", "test-driven-development", "ctx-search"];
-	const messages = [{ role: "user", content: "Review this TypeScript code for security issues." }];
-	assert.deepEqual(selectUsageRecordSkills(messages, selected), []);
-});
-
-test("usage recording ignores injected context-mode messages", () => {
-	const selected = ["context-mode", "source-review-technique"];
-	const messages = [
-		{ role: "user", content: "Use source-review-technique for this review." },
-		{ role: "user", content: "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute." },
-	];
-	assert.deepEqual(selectUsageRecordSkills(messages, selected), ["source-review-technique"]);
-});
-
-test("usage signatures are stable across repeated tool-loop requests", () => {
-	const selected = ["source-review-technique", "test-driven-development"];
-	const first = [{ role: "user", content: "Use source-review-technique and test-driven-development." }];
-	const later = [
-		...first,
-		{ role: "assistant", content: [{ type: "tool_use", name: "Read", input: { path: "src/skills.ts" } }] },
-		{ role: "user", content: [{ type: "tool_result", content: "file contents" }] },
-	];
-	assert.equal(usageRecordSignature(first, selected), usageRecordSignature(later, selected));
+test("splitProfileByScope preserves skills referenced only by clusters", () => {
+	const profile = normalizeProfile({
+		critical: ["global", "project"],
+		queries: { global: ["g"], project: ["p"] },
+		clusters: { mixed: ["global", "project"], only_cluster: ["orphan"] },
+		negativeHints: { global: ["x"], project: ["y"] },
+	});
+	const { global, project } = splitProfileByScope(profile, new Set(["project"]));
+	assert.deepEqual(global, {
+		critical: ["global"],
+		queries: { global: ["g"] },
+		clusters: { mixed: ["global"], only_cluster: ["orphan"] },
+		negativeHints: { global: ["x"] },
+	});
+	assert.deepEqual(project, {
+		critical: ["project"],
+		queries: { project: ["p"] },
+		clusters: { mixed: ["project"] },
+		negativeHints: { project: ["y"] },
+	});
 });

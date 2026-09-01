@@ -4,10 +4,13 @@
  *   npm run bench:output
  */
 import {
+	decodeColumnarJson,
 	hasMinimumSavings,
 	protectedEvidenceLines,
 	truncateUtf8Bytes,
 	utf8ByteLength,
+	reduceJsonArrayColumnar,
+	shouldReduceToolResult,
 	validateExtractedOutput,
 } from "../src/output.ts";
 
@@ -74,10 +77,20 @@ const unicodeSafe = utf8ByteLength(clipped) <= 10
 const materialSavings = hasMinimumSavings(accepted.fromBytes, accepted.toBytes, 512, 0.1);
 const deterministic = JSON.stringify(accepted) === JSON.stringify(validateExtractedOutput(original, extracted, options));
 const savedPct = Math.round((100 * (accepted.fromBytes - accepted.toBytes)) / accepted.fromBytes);
+const jsonRows = Array.from({ length: 500 }, (_, index) => ({ id: index, state: "ready", group: index % 5 }));
+const columnar = reduceJsonArrayColumnar(JSON.stringify(jsonRows, null, 2));
+const columnarSafe = columnar.reduced
+	&& columnar.toBytes < columnar.fromBytes
+	&& JSON.stringify(decodeColumnarJson(columnar.text)) === JSON.stringify(jsonRows);
+const rtkPerResult = shouldReduceToolResult({ toolName: "bash", outputTools: ["*"] })
+	&& !shouldReduceToolResult({ toolName: "bash", outputTools: ["*"], rtkHandled: true })
+	&& shouldReduceToolResult({ toolName: "read", outputTools: ["*"] })
+	&& shouldReduceToolResult({ toolName: "mcp__server__query", outputTools: ["mcp__*"] });
 
 console.log(`synthetic output: ${lines.length} lines, ${accepted.fromBytes} UTF-8 bytes`);
 console.log(`accepted: strategy=${accepted.strategy}, saved=${savedPct}%, evidenceRecall=${evidenceRecall}%`);
 console.log(`guards: hallucination=${hallucinated.rejectionReason}, reorder=${reordered.rejectionReason}, unicodeSafe=${unicodeSafe}, deterministic=${deterministic}`);
+console.log(`columnar: reduced=${columnar.reduced}, roundTrip=${columnarSafe}; rtkPerResult=${rtkPerResult}`);
 
 const invariantFailure = accepted.strategy !== "extract"
 	|| evidenceRecall !== 100
@@ -87,5 +100,7 @@ const invariantFailure = accepted.strategy !== "extract"
 	|| reordered.rejectionReason !== "out-of-order-line"
 	|| reordered.strategy === "extract"
 	|| !unicodeSafe
-	|| !deterministic;
+	|| !deterministic
+	|| !columnarSafe
+	|| !rtkPerResult;
 if (invariantFailure) process.exitCode = 1;

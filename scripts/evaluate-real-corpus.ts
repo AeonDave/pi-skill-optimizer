@@ -1,4 +1,4 @@
-/** Real paired benchmark for off/compact/hybrid and raw/smart/extract/RTK. */
+/** Real paired benchmark for baseline/auto skills and raw/smart/extract/RTK output. */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -13,18 +13,21 @@ import {
 	aggregateEvaluationCases,
 	evaluateCase,
 	parseStrictAllowedSelection,
+	type EvaluationArm,
 	type EvaluationCaseResult,
-	type EvaluationMode,
 } from "../src/evaluation.ts";
-import { optimize, type OptimizeConfig } from "../src/optimize.ts";
 import { buildExtractPrompt, reduceOutput, utf8ByteLength, validateExtractedOutput } from "../src/output.ts";
 import { normalizeProfile, type SkillOptimizerProfile } from "../src/profile.ts";
+import {
+	optimizeSkillCatalog,
+	renderSkillPrefetch,
+	renderStableSkillCatalog,
+	type SkillPrefetchPlan,
+} from "../src/skills.ts";
 import { runLuna, type LunaResult } from "./lib/luna.ts";
 
 interface RuntimeSnapshot {
 	profile: SkillOptimizerProfile;
-	pinnedSkills: string[];
-	config: OptimizeConfig;
 }
 
 interface ModelArtifact {
@@ -40,28 +43,30 @@ interface ModelCallResult {
 	source: ModelResultSource;
 }
 
-interface OptimizeArtifact {
-	mode: EvaluationMode;
-	renderedText: string;
+interface SkillArtifact {
+	arm: EvaluationArm;
+	baseText: string;
+	overlayText: string;
 	renderedSerialized: string;
-	selected: string[];
-	identity: boolean;
-	reoptimizedText: string;
-	reoptimizedIdentity: boolean;
+	prefetched: string[];
+	baseIdentity: boolean;
+	reoptimizedBaseText: string;
+	reoptimizedBaseIdentity: boolean;
+	prefetchMeta?: Pick<SkillPrefetchPlan, "hasSignal" | "confidence" | "marginalChars" | "skippedForBudget">;
 	model: ModelArtifact;
 }
 
 interface CachedModelResults {
-	version: 2;
+	version: 3;
 	results: Record<string, LunaResult>;
 }
 
 const DEFAULT_DIR = resolve(".pi", "skill-optimizer", "benchmark");
 const MODEL = "openai-codex/gpt-5.6-luna";
 const TOKEN_SCOPE = `${MODEL}:anonymized-corpus-evaluator-input`;
-const MODEL_CACHE_REVISION = "real-evaluator-v2";
-const MODEL_THINKING = "off" as const;
-const MODES: readonly EvaluationMode[] = ["off", "compact", "hybrid"];
+const MODEL_CACHE_REVISION = "real-evaluator-v3";
+const MODEL_THINKING = "low" as const;
+const ARMS: readonly EvaluationArm[] = ["baseline", "auto"];
 const SMART_OPTIONS = {
 	maxLines: 80,
 	maxBytes: 8_000,
@@ -92,25 +97,23 @@ function positiveIntArg(name: string, fallback: number): number {
 	return value;
 }
 
-function systemText(payload: unknown): string {
-	if (!payload || typeof payload !== "object") return "";
-	const system = (payload as { system?: unknown }).system;
-	if (typeof system === "string") return system;
-	if (Array.isArray(system)) return system.map((part) => typeof part === "string" ? part : typeof part?.text === "string" ? part.text : "").join("\n");
-	return "";
+function joinBaseAndOverlay(base: string, overlay: string): string {
+	return overlay.trim() ? `${base}\n\n${overlay}` : base;
 }
 
 function cacheKey(systemPrompt: string, userPrompt: string): string {
-	return createHash("sha256").update(`${MODEL_CACHE_REVISION}\0${MODEL}\0${MODEL_THINKING}\0${systemPrompt}\0${userPrompt}`, "utf8").digest("hex");
+	return createHash("sha256")
+		.update(`${MODEL_CACHE_REVISION}\0${MODEL}\0${MODEL_THINKING}\0${systemPrompt}\0${userPrompt}`, "utf8")
+		.digest("hex");
 }
 
 function loadCache(path: string): CachedModelResults {
-	if (!existsSync(path)) return { version: 2, results: {} };
+	if (!existsSync(path)) return { version: 3, results: {} };
 	try {
 		const value = readJson<CachedModelResults>(path);
-		return value.version === 2 && value.results && typeof value.results === "object" ? value : { version: 2, results: {} };
+		return value.version === 3 && value.results && typeof value.results === "object" ? value : { version: 3, results: {} };
 	} catch {
-		return { version: 2, results: {} };
+		return { version: 3, results: {} };
 	}
 }
 
@@ -147,7 +150,7 @@ function rtkVersion(): string {
 }
 
 function exactLinePatterns(lines: readonly string[]): RegExp[] {
-	return lines.map((line) => new RegExp(`^${line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`));
+	return lines.map((line) => new RegExp(`^${line.replace(/[.*+?^{}$()|[\]\\]/g, "\\$&")}$`));
 }
 
 async function main(): Promise<void> {
@@ -162,7 +165,7 @@ async function main(): Promise<void> {
 	runtime.profile = normalizeProfile(runtime.profile);
 
 	const cachePath = join(directory, "model-cache.json");
-	const cache = resumeModelCache ? loadCache(cachePath) : { version: 2 as const, results: {} };
+	const cache = resumeModelCache ? loadCache(cachePath) : { version: 3 as const, results: {} };
 	let freshProviderCalls = 0;
 	let resumeCacheHits = 0;
 	let invalidJudgeRetries = 0;
@@ -170,12 +173,18 @@ async function main(): Promise<void> {
 		const key = cacheKey(systemPrompt, userPrompt);
 		const found = resumeModelCache && !bypassResume ? cache.results[key] : undefined;
 		if (found) {
-			resumeCacheHits++;
+			resumeCacheHits += 1;
 			return { result: found, source: "resume-cache" };
 		}
-		freshProviderCalls++;
+		freshProviderCalls += 1;
 		process.stderr.write(`Luna call ${freshProviderCalls}: ${Math.round(utf8ByteLength(systemPrompt + userPrompt) / 1024)} KiB prompt\n`);
-		const result = await runLuna({ systemPrompt, userPrompt, thinking: MODEL_THINKING, timeoutMs: 600_000, cwd: process.cwd() });
+		const result = await runLuna({
+			systemPrompt,
+			userPrompt,
+			thinking: MODEL_THINKING,
+			timeoutMs: 600_000,
+			cwd: process.cwd(),
+		});
 		if (resumeModelCache) {
 			cache.results[key] = result;
 			atomicJson(cachePath, cache);
@@ -195,7 +204,7 @@ async function main(): Promise<void> {
 				return { value: parse(call.result.text), call };
 			} catch (error) {
 				lastError = error;
-				invalidJudgeRetries++;
+				invalidJudgeRetries += 1;
 				if (resumeModelCache) {
 					delete cache.results[cacheKey(systemPrompt, userPrompt)];
 					atomicJson(cachePath, cache);
@@ -211,74 +220,99 @@ async function main(): Promise<void> {
 	const originalText = renderAvailableSkills(catalog.skills);
 	const cases = corpus.skillExamples.slice(0, skillLimit);
 	if (cases.length === 0) throw new Error("corpus contains no observed skill examples");
-	const artifacts = new Map<string, Map<EvaluationMode, OptimizeArtifact>>();
+	const artifacts = new Map<string, Map<EvaluationArm, SkillArtifact>>();
 	const selectionInstruction = [
 		"You are evaluating skill discovery against an anonymized real catalog.",
-		"Choose every skill that should be loaded at any stage to complete TASK, including workflow and verification support. Use exact catalog names and avoid irrelevant skills.",
-		"Return only JSON in this form: {\"skills\":[\"name\"]}. Use an empty array when none applies.",
+		"Choose every skill that should be loaded at any stage to complete TASK, including workflow and verification support.",
+		"Use exact catalog names, avoid irrelevant skills, and return only JSON: {\"skills\":[\"name\"]}.",
 	].join("\n");
 
-	for (const mode of MODES) {
-		for (let index = 0; index < cases.length; index++) {
-			const example = cases[index];
-			const payload = { system: originalText, messages: [{ role: "user", content: example.query }] };
-			const config: OptimizeConfig = {
-				...runtime.config,
-				mode,
-				toolsMode: "off",
-				profile: runtime.profile,
-				pinnedSkills: runtime.pinnedSkills,
-			};
-			const first = optimize(payload, config);
-			const renderedText = systemText(first.next);
-			const second = optimize(first.next, config);
-			const reoptimizedText = systemText(second.next);
-			const systemPrompt = `${selectionInstruction}\n\n${renderedText}`;
+	for (const arm of ARMS) {
+		for (const example of cases) {
+			let baseText: string;
+			let overlayText: string;
+			let prefetched: string[];
+			let baseIdentity: boolean;
+			let reoptimizedBaseText: string;
+			let reoptimizedBaseIdentity: boolean;
+			let prefetchMeta: SkillArtifact["prefetchMeta"];
+			if (arm === "baseline") {
+				baseText = originalText;
+				overlayText = "";
+				prefetched = [];
+				baseIdentity = true;
+				reoptimizedBaseText = originalText;
+				reoptimizedBaseIdentity = true;
+			} else {
+				const first = optimizeSkillCatalog(originalText, example.query, { profile: runtime.profile });
+				const second = renderStableSkillCatalog(first.text);
+				baseText = first.text;
+				overlayText = renderSkillPrefetch(first.plan);
+				prefetched = [...first.plan.selectedNames];
+				baseIdentity = first.text === originalText && first.removedChars === 0;
+				reoptimizedBaseText = second.text;
+				reoptimizedBaseIdentity = second.text === first.text && second.removedChars === 0;
+				prefetchMeta = {
+					hasSignal: first.plan.hasSignal,
+					confidence: first.plan.confidence,
+					marginalChars: first.plan.marginalChars,
+					skippedForBudget: first.plan.skippedForBudget,
+				};
+			}
+			const combined = joinBaseAndOverlay(baseText, overlayText);
+			const systemPrompt = `${selectionInstruction}\n\n${combined}`;
 			const userPrompt = `TASK:\n${example.query}`;
 			const parsedModel = await callParsedModel(
 				systemPrompt,
 				userPrompt,
-				`skill selection for ${example.id}/${mode}`,
+				`skill selection for ${example.id}/${arm}`,
 				(text) => parseStrictAllowedSelection(text, "skills", allowedNames),
 			);
-			const modes = artifacts.get(example.id) ?? new Map<EvaluationMode, OptimizeArtifact>();
-			modes.set(mode, {
-				mode,
-				renderedText,
-				renderedSerialized: JSON.stringify(first.next),
-				selected: first.selected,
-				identity: first.next === payload,
-				reoptimizedText,
-				reoptimizedIdentity: second.next === first.next,
+			const byArm = artifacts.get(example.id) ?? new Map<EvaluationArm, SkillArtifact>();
+			byArm.set(arm, {
+				arm,
+				baseText,
+				overlayText,
+				renderedSerialized: JSON.stringify({ system: combined, messages: [{ role: "user", content: example.query }] }),
+				prefetched,
+				baseIdentity,
+				reoptimizedBaseText,
+				reoptimizedBaseIdentity,
+				...(prefetchMeta ? { prefetchMeta } : {}),
 				model: { selected: parsedModel.value, result: parsedModel.call.result, source: parsedModel.call.source },
 			});
-			artifacts.set(example.id, modes);
+			artifacts.set(example.id, byArm);
 		}
 	}
 
 	const evaluatedCases: EvaluationCaseResult[] = cases.map((example) => {
-		const modes = artifacts.get(example.id)!;
-		const baselineArtifact = modes.get("off")!;
+		const byArm = artifacts.get(example.id)!;
+		const baselineArtifact = byArm.get("baseline")!;
 		return evaluateCase({
 			id: example.id,
 			catalogKey: catalog.id,
 			originalText,
 			originalSerializedText: JSON.stringify({ system: originalText, messages: [{ role: "user", content: example.query }] }),
 			requiredGroups: example.relevantSkillNames.map((name) => ({ anyOf: [name] })),
-			modes: MODES.map((mode) => {
-				const artifact = modes.get(mode)!;
+			arms: ARMS.map((arm) => {
+				const artifact = byArm.get(arm)!;
 				const exactTokenCounts = baselineArtifact.model.source === "fresh-provider" && artifact.model.source === "fresh-provider"
-					? { tokenizer: TOKEN_SCOPE, before: baselineArtifact.model.result.usage.inputTokens, after: artifact.model.result.usage.inputTokens }
+					? {
+						tokenizer: TOKEN_SCOPE,
+						before: baselineArtifact.model.result.usage.inputTokens,
+						after: artifact.model.result.usage.inputTokens,
+					}
 					: undefined;
 				return {
-					mode,
-					renderedText: artifact.renderedText,
+					arm,
+					baseText: artifact.baseText,
+					overlayText: artifact.overlayText,
 					renderedSerializedText: artifact.renderedSerialized,
-					selectedSkillNames: artifact.selected,
+					prefetchedSkillNames: artifact.prefetched,
 					modelSelectedSkillNames: artifact.model.selected,
-					identityPreserved: artifact.identity,
-					reoptimizedText: artifact.reoptimizedText,
-					reoptimizedIdentity: artifact.reoptimizedIdentity,
+					baseIdentityPreserved: artifact.baseIdentity,
+					reoptimizedBaseText: artifact.reoptimizedBaseText,
+					reoptimizedBaseIdentity: artifact.reoptimizedBaseIdentity,
 					...(exactTokenCounts ? { exactTokenCounts } : {}),
 				};
 			}),
@@ -286,21 +320,25 @@ async function main(): Promise<void> {
 	});
 	const skillAggregate = aggregateEvaluationCases(evaluatedCases);
 
-	const skillModeSummary = Object.fromEntries(MODES.map((mode) => {
-		const modeArtifacts = cases.map((example) => artifacts.get(example.id)!.get(mode)!);
-		const freshArtifacts = modeArtifacts.filter((artifact) => artifact.model.source === "fresh-provider");
-		return [mode, {
+	const skillArmSummary = Object.fromEntries(ARMS.map((arm) => {
+		const armArtifacts = cases.map((example) => artifacts.get(example.id)!.get(arm)!);
+		const freshArtifacts = armArtifacts.filter((artifact) => artifact.model.source === "fresh-provider");
+		return [arm, {
 			freshProviderSamples: freshArtifacts.length,
-			resumeCacheSamples: modeArtifacts.length - freshArtifacts.length,
-			anonymizedCorpusInputTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.inputTokens)),
-			currentRunCacheReadTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.cacheReadTokens)),
-			currentRunCacheWriteTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.cacheWriteTokens)),
-			currentRunOutputTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.outputTokens)),
-			modelRecall: skillAggregate.modes[mode].modelSelectedRecall,
-			modelAnyHitRate: average(cases.map((example) => example.relevantSkillNames.some((name) => artifacts.get(example.id)!.get(mode)!.model.selected.includes(name)) ? 1 : 0)),
-			fullExposureRecall: skillAggregate.modes[mode].fullRecall,
-			intentExposureRecall: skillAggregate.modes[mode].intentRecall,
-			anonymizedCorpusBytesAfterMean: skillAggregate.modes[mode].bytesAfter.mean,
+			resumeCacheSamples: armArtifacts.length - freshArtifacts.length,
+			providerInputTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.inputTokens)),
+			providerCacheReadTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.cacheReadTokens)),
+			providerCacheWriteTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.cacheWriteTokens)),
+			providerOutputTokensMean: averageOrNull(freshArtifacts.map((artifact) => artifact.model.result.usage.outputTokens)),
+			modelRecall: skillAggregate.arms[arm].modelSelectedRecall,
+			modelAnyHitRate: average(cases.map((example) =>
+				example.relevantSkillNames.some((name) => artifacts.get(example.id)!.get(arm)!.model.selected.includes(name)) ? 1 : 0)),
+			baseIntentRecall: skillAggregate.arms[arm].baseIntentRecall,
+			overlayRecall: skillAggregate.arms[arm].overlayRecall,
+			prefetchRecall: skillAggregate.arms[arm].prefetchRecall,
+			baseBytesMean: skillAggregate.arms[arm].baseBytes.mean,
+			overlayBytesMean: skillAggregate.arms[arm].overlayBytes.mean,
+			eagerRequestBytesMean: skillAggregate.arms[arm].bytesAfter.mean,
 		}];
 	}));
 
@@ -370,16 +408,25 @@ async function main(): Promise<void> {
 	const caseSummaries = evaluatedCases.map((entry) => ({
 		id: entry.id,
 		expectedSkillNames: cases.find((example) => example.id === entry.id)?.relevantSkillNames ?? [],
-		modes: Object.fromEntries(MODES.map((mode) => [mode, {
-			promoted: artifacts.get(entry.id)!.get(mode)!.selected,
-			modelSelected: artifacts.get(entry.id)!.get(mode)!.model.selected,
-			fullRecall: entry.modes[mode].coverage.full.recall,
-			modelRecall: entry.modes[mode].coverage.modelSelected?.recall ?? null,
-			bytesAfter: entry.modes[mode].bytesAfter,
-			inputTokens: entry.modes[mode].exactTokenCounts?.after,
-			cacheReadTokens: artifacts.get(entry.id)!.get(mode)!.model.result.usage.cacheReadTokens,
-			safetyPassed: entry.modes[mode].safety.passed,
-		}])),
+		arms: Object.fromEntries(ARMS.map((arm) => {
+			const artifact = artifacts.get(entry.id)!.get(arm)!;
+			const evaluated = entry.arms[arm];
+			return [arm, {
+				prefetched: artifact.prefetched,
+				modelSelected: artifact.model.selected,
+				baseIntentRecall: evaluated.coverage.baseIntent.recall,
+				overlayRecall: evaluated.coverage.overlay.recall,
+				prefetchRecall: evaluated.coverage.prefetch.recall,
+				modelRecall: evaluated.coverage.modelSelected?.recall ?? null,
+				baseBytes: evaluated.baseBytes,
+				overlayBytes: evaluated.overlayBytes,
+				eagerBytes: evaluated.bytesAfter,
+				inputTokens: evaluated.exactTokenCounts?.after,
+				cacheReadTokens: artifact.model.result.usage.cacheReadTokens,
+				prefetchMeta: artifact.prefetchMeta,
+				safetyPassed: evaluated.safety.passed,
+			}];
+		})),
 	}));
 	const projectOutputSafetyPassed = outputReports.every((entry) => ["smart", "extract"].every((name) => {
 		const variant = entry.variants[name] as { evidenceComplete?: boolean };
@@ -393,38 +440,60 @@ async function main(): Promise<void> {
 		: rtkSafetyMeasurements.every((variant) => variant.evidenceComplete === true && variant.semanticEvidenceRecall === 1);
 	const projectSafetyPassed = skillAggregate.hardSafetyPassed && projectOutputSafetyPassed;
 	const report = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		createdAt: new Date().toISOString(),
 		model: `${MODEL}:${MODEL_THINKING}`,
 		rtkVersion: rtkVersion(),
 		measurementScope: {
-			tokens: "actual provider usage for fresh anonymized-corpus evaluator requests; not production payload token counts",
-			outputJudgeTokens: "actual full fixed-judge-input tokens, including instructions and reference facts; not candidate-only tokens",
-			bytes: "UTF-8 bytes of the anonymized corpus artifacts",
+			tokens: "actual provider usage for fresh anonymized-corpus evaluator requests",
+			skillSurfaces: "query-independent base and query-specific eager prefetch overlay are measured separately",
+			outputJudgeTokens: "complete fixed judge prompts, not candidate-only token counts",
+			bytes: "UTF-8 bytes of anonymized corpus artifacts",
 		},
-		corpus: { catalogId: catalog.id, skills: catalog.skills.length, skillCases: cases.length, outputCases: outputReports.length },
+		corpus: {
+			catalogId: catalog.id,
+			skills: catalog.skills.length,
+			skillCases: cases.length,
+			outputCases: outputReports.length,
+		},
 		modelExecution: { resumeEnabled: resumeModelCache, freshProviderCalls, resumeCacheHits, invalidJudgeRetries },
-		skillModeSummary,
+		skillArmSummary,
 		skillAggregate,
 		skillCases: caseSummaries,
 		outputCases: outputReports,
-		projectSafety: { passed: projectSafetyPassed, skillSafetyPassed: skillAggregate.hardSafetyPassed, outputSafetyPassed: projectOutputSafetyPassed },
+		projectSafety: {
+			passed: projectSafetyPassed,
+			skillSafetyPassed: skillAggregate.hardSafetyPassed,
+			outputSafetyPassed: projectOutputSafetyPassed,
+		},
 		rtkExternalSafety: { passed: rtkExternalSafetyPassed, evaluatedCases: rtkSafetyMeasurements.length },
 	};
 	atomicJson(join(directory, "real-report.json"), report);
 
 	console.log(`\nreal skill benchmark: ${cases.length} observed cases, ${catalog.skills.length} catalog skills`);
-	console.log("mode     | anon input tok | fresh/cache | model recall | any hit | full exposure | anon bytes");
-	console.log("---------|----------------|-------------|--------------|---------|---------------|-----------");
-	for (const mode of MODES) {
-		const summary = skillModeSummary[mode] as typeof skillModeSummary[string];
-		const inputTokens = summary.anonymizedCorpusInputTokensMean === null ? "n/a" : Math.round(summary.anonymizedCorpusInputTokensMean).toString();
-		console.log(`${mode.padEnd(8)} | ${inputTokens.padStart(14)} | ${`${summary.freshProviderSamples}/${summary.resumeCacheSamples}`.padStart(11)} | ${percent(summary.modelRecall.microRecall).padStart(12)} | ${percent(summary.modelAnyHitRate).padStart(7)} | ${percent(summary.fullExposureRecall.microRecall).padStart(13)} | ${Math.round(summary.anonymizedCorpusBytesAfterMean ?? 0).toString().padStart(9)}`);
+	console.log("arm      | input tok | fresh/cache | model recall | overlay | prefetch | base bytes | overlay bytes");
+	console.log("---------|-----------|-------------|--------------|---------|----------|------------|--------------");
+	for (const arm of ARMS) {
+		const summary = skillArmSummary[arm] as typeof skillArmSummary[string];
+		const inputTokens = summary.providerInputTokensMean === null ? "n/a" : Math.round(summary.providerInputTokensMean).toString();
+		console.log(
+			`${arm.padEnd(8)} | ${inputTokens.padStart(9)} | ${`${summary.freshProviderSamples}/${summary.resumeCacheSamples}`.padStart(11)} | ${percent(summary.modelRecall.microRecall).padStart(12)} | ${percent(summary.overlayRecall.microRecall).padStart(7)} | ${percent(summary.prefetchRecall.microRecall).padStart(8)} | ${Math.round(summary.baseBytesMean ?? 0).toString().padStart(10)} | ${Math.round(summary.overlayBytesMean ?? 0).toString().padStart(13)}`,
+		);
 	}
+	console.log(`base cache stability: ${skillAggregate.baseCacheStability.passed === null ? "N/A" : skillAggregate.baseCacheStability.passed ? "PASS" : "FAIL"}`);
 	console.log(`\nreal output benchmark: ${outputReports.length} cases; RTK ${report.rtkVersion}`);
 	for (const entry of outputReports) {
-		const variants = entry.variants as Record<string, { available: boolean; bytes?: number; actualFixedJudgeInputTokens?: number | null; evidenceRecall?: number; semanticEvidenceRecall?: number }>;
-		console.log(`${entry.label}: ${Object.entries(variants).map(([name, value]) => value.available ? `${name}=${value.bytes}B/judge-input ${value.actualFixedJudgeInputTokens ?? "resume"}tok/exact ${percent(value.evidenceRecall ?? null)}/semantic ${percent(value.semanticEvidenceRecall ?? null)}` : `${name}=n/a`).join(" | ")}`);
+		const variants = entry.variants as Record<string, {
+			available: boolean;
+			bytes?: number;
+			actualFixedJudgeInputTokens?: number | null;
+			evidenceRecall?: number;
+			semanticEvidenceRecall?: number;
+		}>;
+		console.log(`${entry.label}: ${Object.entries(variants).map(([name, value]) =>
+			value.available
+				? `${name}=${value.bytes}B/judge-input ${value.actualFixedJudgeInputTokens ?? "resume"}tok/exact ${percent(value.evidenceRecall ?? null)}/semantic ${percent(value.semanticEvidenceRecall ?? null)}`
+				: `${name}=n/a`).join(" | ")}`);
 	}
 	console.log(`\nfresh Luna calls: ${freshProviderCalls}; resume-cache hits: ${resumeCacheHits}; invalid-judge retries: ${invalidJudgeRetries}`);
 	console.log(`project safety: ${projectSafetyPassed ? "PASS" : "FAIL"}; RTK external safety: ${rtkExternalSafetyPassed === null ? "N/A" : rtkExternalSafetyPassed ? "PASS" : "FAIL"}`);

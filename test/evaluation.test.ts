@@ -4,15 +4,15 @@ import {
 	aggregateEvaluationCases,
 	collectIndependentEvidenceLines,
 	deriveSkillStates,
+	descriptionIsExtractedVerbatim,
 	distribution,
+	evaluateArm,
 	evaluateCase,
-	evaluateMode,
 	evaluateRequiredGroups,
 	parseStrictAllowedSelection,
-	type EvaluationMode,
-	type ModeEvaluationInput,
+	type ArmEvaluationInput,
+	type EvaluationArm,
 } from "../src/evaluation.ts";
-import { transformSkillsInText } from "../src/skills.ts";
 
 function skillXml(name: string, description = "", location = `C:/skills/${name}/SKILL.md`): string {
 	const descriptionLine = description ? `\n    <description>${description}</description>` : "";
@@ -24,16 +24,16 @@ function catalog(...skills: string[]): string {
 	return `<available_skills>\n${skills.join("\n")}\n</available_skills>`;
 }
 
-test("deriveSkillStates distinguishes full, intent, name-only, and missing while resolving path-note loadability", () => {
+test("deriveSkillStates distinguishes exposures while resolving path-note loadability", () => {
 	const original = catalog(
 		skillXml("alpha", "Alpha complete description."),
 		skillXml("beta", "Beta complete routing description."),
 		skillXml("gamma", "Gamma complete description."),
 		skillXml("delta", "Delta complete description."),
 	);
-	const rendered = `<available_skills>\n  <!--skill-optimizer-->\n  <skill_path_note>Skills listed without a location field are stored at {root}/{name}/SKILL.md (roots: C:/skills). Read that file to load one, or run /skill:name.</skill_path_note>\n${[
+	const rendered = `<available_skills>\n  <!--skill-optimizer:auto:v2-->\n  <skill_path_note>Skills listed without a location field are stored at {root}/{name}/SKILL.md (roots: C:/skills). Read that file to load one.</skill_path_note>\n${[
 		skillXml("alpha", "Alpha complete description."),
-		skillXml("beta", "Beta routing." , ""),
+		skillXml("beta", "Beta routing.", ""),
 		skillXml("gamma", "", ""),
 	].join("\n")}\n</available_skills>`;
 	const analysis = deriveSkillStates(original, rendered);
@@ -49,24 +49,25 @@ test("path notes do not rescue an incorrect explicit location", () => {
 	assert.equal(deriveSkillStates(original, rendered).states[0]?.loadable, false);
 });
 
-test("hard safety rejects rewritten tail descriptions", () => {
+test("hard safety rejects rewritten base descriptions", () => {
 	const original = catalog(skillXml("alpha", "Alpha exact operational workflow."));
 	const rendered = catalog(skillXml("alpha", "Completely paraphrased guidance."));
-	const result = evaluateMode({
-		mode: "compact",
+	const result = evaluateArm({
+		arm: "auto",
 		originalText: original,
-		renderedText: rendered,
+		baseText: rendered,
+		overlayText: "",
 		requiredGroups: [],
-		selectedSkillNames: [],
-		identityPreserved: false,
-		reoptimizedText: rendered,
-		reoptimizedIdentity: true,
+		prefetchedSkillNames: [],
+		baseIdentityPreserved: false,
+		reoptimizedBaseText: rendered,
+		reoptimizedBaseIdentity: true,
 	});
 	assert.equal(result.safety.passed, false);
-	assert.equal(result.safety.checks.find((check) => check.name === "tail-description-extractive")?.passed, false);
+	assert.equal(result.safety.checks.find((check) => check.name === "base-description-extractive")?.passed, false);
 });
 
-test("independent evidence oracle is uncapped and strict judge parsing never converts invalid output to an empty selection", () => {
+test("independent evidence is uncapped and strict parsing rejects invalid selections", () => {
 	const output = Array.from({ length: 150 }, (_, index) => `ERROR E${1000 + index}: failure ${index}`).join("\n");
 	assert.equal(collectIndependentEvidenceLines(output).length, 150);
 	const allowed = new Set(["alpha", "beta"]);
@@ -76,167 +77,177 @@ test("independent evidence oracle is uncapped and strict judge parsing never con
 	assert.throws(() => parseStrictAllowedSelection('{"skills":["unknown"]}', "skills", allowed), /unknown/);
 });
 
-test("required groups support alternatives and report full, intent, loadable, promoted, and model-selected recall", () => {
+test("required groups report base, overlay, prefetch, and model recall independently", () => {
 	const original = catalog(
 		skillXml("alpha", "Alpha complete description."),
 		skillXml("beta", "Beta complete routing description."),
 		skillXml("gamma", "Gamma complete description."),
 	);
-	const rendered = `<available_skills>\n  <skill_path_note>Skills listed without a location field are stored at {root}/{name}/SKILL.md (roots: C:/skills). Read that file to load one.</skill_path_note>\n${[
+	const base = `<available_skills>\n  <skill_path_note>Skills listed without a location field are stored at {root}/{name}/SKILL.md (roots: C:/skills). Read that file to load one.</skill_path_note>\n${[
 		skillXml("alpha", "Alpha complete description."),
 		skillXml("beta", "Beta routing.", ""),
 		skillXml("gamma", "", ""),
 	].join("\n")}\n</available_skills>`;
-	const states = deriveSkillStates(original, rendered).states;
+	const states = deriveSkillStates(original, base).states;
 	const metrics = evaluateRequiredGroups(
 		states,
 		[{ anyOf: ["alpha"] }, { anyOf: ["beta", "alternative-beta"] }, { anyOf: ["gamma"] }],
-		["alpha"],
+		["beta"],
+		["beta", "gamma"],
 		["alpha", "gamma"],
 	);
-	assert.equal(metrics.full.recall, 1 / 3);
-	assert.equal(metrics.intent.recall, 2 / 3);
-	assert.equal(metrics.loadable.recall, 1);
-	assert.equal(metrics.promoted.recall, 1 / 3);
+	assert.equal(metrics.baseFull.recall, 1 / 3);
+	assert.equal(metrics.baseIntent.recall, 2 / 3);
+	assert.equal(metrics.baseLoadable.recall, 1);
+	assert.equal(metrics.overlay.recall, 1 / 3);
+	assert.equal(metrics.prefetch.recall, 2 / 3);
 	assert.equal(metrics.modelSelected?.recall, 2 / 3);
-	assert.equal(metrics.allGroupsLoadable, true);
-	assert.equal(metrics.allGroupsFull, false);
 });
 
 const DESCRIPTIONS = {
-	alpha: "Alpha specialist workflow. Additional detailed operational guidance that should be removed from compact tails.",
-	beta: "Beta specialist workflow. Additional detailed operational guidance that should be removed from compact tails.",
-	gamma: "Gamma specialist workflow. Additional detailed operational guidance that should be removed from compact tails.",
-	delta: "Delta specialist workflow. Additional detailed operational guidance that should be removed from compact tails.",
+	alpha: "Alpha specialist workflow. Additional detailed operational guidance that is absent from the stable base.",
+	beta: "Beta specialist workflow. Additional detailed operational guidance that is absent from the stable base.",
+	gamma: "Gamma specialist workflow. Additional detailed operational guidance that is absent from the stable base.",
+	delta: "Delta specialist workflow. Additional detailed operational guidance that is absent from the stable base.",
 };
 const ORIGINAL = catalog(...Object.entries(DESCRIPTIONS).map(([name, description]) => skillXml(name, description)));
+const STABLE_BASE = `<available_skills>\n  <!--skill-optimizer:auto:v2-->\n  <skill_path_note>Skills listed without a location field are stored at {root}/{name}/SKILL.md (roots: C:/skills). Read that file to load one.</skill_path_note>\n${Object.keys(DESCRIPTIONS).map((name) =>
+	skillXml(name, `${name[0].toUpperCase() + name.slice(1)} specialist workflow.`, "")).join("\n")}\n</available_skills>`;
 
-function transformedMode(mode: "compact" | "hybrid", query: string) {
-	const options = { mode, topK: 1, tail: "name" as const, query };
-	const first = transformSkillsInText(ORIGINAL, options);
-	const second = transformSkillsInText(first.text, options);
-	return { first, second };
-}
-
-function caseMode(mode: EvaluationMode, query: string, modelSelected: string): Omit<ModeEvaluationInput, "originalText" | "requiredGroups" | "originalSerializedText"> {
-	if (mode === "off") {
+function caseArm(
+	arm: EvaluationArm,
+	required: keyof typeof DESCRIPTIONS,
+	baseText = STABLE_BASE,
+): Omit<ArmEvaluationInput, "originalText" | "requiredGroups" | "originalSerializedText"> {
+	if (arm === "baseline") {
 		return {
-			mode,
-			renderedText: ORIGINAL,
-			selectedSkillNames: [],
-			modelSelectedSkillNames: [modelSelected],
-			identityPreserved: true,
-			reoptimizedText: ORIGINAL,
-			reoptimizedIdentity: true,
+			arm,
+			baseText: ORIGINAL,
+			overlayText: "",
+			prefetchedSkillNames: [],
+			modelSelectedSkillNames: [required],
+			renderedSerializedText: JSON.stringify({ system: ORIGINAL }),
+			baseIdentityPreserved: true,
+			reoptimizedBaseText: ORIGINAL,
+			reoptimizedBaseIdentity: true,
 			exactTokenCounts: { tokenizer: "fixture-tokenizer", before: 100, after: 100 },
 		};
 	}
-	const { first, second } = transformedMode(mode, query);
+	const overlayText = catalog(skillXml(required, DESCRIPTIONS[required]));
 	return {
-		mode,
-		renderedText: first.text,
-		selectedSkillNames: first.selected,
-		modelSelectedSkillNames: [modelSelected],
-		identityPreserved: first.text === ORIGINAL,
-		reoptimizedText: second.text,
-		reoptimizedIdentity: second.text === first.text && second.removedChars === 0,
-		exactTokenCounts: { tokenizer: "fixture-tokenizer", before: 100, after: mode === "compact" ? 40 : 60 },
+		arm,
+		baseText,
+		overlayText,
+		prefetchedSkillNames: [required],
+		modelSelectedSkillNames: [required],
+		renderedSerializedText: JSON.stringify({ system: `${baseText}\n\n${overlayText}` }),
+		baseIdentityPreserved: false,
+		reoptimizedBaseText: baseText,
+		reoptimizedBaseIdentity: true,
+		exactTokenCounts: { tokenizer: "fixture-tokenizer", before: 100, after: 60 },
 	};
 }
 
-test("evaluateCase and aggregateEvaluationCases produce paired byte/token/recall metrics and enforce cache stability", () => {
-	const makeCase = (id: string, query: string, required: string) => evaluateCase({
+function evaluatedCase(id: string, required: keyof typeof DESCRIPTIONS, baseText = STABLE_BASE) {
+	return evaluateCase({
 		id,
 		catalogKey: "shared-catalog",
 		originalText: ORIGINAL,
+		originalSerializedText: JSON.stringify({ system: ORIGINAL }),
 		requiredGroups: [{ anyOf: [required] }],
-		modes: [caseMode("off", query, required), caseMode("compact", query, required), caseMode("hybrid", query, required)],
+		arms: [caseArm("baseline", required), caseArm("auto", required, baseText)],
 	});
-	const first = makeCase("one", "alpha", "alpha");
-	const second = makeCase("two", "beta", "beta");
-	assert.equal(first.modes.off.coverage.full.recall, 1);
-	assert.equal(first.modes.compact.coverage.intent.recall, 1);
-	assert.equal(first.modes.hybrid.coverage.full.recall, 1);
-	assert.ok(first.modes.off.safety.passed);
-	assert.ok(first.modes.compact.safety.passed);
-	assert.ok(first.modes.hybrid.safety.passed);
+}
+
+test("paired aggregation separates stable base, overlay recall, and prefetch recall", () => {
+	const first = evaluatedCase("one", "alpha");
+	const second = evaluatedCase("two", "beta");
+	assert.equal(first.arms.baseline.coverage.baseFull.recall, 1);
+	assert.equal(first.arms.auto.coverage.overlay.recall, 1);
+	assert.equal(first.arms.auto.coverage.prefetch.recall, 1);
+	assert.ok(first.arms.baseline.safety.passed);
+	assert.ok(first.arms.auto.safety.passed);
 
 	const aggregate = aggregateEvaluationCases([first, second]);
-	assert.equal(aggregate.compactCacheStability.comparedCatalogs, 1);
-	assert.equal(aggregate.compactCacheStability.passed, true);
+	assert.equal(aggregate.baseCacheStability.comparedCatalogs, 1);
+	assert.equal(aggregate.baseCacheStability.passed, true);
 	assert.equal(aggregate.hardSafetyPassed, true);
-	assert.equal(aggregate.modes.hybrid.fullRecall.microRecall, 1);
-	assert.equal(aggregate.modes.compact.fullCount.count, 2);
-	assert.equal(aggregate.modes.compact.exactTokensByTokenizer["fixture-tokenizer"].saved.mean, 60);
-	assert.equal(aggregate.pairs.offToCompact.exactTokensSavedByTo["fixture-tokenizer"].mean, 60);
-	assert.ok((aggregate.pairs.offToCompact.bytesSavedByTo.mean ?? 0) > 0);
+	assert.equal(aggregate.arms.auto.overlayRecall.microRecall, 1);
+	assert.equal(aggregate.arms.auto.prefetchRecall.microRecall, 1);
+	assert.equal(aggregate.arms.auto.overlayCount.count, 2);
+	assert.equal(aggregate.arms.auto.exactTokensByTokenizer["fixture-tokenizer"].saved.mean, 40);
+	assert.equal(aggregate.pair.exactTokensSavedByAuto["fixture-tokenizer"].mean, 40);
+	assert.ok((aggregate.pair.baseBytesSavedByAuto.mean ?? 0) > 0);
 });
 
-test("cache stability is not applicable when no catalog has repeated cases", () => {
-	const single = evaluateCase({
-		id: "single",
-		catalogKey: "single-catalog",
-		originalText: ORIGINAL,
-		requiredGroups: [{ anyOf: ["alpha"] }],
-		modes: [caseMode("off", "alpha", "alpha"), caseMode("compact", "alpha", "alpha"), caseMode("hybrid", "alpha", "alpha")],
-	});
-	const aggregate = aggregateEvaluationCases([single]);
-	assert.equal(aggregate.compactCacheStability.comparedCatalogs, 0);
-	assert.equal(aggregate.compactCacheStability.passed, null);
+test("base cache stability is query-independent and detects changed bases", () => {
+	const single = aggregateEvaluationCases([evaluatedCase("single", "alpha")]);
+	assert.equal(single.baseCacheStability.comparedCatalogs, 0);
+	assert.equal(single.baseCacheStability.passed, null);
+
+	const unstable = aggregateEvaluationCases([
+		evaluatedCase("one", "alpha"),
+		evaluatedCase("two", "beta", `${STABLE_BASE}\n`),
+	]);
+	assert.equal(unstable.baseCacheStability.comparedCatalogs, 1);
+	assert.equal(unstable.baseCacheStability.passed, false);
+	assert.deepEqual(unstable.baseCacheStability.unstableCatalogKeys, ["shared-catalog"]);
 });
 
-test("hard safety detects off mutation, reordered names, selected non-full skills, and failed idempotence", () => {
+test("hard safety detects baseline mutation and overlay/prefetch divergence", () => {
 	const reordered = catalog(
 		skillXml("beta", DESCRIPTIONS.beta),
 		skillXml("alpha", DESCRIPTIONS.alpha),
 		skillXml("gamma", DESCRIPTIONS.gamma),
 		skillXml("delta", DESCRIPTIONS.delta),
 	);
-	const result = evaluateMode({
-		mode: "off",
+	const baseline = evaluateArm({
+		arm: "baseline",
 		originalText: ORIGINAL,
-		renderedText: reordered,
+		baseText: reordered,
+		overlayText: "",
 		requiredGroups: [{ anyOf: ["alpha"] }],
-		selectedSkillNames: ["alpha"],
-		identityPreserved: false,
-		reoptimizedText: `${reordered}\nchanged`,
-		reoptimizedIdentity: false,
+		prefetchedSkillNames: [],
+		baseIdentityPreserved: false,
+		reoptimizedBaseText: `${reordered}\nchanged`,
+		reoptimizedBaseIdentity: false,
 	});
-	assert.equal(result.safety.passed, false);
-	const failed = new Set(result.safety.checks.filter((check) => !check.passed).map((check) => check.name));
-	assert.ok(failed.has("order-preservation"));
-	assert.ok(failed.has("idempotence"));
-	assert.ok(failed.has("off-identity"));
+	const failed = new Set(baseline.safety.checks.filter((check) => !check.passed).map((check) => check.name));
+	assert.ok(failed.has("base-order-preservation"));
+	assert.ok(failed.has("base-idempotence"));
+	assert.ok(failed.has("baseline-identity"));
+
+	const divergent = evaluateArm({
+		...caseArm("auto", "alpha"),
+		originalText: ORIGINAL,
+		originalSerializedText: JSON.stringify({ system: ORIGINAL }),
+		requiredGroups: [{ anyOf: ["alpha"] }],
+		prefetchedSkillNames: ["beta"],
+	});
+	assert.equal(divergent.safety.checks.find((check) => check.name === "overlay-prefetch-integrity")?.passed, false);
 });
 
-test("distribution uses deterministic median and nearest-rank p95; UTF-8 byte metrics are not character estimates", () => {
+test("distribution and UTF-8 byte metrics are exact", () => {
 	assert.deepEqual(distribution([1, 2, 3, 100]), { count: 4, mean: 26.5, median: 2.5, p95: 100, min: 1, max: 100 });
-	const empty = distribution([]);
-	assert.equal(empty.mean, null);
-	const utf8 = evaluateMode({
-		mode: "off",
+	assert.equal(distribution([]).mean, null);
+	const utf8 = evaluateArm({
+		arm: "baseline",
 		originalText: "🔥",
-		renderedText: "🔥",
+		baseText: "🔥",
+		overlayText: "",
 		requiredGroups: [],
-		selectedSkillNames: [],
-		identityPreserved: true,
-		reoptimizedText: "🔥",
-		reoptimizedIdentity: true,
+		prefetchedSkillNames: [],
+		baseIdentityPreserved: true,
+		reoptimizedBaseText: "🔥",
+		reoptimizedBaseIdentity: true,
 	});
 	assert.equal(utf8.bytesBefore, 4);
 	assert.equal(utf8.exactTokenCounts, undefined);
 });
 
-
-test("extractive safety accepts ordered runtime description fragments", async () => {
-	const [{ descriptionIsExtractedVerbatim }, { compactDescription }] = await Promise.all([
-		import("../src/evaluation.ts"),
-		import("../src/skills.ts"),
-	]);
+test("extractive safety accepts ordered fragments and rejects reordered prose", () => {
 	const original = "An intentionally detailed opening sentence establishes the skill purpose and operating boundaries. Supporting details are omitted here. Use this skill when authentication failures need focused investigation.";
-	const rendered = compactDescription(original, 80);
-
-	assert.match(rendered, /…[\s\S]*Use this skill/u);
+	const rendered = "An intentionally detailed opening… Use this skill when authentication failures need focused investigation.";
 	assert.equal(descriptionIsExtractedVerbatim(original, rendered), true);
 	assert.equal(descriptionIsExtractedVerbatim(original, "Use this skill when investigation needs focused authentication failures."), false);
 });

@@ -26,11 +26,16 @@ import {
 	type OutputExampleV1,
 	type SkillExampleV1,
 } from "../src/corpus.ts";
-import { getConfig, getPinnedTopK, getProfilePaths, getUsageFilePath } from "../src/config.ts";
+import {
+	getConfig,
+	getGlobalProfilePath,
+	getGlobalUsagePath,
+	getProjectProfilePath,
+} from "../src/config.ts";
 import { collectIndependentEvidenceLines } from "../src/evaluation.ts";
 import { truncateUtf8Bytes, utf8ByteLength } from "../src/output.ts";
 import { loadMergedProfile, loadUsageFile } from "../src/persistence.ts";
-import { selectPinnedSkills } from "../src/usage.ts";
+import { buildUsagePrior } from "../src/usage.ts";
 import { parsePiJsonl } from "./lib/luna.ts";
 
 type JsonRecord = Record<string, unknown>;
@@ -338,24 +343,29 @@ function chooseOutputExamples(candidates: readonly OutputCandidate[]): OutputCan
 }
 
 function sanitizedProfileSnapshot(catalog: CatalogExampleV1) {
-	const profile = loadMergedProfile(getProfilePaths(process.cwd()));
+	const profile = loadMergedProfile({
+		global: getGlobalProfilePath(),
+		project: getProjectProfilePath(process.cwd()),
+	});
 	const names = new Set(catalog.skills.map((skill) => skill.name));
 	const textMap = (record: Record<string, string[]>) => Object.fromEntries(Object.entries(record)
 		.filter(([name]) => names.has(name))
 		.map(([name, values]) => [name, values.map(redactSensitiveText)]));
-	const aliases = Object.fromEntries(Object.entries(profile.aliases)
-		.map(([key, values]) => [redactSensitiveText(key), values.map(redactSensitiveText)]));
-	const usage = loadUsageFile(getUsageFilePath(process.cwd()));
+	const usage = loadUsageFile(getGlobalUsagePath());
+	const config = getConfig();
+	const usagePrior = Object.fromEntries(
+		Object.entries(buildUsagePrior(usage, { halfLifeDays: config.usageHalfLifeDays }))
+			.filter(([name]) => names.has(name)),
+	);
 	return {
 		profile: {
-			aliases,
 			critical: profile.critical.filter((name) => names.has(name)),
 			queries: textMap(profile.queries),
 			clusters: textMap(profile.clusters),
 			negativeHints: textMap(profile.negativeHints),
 		},
-		pinnedSkills: selectPinnedSkills(usage, getPinnedTopK(process.cwd()), Date.now()).filter((name) => names.has(name)),
-		config: getConfig(process.cwd()),
+		usagePrior,
+		config,
 	};
 }
 
