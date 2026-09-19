@@ -31,9 +31,18 @@ const NON_HUMAN_BLOCK_TYPES = new Set([
 	"context_reference",
 ]);
 
-/** Synthetic context-mode messages are transport context, not user intent. */
+const INJECTED_CONTEXT_PREFIXES = [
+	"context-mode active.",
+	"[pi-persona] identity data",
+	"[pi-persona] first action:",
+	"[pi-persona] session clock",
+	"current clock:",
+] as const;
+
+/** Synthetic extension messages are transport context, not user intent. */
 function isInjectedContextText(value: string): boolean {
-	return value.trimStart().toLowerCase().startsWith("context-mode active.");
+	const normalized = value.trimStart().toLowerCase();
+	return INJECTED_CONTEXT_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

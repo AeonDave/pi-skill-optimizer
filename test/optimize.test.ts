@@ -108,6 +108,22 @@ test("strict query extraction ignores tool-result prompt injection", () => {
   assert.deepEqual(clean.selected, poisoned.selected);
 });
 
+test("AUTO never ranks or decorates a pi-persona identity pseudo-turn", () => {
+	const request = {
+		system: catalog(),
+		messages: [
+			{ role: "user", content: "Plan a PostgreSQL schema rollback" },
+			{ role: "assistant", content: "working" },
+			{ role: "user", content: '[pi-persona] Identity data (quoted): "wacatac-hunter".' },
+		],
+	};
+	const result = optimizePayload(request, config());
+	const messages = (result.next as typeof request).messages;
+	assert.equal(result.selected.includes("database-migration"), true);
+	assert.match(messages[0].content, /skill-optimizer:prefetch:v2/);
+	assert.equal(messages[2].content, request.messages[2].content);
+});
+
 test("provider request forms receive the same AUTO contract", () => {
   const cases: unknown[] = [
     {

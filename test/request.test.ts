@@ -77,6 +77,23 @@ test("excludes Anthropic tool results and injected context from the ranking quer
 	assert.deepEqual([...request.usedToolNames], ["inspect"]);
 });
 
+test("excludes pi-persona identity and clock context from ranking across provider shapes", () => {
+	const identity = '[pi-persona] Identity data (quoted): "wacatac-hunter". Keep this same handle.';
+	const bootstrap = '[pi-persona] FIRST action: invent a distinct short personal handle, then call agent_name.';
+	const clock = "Current clock: UTC 2026-09-19T20:00:00Z; local 2026-09-19T22:00:00+02:00.";
+	const cases = [
+		{ messages: [{ role: "user", content: "anthropic/chat/mistral task" }, { role: "user", content: identity }] },
+		{ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "responses task" }] }, { type: "message", role: "user", content: [{ type: "input_text", text: bootstrap }] }] },
+		{ contents: [{ role: "user", parts: [{ text: "gemini task" }] }, { role: "user", parts: [{ text: clock }] }] },
+	] as const;
+	const expected = ["anthropic/chat/mistral task", "responses task", "gemini task"];
+	for (let index = 0; index < cases.length; index++) {
+		const request = normalizeRequest(cases[index]);
+		assert.equal(extractRequestQuery(request), expected[index]);
+		assert.equal(request.messages.length, 1);
+	}
+});
+
 test("excludes OpenAI function outputs and Chat/Mistral tool-role content", () => {
 	const request = normalizeRequest({
 		messages: [
@@ -160,6 +177,21 @@ test("appendToLatestHumanInput supports Gemini and ignores functionResponse/cont
 	assert.equal((next.contents[0].parts[0] as { text: string }).text, "gemini task\noverlay");
 	assert.equal(next.contents[1], payload.contents[1]);
 	assert.equal(next.contents[2], payload.contents[2]);
+});
+
+test("appendToLatestHumanInput skips pi-persona pseudo-turns", () => {
+	const identity = { role: "user", content: '[pi-persona] Identity data (quoted): "wacatac-hunter".' };
+	const payload = {
+		messages: [
+			{ role: "user", content: "real human task" },
+			{ role: "assistant", content: "working" },
+			identity,
+		],
+	};
+	const next = appendToLatestHumanInput(payload, "prefetched context") as typeof payload;
+	assert.equal(next.messages[0].content, "real human task\nprefetched context");
+	assert.equal(next.messages[2], identity);
+	assert.equal(next.messages[2].content, identity.content);
 });
 
 test("appendToLatestHumanInput returns identity without genuine human text", () => {
