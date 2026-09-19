@@ -36,9 +36,10 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/request.test.ts test/history.test.ts test/skills.test.ts test/skill-loader.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/generate.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts test/usage.test.ts test/persistence.test.ts test/corpus.test.ts test/evaluation.test.ts test/luna.test.ts",
+    "test": "node --import tsx --test test/request.test.ts test/history.test.ts test/skills.test.ts test/skill-loader.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/generate.test.ts test/init.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts test/usage.test.ts test/persistence.test.ts test/corpus.test.ts test/evaluation.test.ts test/luna.test.ts",
     "measure": "node --import tsx scripts/measure.ts",
     "bench": "node --import tsx scripts/bench.ts",
+    "bench:perf": "node --import tsx scripts/perf-bench.ts",
     "bench:output": "node --import tsx scripts/output-bench.ts",
     "corpus:build": "node --import tsx scripts/build-real-corpus.ts",
     "bench:real": "node --import tsx scripts/evaluate-real-corpus.ts"
@@ -48,12 +49,12 @@
     "@earendil-works/pi-coding-agent": ">=0.84.4"
   },
   "dependencies": {
-    "typebox": "^1.3.7"
+    "typebox": "^1.3.34"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.84.4",
-    "@earendil-works/pi-coding-agent": "^0.84.4",
-    "@types/node": "^22.20.1",
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "@types/node": "^22.20.4",
     "tsx": "^4.23.13",
     "typescript": "^5.9.3"
   },

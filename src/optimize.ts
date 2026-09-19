@@ -1,5 +1,6 @@
 import {
   planSkillPrefetch,
+  inspectStableSkillCatalog,
   renderStableSkillCatalog,
   renderSkillPrefetch,
   type Skill,
@@ -73,6 +74,8 @@ interface PayloadLike {
   systemInstruction?: unknown;
   instructions?: unknown;
   messages?: unknown;
+  input?: unknown;
+  context?: unknown;
   tools?: unknown;
   [key: string]: unknown;
 }
@@ -143,12 +146,37 @@ function replaceMessageContent(
     if (!isRecord(entry)) return entry;
     const message = entry as MessageLike;
     if (message.role !== "system" && message.role !== "developer") return entry;
+    let nextMessage: MessageLike = message;
     const content = replaceTextBlocks(message.content, transform);
-    if (content === message.content) return entry;
+    if (content !== message.content) nextMessage = { ...nextMessage, content };
+    if (message.role === "system" && isRecord(message.sections)) {
+      let sectionsChanged = false;
+      const sections = Object.fromEntries(Object.entries(message.sections).map(([name, value]) => {
+        if (typeof value !== "string") return [name, value];
+        const text = transform(value);
+        if (text !== value) sectionsChanged = true;
+        return [name, text];
+      }));
+      if (sectionsChanged) nextMessage = { ...nextMessage, sections };
+    }
+    if (message.role === "system" && Array.isArray(message.toolsAdded)) {
+      const toolsAdded = replaceToolDescriptions(message.toolsAdded, transform);
+      if (toolsAdded !== message.toolsAdded) nextMessage = { ...nextMessage, toolsAdded };
+    }
+    if (nextMessage === message) return entry;
     changed = true;
-    return { ...message, content };
+    return nextMessage;
   });
   return changed ? next : messages;
+}
+
+function replaceTranscriptContext(
+  value: unknown,
+  transform: (text: string) => string,
+): unknown {
+  if (!isRecord(value)) return value;
+  const messages = replaceMessageContent(value.messages, transform);
+  return messages === value.messages ? value : { ...value, messages };
 }
 
 function replaceToolDescriptions(
@@ -235,18 +263,19 @@ export function optimizePayload<T>(
   let baseRemovedChars = 0;
   const catalogFloors: number[] = [];
   const inspect = (text: string): string => {
-    const preview = renderStableSkillCatalog(text, {
+    const preview = inspectStableSkillCatalog(text, {
       never: config.excludeSkills,
       intentMaxChars: config.intentMaxChars,
-      budgetChars: 0,
     });
-    if (preview.skills.length > 0) catalogFloors.push(preview.budget.floorChars);
+    if (preview.skills.length > 0) catalogFloors.push(preview.floorChars);
     return text;
   };
   replaceTextBlocks(source.system, inspect);
   replaceSystemInstruction(source.systemInstruction, inspect);
   if (typeof source.instructions === "string") inspect(source.instructions);
   replaceMessageContent(source.messages, inspect);
+  replaceMessageContent(source.input, inspect);
+  replaceTranscriptContext(source.context, inspect);
   replaceToolDescriptions(source.tools, inspect);
 
   let catalogIndex = 0;
@@ -303,6 +332,12 @@ export function optimizePayload<T>(
 
   const messages = replaceMessageContent(source.messages, transform);
   if (messages !== source.messages) next = { ...next, messages };
+
+  const input = replaceMessageContent(source.input, transform);
+  if (input !== source.input) next = { ...next, input };
+
+  const context = replaceTranscriptContext(source.context, transform);
+  if (context !== source.context) next = { ...next, context };
 
   const tools = replaceToolDescriptions(source.tools, transform);
   if (tools !== source.tools) next = { ...next, tools };

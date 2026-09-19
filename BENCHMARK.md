@@ -2,19 +2,23 @@
 
 This document defines the benchmark contract and records the current real-corpus evidence for AUTO. Earlier discovery architectures are not comparable and are intentionally excluded.
 
-## Published snapshot
+## Published v2.0.0 snapshot
 
 Status: **completed**
 
 | Item | Value |
 | --- | --- |
+| Repository | `8a0b28a` (`v2.0.0`, 2026-09-01) |
 | Anonymized cases | 8 |
 | Distinct skills | 332 |
 | Real-provider work | 31 Luna calls |
+| Runtime/provider/model revision | Not recorded in the original run |
 | Provider-reported cache reads | 0 |
 | Invalid-response retries | 0 |
 | Project safety gate | **PASS** |
 | RTK external-comparator safety gate | **FAIL** |
+
+This is historical release evidence. It predates the Unreleased provider-shape and bounded runtime-cache changes and is not a measurement of the current working tree.
 
 No raw request, catalog, output, path, account identifier, hostname, or private corpus record is published.
 
@@ -290,6 +294,7 @@ The benchmark also does not establish reduction of arbitrary system prompts or o
 npm run typecheck
 npm test
 npm run bench
+npm run bench:perf
 npm run bench:output
 ```
 

@@ -4,6 +4,24 @@ All notable changes are documented here.
 
 ## Unreleased
 
+### Added
+
+- A deterministic `bench:perf` harness reports cold and steady request-transform latency at 284 and 2,000 synthetic skills.
+
+### Changed
+
+- Development validation now targets Pi `0.85.1`, TypeBox `1.3.34`, and the current Node 22 type line while retaining the compatible Pi `>=0.84.4` peer floor.
+- Stable catalog preparation and rendering use bounded LRU caches, avoiding repeated parsing and rendering across provider requests and cache-warm refreshes.
+- Init batch progress is transient status; only start, terminal batch failures, and completion create durable notifications.
+
+### Fixed
+
+- `/skill-optimizer init` reports progress, checkpoints successful batches immediately, and avoids the redundant final profile rewrite and its stale-CAS race.
+- Init respects terminal versus retryable model failures, rejects non-success stop reasons, leaves failed changed skills inactive instead of serving stale routing, and repairs misplaced global/project profile state without another model call.
+- OpenAI/Azure Responses developer catalogs in `input` and structured `pi-messages` skill sections now receive the same AUTO transformation and latest-human prefetch contract.
+- Synthetic pi-persona identity and clock turns cannot become routing intent or receive a prefetch overlay.
+- Repeated identical status text no longer asks Pi to redraw the footer.
+
 ## 2.0.0 - 2026-09-01
 
 ### Added

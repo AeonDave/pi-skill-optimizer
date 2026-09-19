@@ -4,6 +4,7 @@ import {
 	batchSkillsByWeight,
 	generateProfileInBatches,
 	interpretBatchResponse,
+	isRetryableBatchException,
 	parseJsonObject,
 	responseText,
 	stripCodeFences,
@@ -115,6 +116,22 @@ test("interpretBatchResponse parses valid output and rejects truncation as retry
 	assert.equal((truncated as { retryable: boolean }).retryable, true);
 });
 
+test("interpretBatchResponse rejects non-success stop reasons", () => {
+	for (const stopReason of ["pending", "toolUse"] as const) {
+		const outcome = interpretBatchResponse(textResponse('{"processedSkills":["a"]}', stopReason));
+		assert.equal(outcome.status, "failed", stopReason);
+		assert.equal((outcome as { retryable: boolean }).retryable, false, stopReason);
+	}
+});
+
+test("batch exception retry classification treats cancellation as terminal", () => {
+	const aborted = new Error("cancelled by caller");
+	aborted.name = "AbortError";
+	assert.equal(isRetryableBatchException(aborted), false);
+	assert.equal(isRetryableBatchException(new Error("Request was aborted")), false);
+	assert.equal(isRetryableBatchException(new Error("temporary network failure")), true);
+});
+
 test("interpretBatchResponse requires explicit processedSkills even with profile content", () => {
 	assert.equal(interpretBatchResponse(textResponse("{}")).status, "failed");
 	assert.equal(interpretBatchResponse(textResponse('{"critical":["a"]}')).status, "failed");
@@ -192,4 +209,87 @@ test("generateProfileInBatches has no legacy fallback without explicit processed
 test("generateProfileInBatches returns undefined only when every batch fails", async () => {
 	const result = await generateProfileInBatches(refs("a", "b", "c"), limits(1), async () => undefined);
 	assert.equal(result, undefined);
+});
+
+test("generateProfileInBatches does not retry a terminal batch failure", async () => {
+	let attempts = 0;
+	const result = await generateProfileInBatches(
+		refs("a"),
+		{ maxSkills: 1, maxUtf8Bytes: 1_000, maxAttempts: 3 },
+		async () => {
+			attempts += 1;
+			return { status: "failed", reason: "aborted", retryable: false };
+		},
+	);
+	assert.equal(result, undefined);
+	assert.equal(attempts, 1);
+});
+
+test("generateProfileInBatches retries a transient batch failure", async () => {
+	const attempts: number[] = [];
+	const result = await generateProfileInBatches(
+		refs("a"),
+		{ maxSkills: 1, maxUtf8Bytes: 1_000, maxAttempts: 3 },
+		async (batch, _index, _total, attempt) => {
+			attempts.push(attempt);
+			if (attempt === 1) return { status: "failed", reason: "provider unavailable", retryable: true };
+			return {
+				profile: { ...EMPTY_PROFILE, critical: ["a"] },
+				processedSkills: batch.map((skill) => skill.name),
+			};
+		},
+	);
+	assert.ok(result);
+	assert.deepEqual(attempts, [1, 2]);
+	assert.deepEqual([...result.applied], ["a"]);
+});
+
+test("generateProfileInBatches checkpoints each successful batch through onEvent", async () => {
+	const events: Array<{ type: string; applied: string[]; names?: string[] }> = [];
+	const result = await generateProfileInBatches(
+		refs("a", "b", "c"),
+		limits(1),
+		async (batch) => ({
+			profile: { ...EMPTY_PROFILE, critical: batch.map((skill) => skill.name) },
+			processedSkills: batch.map((skill) => skill.name),
+		}),
+		async (event) => {
+			if (event.type === "committed") {
+				events.push({
+					type: event.type,
+					applied: [...event.applied],
+					names: [...event.batchNames],
+				});
+			}
+		},
+	);
+	assert.ok(result);
+	assert.deepEqual(events, [
+		{ type: "committed", applied: ["a"], names: ["a"] },
+		{ type: "committed", applied: ["a", "b"], names: ["b"] },
+		{ type: "committed", applied: ["a", "b", "c"], names: ["c"] },
+	]);
+	assert.deepEqual([...result.applied].sort(), ["a", "b", "c"]);
+});
+
+test("generateProfileInBatches reports incomplete coverage then accepts a complete retry", async () => {
+	const events: Array<{ type: string; attempt?: number }> = [];
+	const result = await generateProfileInBatches(
+		refs("a", "b"),
+		{ maxSkills: 2, maxUtf8Bytes: 1_000, maxAttempts: 2 },
+		async (batch, _index, _total, attempt) => ({
+			profile: { ...EMPTY_PROFILE, critical: batch.map((skill) => skill.name) },
+			processedSkills: attempt === 1 ? ["a"] : batch.map((skill) => skill.name),
+		}),
+		async (event) => {
+			events.push(event.type === "rejected"
+				? { type: event.type, attempt: event.attempt }
+				: { type: event.type });
+		},
+	);
+	assert.ok(result);
+	assert.deepEqual(events, [
+		{ type: "rejected", attempt: 1 },
+		{ type: "committed" },
+	]);
 });

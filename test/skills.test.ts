@@ -4,6 +4,7 @@ import {
 	auditSkillDescriptions,
 	catalogFingerprint,
 	compactDescription,
+	inspectStableSkillCatalog,
 	optimizeSkillCatalog,
 	parseSkills,
 	planSkillPrefetch,
@@ -88,6 +89,22 @@ ${skillXml("beta", `Beta workflow.${LONG}`)}
 	const second = renderStableSkillCatalog(first.text);
 	assert.equal(second.text, first.text);
 	assert.equal(second.removedChars, 0);
+});
+
+test("stable catalog inspection matches the rendered floor and cached results stay isolated", () => {
+	const source = catalog(
+		skillXml("alpha", `Alpha workflow.${LONG}`),
+		skillXml("beta", `Beta workflow.${LONG}`),
+	);
+	const inspection = inspectStableSkillCatalog(source);
+	const first = renderStableSkillCatalog(source, { budgetChars: inspection.floorChars });
+	assert.equal(first.budget.floorChars, inspection.floorChars);
+	assert.deepEqual(first.skills.map((entry) => entry.name), ["alpha", "beta"]);
+	first.skills[0].name = "mutated-consumer-copy";
+	first.budget.usedChars = -1;
+	const second = renderStableSkillCatalog(source, { budgetChars: inspection.floorChars });
+	assert.deepEqual(second.skills.map((entry) => entry.name), ["alpha", "beta"]);
+	assert.equal(second.budget.usedChars >= 0, true);
 });
 
 test("explicit exclusions are applied to the stable index", () => {

@@ -15,6 +15,7 @@ interface RequestEnvelope {
 	messages?: unknown;
 	input?: unknown;
 	contents?: unknown;
+	context?: unknown;
 }
 
 const TEXT_MESSAGE_ROLES = new Set(["user", "assistant"]);
@@ -181,6 +182,11 @@ export function normalizeRequest(payload: unknown): NormalizedRequest {
 	if (Array.isArray(envelope.contents)) {
 		for (const item of envelope.contents) collectItem(item, undefined, messages, usedToolNames);
 	}
+	if (envelope.context !== undefined) {
+		const nested = normalizeRequest(envelope.context);
+		messages.push(...nested.messages);
+		for (const name of nested.usedToolNames) usedToolNames.add(name);
+	}
 	return { messages, usedToolNames };
 }
 
@@ -289,6 +295,10 @@ export function appendToLatestHumanInput(payload: unknown, appendix: string, mar
 	if (Array.isArray(envelope.messages)) {
 		const messages = appendToItems(envelope.messages, undefined, appendix, marker);
 		if (messages) return { ...envelope, messages };
+	}
+	if (envelope.context !== undefined) {
+		const context = appendToLatestHumanInput(envelope.context, appendix, marker);
+		if (context !== envelope.context) return { ...envelope, context };
 	}
 	return payload;
 }

@@ -154,6 +154,72 @@ test("provider request forms receive the same AUTO contract", () => {
   }
 });
 
+test("OpenAI Responses optimizes a developer catalog inside input without touching cache metadata", () => {
+	const request = {
+		model: "gpt-test",
+		input: [
+			{ role: "developer", content: [{ type: "input_text", text: catalog() }] },
+			{ role: "user", content: [{ type: "input_text", text: "Plan an incident response from logs" }] },
+		],
+		prompt_cache_key: "stable-session",
+		prompt_cache_retention: "24h",
+		prompt_cache_options: { scope: "session" },
+	};
+	const result = optimizePayload(request, config());
+	const next = result.next as typeof request;
+
+	assert.equal(result.removedChars > 0, true);
+	assert.equal(result.selected.includes("incident-response"), true);
+	assert.match(next.input[0].content[0].text, /skill-optimizer:auto:v2/);
+	assert.match(next.input[1].content[0].text, /skill-optimizer:prefetch:v2/);
+	assert.equal(next.prompt_cache_key, request.prompt_cache_key);
+	assert.equal(next.prompt_cache_retention, request.prompt_cache_retention);
+	assert.equal(next.prompt_cache_options, request.prompt_cache_options);
+	assert.doesNotMatch(request.input[0].content[0].text, /skill-optimizer:auto:v2/);
+});
+
+test("pi-messages optimizes structured skill sections and decorates only the transient latest user turn", () => {
+	const request = {
+		model: "pi-test",
+		context: {
+			messages: [
+				{
+					role: "system",
+					content: "base instructions",
+					sections: { skills: catalog(), cwd: "<cwd>/workspace</cwd>" },
+					toolsAdded: [{ name: "read", description: "Read a file", parameters: { type: "object" } }],
+					timestamp: 1,
+				},
+				{ role: "user", content: "initial task", timestamp: 2 },
+				{
+					role: "system",
+					content: "",
+					sections: { skills: catalog(), retained: "keep me" },
+					timestamp: 3,
+				},
+				{ role: "user", content: "Test browser accessibility with Playwright", timestamp: 4 },
+			],
+		},
+		options: { cacheRetention: "long", sessionId: "session-1" },
+	};
+	const result = optimizePayload(request, config());
+	const next = result.next as typeof request;
+	const messages = next.context.messages;
+
+	assert.equal(result.removedChars > 0, true);
+	assert.equal(result.selected.includes("browser-testing"), true);
+	assert.match(messages[0].sections?.skills ?? "", /skill-optimizer:auto:v2/);
+	assert.match(messages[2].sections?.skills ?? "", /skill-optimizer:auto:v2/);
+	assert.equal(messages[0].sections?.cwd, "<cwd>/workspace</cwd>");
+	assert.equal(messages[2].sections?.retained, "keep me");
+	assert.equal(messages[0].timestamp, 1);
+	assert.equal(messages[0].toolsAdded, request.context.messages[0].toolsAdded);
+	assert.equal(messages[1].content, "initial task");
+	assert.match(messages[3].content, /skill-optimizer:prefetch:v2/);
+	assert.doesNotMatch(request.context.messages[3].content, /skill-optimizer:prefetch:v2/);
+	assert.equal(next.options, request.options);
+});
+
 test("no-signal requests do not invent an ordinary prefetch", () => {
   const result = optimizePayload(
     { system: catalog(), messages: [{ role: "user", content: [{ type: "image", source: "opaque" }] }] },

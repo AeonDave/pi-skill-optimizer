@@ -31,6 +31,12 @@ export interface StableCatalogResult {
 	budget: CatalogBudgetOutcome;
 }
 
+export interface StableCatalogInspection {
+	skills: Skill[];
+	fingerprint: string;
+	floorChars: number;
+}
+
 export interface SkillPrefetchOptions {
 	profile?: SkillOptimizerProfile;
 	usagePrior?: Readonly<Record<string, number>> | ReadonlyMap<string, number>;
@@ -129,6 +135,7 @@ const AUTO_MARKER = "<!--skill-optimizer:auto:v2-->";
 const CATALOG_RE = /<available_skills\b[^>]*>([\s\S]*?)<\/available_skills>/gi;
 const XML_SKILL_RE = /<skill\b[^>]*>([\s\S]*?)<\/skill>/gi;
 const INDEX_RE = /<skill_index\b[^>]*>([\s\S]*?)<\/skill_index>/gi;
+const STABLE_CATALOG_CACHE_MAX = 8;
 const FIELD_NAMES = ["name", "intent", "description", "queries"] as const;
 type FieldName = typeof FIELD_NAMES[number];
 
@@ -320,26 +327,112 @@ export function catalogFingerprint(skills: readonly Skill[]): string {
 	return createHash("sha256").update(canonicalSkillData(skills), "utf8").digest("hex");
 }
 
+interface PreparedStableCatalogBlock {
+	blockIndex: number;
+	marked: boolean;
+	parsed: readonly Skill[];
+	retained: readonly Skill[];
+}
+
+interface PreparedStableCatalog {
+	cacheKey: string;
+	source: string;
+	exclusions: string;
+	blocks: readonly PreparedStableCatalogBlock[];
+	skills: readonly Skill[];
+	fingerprint: string;
+	floorChars: number;
+}
+
+const stableCatalogCache = new Map<string, PreparedStableCatalog>();
+const stableCatalogRenderCache = new Map<string, StableCatalogResult>();
+
+function prepareStableCatalog(text: string, never: readonly string[]): PreparedStableCatalog {
+	const exclusions = JSON.stringify(never);
+	const cacheKey = createHash("sha256")
+		.update("pi-skill-optimizer:stable-catalog:v1\0", "utf8")
+		.update(exclusions, "utf8")
+		.update("\0", "utf8")
+		.update(text, "utf8")
+		.digest("hex");
+	const cached = stableCatalogCache.get(cacheKey);
+	if (cached?.source === text && cached.exclusions === exclusions) {
+		stableCatalogCache.delete(cacheKey);
+		stableCatalogCache.set(cacheKey, cached);
+		return cached;
+	}
+
+	const blocks = [...text.matchAll(CATALOG_RE)].map((match, blockIndex): PreparedStableCatalogBlock => {
+		const inner = match[1];
+		const parsed = parseSkills(inner);
+		return {
+			blockIndex,
+			marked: inner.includes(AUTO_MARKER),
+			parsed,
+			retained: parsed.filter((skill) => !matchesPattern(skill.name, never)),
+		};
+	});
+	const skills = [...new Map(blocks
+		.flatMap((block) => block.retained)
+		.map((skill) => [skill.name, skill])).values()];
+	const floorChars = blocks
+		.filter((block) => !block.marked && block.parsed.length > 0)
+		.reduce((sum, block) => sum + renderStableBlock(block.retained, block.retained.map(() => 0)).length, 0);
+	const prepared: PreparedStableCatalog = {
+		cacheKey,
+		source: text,
+		exclusions,
+		blocks,
+		skills,
+		fingerprint: catalogFingerprint(skills),
+		floorChars,
+	};
+	stableCatalogCache.set(cacheKey, prepared);
+	while (stableCatalogCache.size > STABLE_CATALOG_CACHE_MAX) {
+		stableCatalogCache.delete(stableCatalogCache.keys().next().value as string);
+	}
+	return prepared;
+}
+
+function cloneStableCatalogResult(result: StableCatalogResult): StableCatalogResult {
+	return {
+		...result,
+		skills: result.skills.map((skill) => ({ ...skill })),
+		budget: { ...result.budget },
+	};
+}
+
+/** Inspect the immutable all-name floor without rendering the catalog a first time. */
+export function inspectStableSkillCatalog(
+	text: string,
+	options: Omit<StableCatalogOptions, "budgetChars"> = {},
+): StableCatalogInspection {
+	const prepared = prepareStableCatalog(text, options.never ?? []);
+	return {
+		skills: prepared.skills.map((skill) => ({ ...skill })),
+		fingerprint: prepared.fingerprint,
+		floorChars: prepared.floorChars,
+	};
+}
+
 export function renderStableSkillCatalog(text: string, options: StableCatalogOptions = {}): StableCatalogResult {
 	const never = options.never ?? [];
 	const intentMaxChars = clamp(Math.trunc(options.intentMaxChars ?? DEFAULT_INTENT_MAX_CHARS), 24, 240);
 	const requestedChars = Math.max(0, Math.trunc(options.budgetChars ?? DEFAULT_CATALOG_BUDGET_CHARS));
-	const blocks = [...text.matchAll(CATALOG_RE)].map((match, blockIndex) => {
-		const inner = match[1];
-		const parsed = parseSkills(inner);
-		const retained = parsed.filter((skill) => !matchesPattern(skill.name, never));
-		return {
-			blockIndex,
-			inner,
-			marked: inner.includes(AUTO_MARKER),
-			parsed,
-			retained,
-			intentLimits: retained.map(() => 0),
-		};
-	});
+	const prepared = prepareStableCatalog(text, never);
+	const renderCacheKey = `${prepared.cacheKey}:${intentMaxChars}:${requestedChars}`;
+	const cached = stableCatalogRenderCache.get(renderCacheKey);
+	if (cached) {
+		stableCatalogRenderCache.delete(renderCacheKey);
+		stableCatalogRenderCache.set(renderCacheKey, cached);
+		return cloneStableCatalogResult(cached);
+	}
+	const blocks = prepared.blocks.map((block) => ({
+		...block,
+		intentLimits: block.retained.map(() => 0),
+	}));
 	const rawBlocks = blocks.filter((block) => !block.marked && block.parsed.length > 0);
-	const floorChars = rawBlocks.reduce((sum, block) =>
-		sum + renderStableBlock(block.retained, block.intentLimits).length, 0);
+	const floorChars = prepared.floorChars;
 	let remaining = Math.max(0, requestedChars - floorChars);
 	const candidates = rawBlocks.flatMap((block) => block.retained
 		.map((skill, skillIndex) => {
@@ -394,7 +487,6 @@ export function renderStableSkillCatalog(text: string, options: StableCatalogOpt
 			}
 		}
 	}
-	const allSkills: Skill[] = [];
 	let changed = false;
 	let blockCursor = 0;
 	let usedChars = 0;
@@ -403,7 +495,6 @@ export function renderStableSkillCatalog(text: string, options: StableCatalogOpt
 	const next = text.replace(CATALOG_RE, (block, inner: string) => {
 		const state = blocks[blockCursor++];
 		if (!state || state.parsed.length === 0) return block;
-		allSkills.push(...state.retained);
 		if (state.marked) {
 			usedChars += block.length;
 			for (const skill of state.retained) {
@@ -421,12 +512,11 @@ export function renderStableSkillCatalog(text: string, options: StableCatalogOpt
 		changed = true;
 		return rebuilt;
 	});
-	const deduplicated = [...new Map(allSkills.map((skill) => [skill.name, skill])).values()];
-	return {
+	const result: StableCatalogResult = {
 		text: changed ? next : text,
 		removedChars: changed ? Math.max(0, text.length - next.length) : 0,
-		skills: deduplicated,
-		fingerprint: catalogFingerprint(deduplicated),
+		skills: prepared.skills.map((skill) => ({ ...skill })),
+		fingerprint: prepared.fingerprint,
 		budget: {
 			requestedChars,
 			usedChars,
@@ -436,6 +526,11 @@ export function renderStableSkillCatalog(text: string, options: StableCatalogOpt
 			overBudgetChars: Math.max(0, usedChars - requestedChars),
 		},
 	};
+	stableCatalogRenderCache.set(renderCacheKey, result);
+	while (stableCatalogRenderCache.size > STABLE_CATALOG_CACHE_MAX) {
+		stableCatalogRenderCache.delete(stableCatalogRenderCache.keys().next().value as string);
+	}
+	return cloneStableCatalogResult(result);
 }
 
 interface TermDocument {

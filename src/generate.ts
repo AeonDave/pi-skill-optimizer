@@ -213,6 +213,13 @@ export function interpretBatchResponse(response: ModelResponse): BatchResponseOu
 			retryable: stopReason === "error",
 		};
 	}
+	if (stopReason !== "stop") {
+		return {
+			status: "failed",
+			reason: `unexpected stop reason: ${stopReason ?? "missing"}`,
+			retryable: false,
+		};
+	}
 	let parsed: unknown;
 	try {
 		parsed = parseJsonObject(responseText(response));
@@ -238,36 +245,105 @@ export interface GeneratedBatchProfile {
 	processedSkills: readonly string[];
 }
 
+export interface FailedBatchGeneration {
+	status: "failed";
+	reason: string;
+	retryable: boolean;
+}
+
+export type BatchGenerationAttempt = GeneratedBatchProfile | FailedBatchGeneration;
+
+/** Provider/network failures may be retried, but explicit cancellation is terminal. */
+export function isRetryableBatchException(error: unknown): boolean {
+	if (!(error instanceof Error)) return true;
+	if (error.name === "AbortError") return false;
+	return error.message.trim().toLowerCase() !== "request was aborted";
+}
+
+/** Progress from a batched generation so the caller can checkpoint and report. */
+export type BatchGenerationEvent =
+	| {
+		type: "committed";
+		index: number;
+		total: number;
+		batchNames: readonly string[];
+		applied: ReadonlySet<string>;
+		partial: SkillOptimizerProfile;
+	}
+	| {
+		type: "rejected";
+		index: number;
+		total: number;
+		attempt: number;
+		reason: string;
+		retryable: boolean;
+	};
+
 /**
  * Run `runBatch` over deterministic count- and UTF-8-bounded groups, merging the profiles
  * of the batches that succeed. `runBatch` returns the parsed+normalized profile for a
  * batch, or `undefined` if that batch failed (the caller is expected to have logged why).
  * Returns `undefined` only when *every* batch failed, so a single bad batch never loses
  * the whole run and the caller can persist a partial profile.
+ *
+ * `onEvent` fires after each successful batch (`committed`) so the caller can checkpoint
+ * immediately, and when a parsed response fails coverage (`rejected`) before retry.
  */
 export async function generateProfileInBatches(
 	targetSkills: readonly SkillRef[],
 	limits: SkillBatchLimits,
-	runBatch: (batch: SkillRef[], index: number, total: number, attempt: number) => Promise<GeneratedBatchProfile | undefined>,
+	runBatch: (batch: SkillRef[], index: number, total: number, attempt: number) => Promise<BatchGenerationAttempt | undefined>,
+	onEvent?: (event: BatchGenerationEvent) => Promise<void> | void,
 ): Promise<BatchGenerationResult | undefined> {
 	const normalizedLimits = normalizeBatchLimits(limits);
 	const batches = batchSkillsByWeight(targetSkills, normalizedLimits);
-	const partials: SkillOptimizerProfile[] = [];
+	let partial = EMPTY_PROFILE;
 	const applied = new Set<string>();
+	let committed = 0;
 	for (let i = 0; i < batches.length; i++) {
 		const batch = batches[i];
 		const expected = new Set(batch.map((skill) => skill.name));
 		for (let attempt = 1; attempt <= normalizedLimits.maxAttempts; attempt++) {
 			const generated = await runBatch(batch, i, batches.length, attempt);
 			if (!generated) continue;
+			if ("status" in generated) {
+				await onEvent?.({
+					type: "rejected",
+					index: i,
+					total: batches.length,
+					attempt,
+					reason: generated.reason,
+					retryable: generated.retryable,
+				});
+				if (!generated.retryable) break;
+				continue;
+			}
 			const covered = new Set(generated.processedSkills);
-			if (covered.size !== expected.size || [...covered].some((name) => !expected.has(name))) continue;
-			partials.push(generated.profile);
+			if (covered.size !== expected.size || [...covered].some((name) => !expected.has(name))) {
+				await onEvent?.({
+					type: "rejected",
+					index: i,
+					total: batches.length,
+					attempt,
+					reason: "incomplete coverage",
+					retryable: true,
+				});
+				continue;
+			}
+			partial = mergeProfiles(partial, generated.profile);
 			for (const name of expected) applied.add(name);
+			committed += 1;
+			await onEvent?.({
+				type: "committed",
+				index: i,
+				total: batches.length,
+				batchNames: batch.map((skill) => skill.name),
+				applied: new Set(applied),
+				partial,
+			});
 			break;
 		}
 	}
-	if (partials.length === 0) return undefined;
-	const partial = partials.reduce((acc, p) => mergeProfiles(acc, p), EMPTY_PROFILE);
+	if (committed === 0) return undefined;
 	return { partial, applied };
 }

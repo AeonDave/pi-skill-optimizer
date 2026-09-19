@@ -35,7 +35,7 @@ The index contains no filesystem paths. With the same catalog, profile, and conf
 
 ### Request-specific prefetch
 
-AUTO extracts intent only from genuine human text in Anthropic, OpenAI Chat and Responses, Gemini, and Mistral request shapes. Assistant text, tool or function results, injected context, image metadata, and empty input cannot create a ranking signal.
+AUTO extracts intent only from genuine human text in Anthropic, OpenAI Chat and Responses (including developer messages in `input`), Gemini, Mistral, and Pi's structured `pi-messages` request shapes. Assistant text, tool or function results, injected context, image metadata, and empty input cannot create a ranking signal.
 
 Ranking uses exact matching, BM25F, bounded name and alias typo recovery, reciprocal-rank fusion, diversity, profile evidence, and decayed usage evidence. It scores full source descriptions, then appends a bounded set of full verbatim definitions to the latest human block. The overlay is separate from the stable prefix, fingerprinted, idempotent, and omitted when there is no valid target.
 
@@ -77,7 +77,7 @@ Start Pi and generate the routing profile:
 /skill-optimizer init
 ```
 
-`init` is explicit model work. It batches full descriptions by skill count and UTF-8 input size, validates complete coverage and provider stop reason, and retries incomplete batches. Ordinary discovery does not call a model.
+`init` is explicit model work. It notifies at start and completion while per-batch progress stays in the transient status line. It batches full descriptions by skill count and UTF-8 input size, validates complete coverage and a successful provider stop reason, retries only retryable failures, and checkpoints each successful batch so interrupted work is not lost. A changed skill whose regeneration fails stays unhashed and inactive until retry, rather than serving stale routing. Init also repairs global/project profile ownership without another model call. Ordinary discovery does not call a model.
 
 For local development:
 
@@ -165,9 +165,9 @@ Profile, usage, and statistics updates use atomic replacement and lock-serialize
 - Full output archives stay local.
 - `.pi/skill-optimizer/benchmark/` must not be committed.
 
-## Current benchmark
+## Published v2.0.0 benchmark snapshot
 
-The current private, anonymized run covers 8 cases and 332 skills.
+The published private, anonymized v2.0.0 snapshot (`8a0b28a`, 2026-09-01) covers 8 cases and 332 skills. It predates the Unreleased provider-shape and runtime-cache changes; it is retained as release evidence, not presented as a fresh measurement of this working tree. Provider and model revisions were not recorded in the original run.
 
 | Metric | Baseline/raw | AUTO | Change |
 | --- | ---: | ---: | ---: |
@@ -199,13 +199,14 @@ AUTO makes the tested large catalogs substantially cheaper, not free, and does n
 npm run typecheck
 npm test
 npm run bench
+npm run bench:perf
 npm run bench:output
 npm run corpus:build
 npm run bench:real
 npm run measure <capture.json>
 ```
 
-The first four commands are local gates. `corpus:build` and `bench:real` are explicit remote workflows and may incur provider cost.
+The first five commands are local gates. `bench:perf` reports cold and steady provider-request latency at 284 and 2,000 synthetic skills; it is a regression measurement, not a hardware-independent pass threshold. `corpus:build` and `bench:real` are explicit remote workflows and may incur provider cost.
 
 ## References
 

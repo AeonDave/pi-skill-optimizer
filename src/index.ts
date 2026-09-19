@@ -13,8 +13,15 @@ import {
 	getUsageFilePath,
 	isDisabled,
 } from "./config.ts";
-import { generateProfileInBatches, interpretBatchResponse, responseText } from "./generate.ts";
+import {
+	batchSkillsByWeight,
+	generateProfileInBatches,
+	interpretBatchResponse,
+	isRetryableBatchException,
+	responseText,
+} from "./generate.ts";
 import { deduplicateToolResultHistory, type HistoryArtifact } from "./history.ts";
+import { buildInitProfileWrites, needsProfileScopeRepair } from "./init-profile.ts";
 import { optimizePayload } from "./optimize.ts";
 import {
 	buildExtractPrompt,
@@ -42,7 +49,6 @@ import {
 	saveTemporaryOutput,
 	saveUsageDelta,
 	writeProfileFiles,
-	type ProfileWrite,
 	type SavedStats,
 } from "./persistence.ts";
 import {
@@ -52,7 +58,6 @@ import {
 	mergeIncrementalProfile,
 	mergeProfiles,
 	pruneProfileNames,
-	splitProfileByScope,
 	type SkillOptimizerProfile,
 } from "./profile.ts";
 import { createSkillRegistry, type SkillRegistry } from "./skill-loader.ts";
@@ -134,10 +139,6 @@ function setStatus(ctx: ExtensionContext, text: string | undefined): void {
 
 function profileSummary(profile: SkillOptimizerProfile): string {
 	return `${profile.critical.length} critical, ${Object.keys(profile.queries).length} query sets, ${Object.keys(profile.clusters).length} clusters`;
-}
-
-function pickKeys(record: Record<string, string>, keep: (name: string) => boolean): Record<string, string> {
-	return Object.fromEntries(Object.entries(record).filter(([name]) => keep(name)));
 }
 
 function usagePruneOptions(snapshot: RuntimeSnapshot): UsagePruneOptions {
@@ -279,6 +280,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	let lastRemovedChars = 0;
 	let lastBudget = { usedChars: 0, requestedChars: 0, nameOnlyCount: 0 };
 	let rtkPresence: boolean | undefined;
+	let hasStatus = false;
+	let lastStatusText: string | undefined;
 	const usedTools = new Set<string>();
 	const seenEvidence = new Set<string>();
 	const seenProviderMessages = new Set<string>();
@@ -292,6 +295,23 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	const pendingUsage = new Map<string, SkillUsageStats>();
 	const statsBase = new Map<string, SavedStats>();
 	let lastFlushAt = 0;
+
+	const setSessionStatus = (ctx: ExtensionContext, text: string | undefined): void => {
+		if (hasStatus && lastStatusText === text) return;
+		setStatus(ctx, text);
+		hasStatus = true;
+		lastStatusText = text;
+	};
+
+	const reportInitProgress = (
+		ctx: ExtensionContext,
+		message: string,
+		type: "info" | "warning" | "error" = "info",
+		notify = true,
+	): void => {
+		if (notify) ctx.ui.notify(message, type);
+		setSessionStatus(ctx, message);
+	};
 
 	const stateFallback = (ctx: ExtensionContext, config: ConfigRecord): RuntimeSnapshot => {
 		const profilePaths = getProfilePaths(ctx.cwd);
@@ -418,7 +438,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const denominator = sessionCache.input + sessionCache.cacheRead + sessionCache.cacheWrite;
 		const cache = denominator > 0 ? `${Math.round(sessionCache.cacheRead * 100 / denominator)}% cache` : "cache n/a";
 		const saved = totalSavings(sessionSaved);
-		setStatus(ctx, `AUTO | -${approxK(saved)} tok | ${cache}`);
+		setSessionStatus(ctx, `AUTO | -${approxK(saved)} tok | ${cache}`);
 	};
 
 	const storeHistoryArtifact = (artifact: HistoryArtifact): void => {
@@ -629,13 +649,13 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 
 	const initProfile = async (ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1]): Promise<void> => {
 		if (!ctx.model) {
-			ctx.ui.notify("skill-optimizer: no model selected", "error");
+			reportInitProgress(ctx, "skill-optimizer: init failed: no model selected", "error");
 			return;
 		}
 		const model = ctx.model;
 		const skills = skillInputs(ctx.getSystemPromptOptions().skills ?? []);
 		if (skills.length === 0) {
-			ctx.ui.notify("skill-optimizer: no model-invocable skills found", "warning");
+			reportInitProgress(ctx, "skill-optimizer: init failed: no model-invocable skills found", "warning");
 			return;
 		}
 		const paths = getProfilePaths(ctx.cwd);
@@ -645,7 +665,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			stored = readStoredProfile(paths.global);
 			projectStored = paths.project !== paths.global ? readStoredProfile(paths.project) : undefined;
 		} catch (error) {
-			ctx.ui.notify(`skill-optimizer: profile read failed (${(error as Error).message})`, "error");
+			reportInitProgress(ctx, `skill-optimizer: init failed: profile read failed (${(error as Error).message})`, "error");
 			return;
 		}
 		const baseProfile = projectStored?.exists ? mergeProfiles(stored.profile, projectStored.profile) : stored.profile;
@@ -655,17 +675,80 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			|| (!!projectStored?.exists && projectStored.initVersion !== INIT_VERSION);
 		const refs = skills.map((skill) => ({ name: skill.name, description: skill.description }));
 		const { changed, removed, hashes } = diffSkills(refs, forceFull ? {} : storedHashes);
-		if (!forceFull && changed.length === 0 && removed.length === 0) {
-			ctx.ui.notify(`skill-optimizer: profile already current (${skills.length} skills)`, "info");
+		const projectNames = new Set(skills
+			.filter((skill) => skill.sourceInfo.scope === "project")
+			.map((skill) => skill.name));
+		const scopeRepair = needsProfileScopeRepair({
+			paths,
+			projectNames,
+			global: stored,
+			project: projectStored,
+		});
+		if (!forceFull && changed.length === 0 && removed.length === 0 && !scopeRepair) {
+			reportInitProgress(ctx, `skill-optimizer: init done: profile already current (${skills.length} skills)`);
 			return;
 		}
 
+		const batchLimits = {
+			maxSkills: INIT_BATCH_MAX_SKILLS,
+			maxUtf8Bytes: INIT_BATCH_MAX_UTF8_BYTES,
+			maxAttempts: INIT_BATCH_MAX_ATTEMPTS,
+		};
+		const changedNames = new Set(changed);
+		const targetSkills = refs.filter((skill) => changedNames.has(skill.name));
+		const batches = targetSkills.length > 0 ? batchSkillsByWeight(targetSkills, batchLimits) : [];
+		const invalidatedNames = new Set([...removed, ...changed]);
+		const prunedBase = pruneProfileNames(forceFull ? EMPTY_PROFILE : baseProfile, invalidatedNames);
 		let partial = EMPTY_PROFILE;
 		let appliedChanged: string[] = [];
-		let failedChanged: string[] = [];
+		let savedCount = 0;
+		let checkpointedProfile: SkillOptimizerProfile | undefined;
+		let checkpointedApplied = new Set<string>();
+
+		const persist = (nextPartial: SkillOptimizerProfile, applied: readonly string[]): SkillOptimizerProfile => {
+			const appliedSet = new Set(applied);
+			const profile = mergeIncrementalProfile(prunedBase, nextPartial, applied);
+			const pending = changed.filter((name) => !appliedSet.has(name));
+			writeProfileFiles(buildInitProfileWrites({
+				paths,
+				profile,
+				hashes: computeFinalHashes(hashes, pending),
+				skillCount: skills.length,
+				projectNames,
+				globalRevision: stored.revision,
+				projectRevision: projectStored?.revision ?? null,
+				projectExists: !!projectStored?.exists,
+			}), INIT_VERSION);
+			stored = readStoredProfile(paths.global);
+			if (projectStored !== undefined) projectStored = readStoredProfile(paths.project);
+			snapshot = undefined;
+			retryAfter = 0;
+			savedCount = appliedSet.size;
+			checkpointedProfile = profile;
+			checkpointedApplied = appliedSet;
+			return profile;
+		};
+
+		const persistError = (error: unknown): string => error instanceof ConcurrentFileUpdateError
+			? "profile changed concurrently; run init again"
+			: (error as Error).message;
+
+		reportInitProgress(
+			ctx,
+			`skill-optimizer: init starting (${skills.length} skills, ${batches.length} batch${batches.length === 1 ? "" : "es"}${removed.length > 0 ? `, ${removed.length} removed` : ""})`,
+		);
+
+		if (!forceFull && removed.length > 0) {
+			try {
+				persist(EMPTY_PROFILE, []);
+			} catch (error) {
+				reportInitProgress(ctx, `skill-optimizer: init failed: profile not saved (${persistError(error)})`, "error");
+				return;
+			}
+			reportInitProgress(ctx, `skill-optimizer: init saved ${removed.length} removal(s)`, "info", false);
+		}
+
 		if (changed.length > 0) {
-			const changedNames = new Set(changed);
-			const targetSkills = refs.filter((skill) => changedNames.has(skill.name));
 			const systemPrompt = [
 				"Generate a compact JSON retrieval profile for the supplied skills.",
 				"Return JSON only, with no markdown.",
@@ -678,118 +761,137 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				"Keep values concise. Do not emit aliases.",
 				...(forceFull ? [] : ["Emit name-owned entries only for these new or modified skills."]),
 			].join("\n");
-			const result = await generateProfileInBatches(
-				targetSkills,
-				{
-					maxSkills: INIT_BATCH_MAX_SKILLS,
-					maxUtf8Bytes: INIT_BATCH_MAX_UTF8_BYTES,
-					maxAttempts: INIT_BATCH_MAX_ATTEMPTS,
-				},
-				async (batch, index, total, attempt) => {
-					const label = `batch ${index + 1}/${total}, attempt ${attempt}`;
-					const message: UserMessage = {
-						role: "user",
-						content: [{
-							type: "text",
-							text: JSON.stringify({
-								skills: batch.map((skill) => ({
-									name: skill.name,
-									description: skill.description,
-								})),
-							}),
-						}],
-						timestamp: Date.now(),
-					};
-					try {
-						const response = await ctx.modelRegistry.complete(
-							model,
-							{ systemPrompt, messages: [message] },
+			let result: Awaited<ReturnType<typeof generateProfileInBatches>>;
+			try {
+				result = await generateProfileInBatches(
+					targetSkills,
+					batchLimits,
+					async (batch, index, total, attempt) => {
+						const label = `${index + 1}/${total}`;
+						reportInitProgress(
+							ctx,
+							`skill-optimizer: init ${label} starting (${batch.length} skills${attempt > 1 ? `, attempt ${attempt}` : ""})`,
+							"info",
+							false,
 						);
-						const outcome = interpretBatchResponse(response);
-						if (outcome.status === "failed") {
-							ctx.ui.notify(`skill-optimizer: ${label} ${outcome.reason}`, "warning");
-							return undefined;
+						const message: UserMessage = {
+							role: "user",
+							content: [{
+								type: "text",
+								text: JSON.stringify({
+									skills: batch.map((skill) => ({
+										name: skill.name,
+										description: skill.description,
+									})),
+								}),
+							}],
+							timestamp: Date.now(),
+						};
+						try {
+							const response = await ctx.modelRegistry.complete(
+								model,
+								{ systemPrompt, messages: [message] },
+							);
+							const outcome = interpretBatchResponse(response);
+							if (outcome.status === "failed") {
+								return outcome;
+							}
+							return { profile: outcome.profile, processedSkills: outcome.processedSkills };
+						} catch (error) {
+							return {
+								status: "failed",
+								reason: `failed (${(error as Error).message})`,
+								retryable: isRetryableBatchException(error),
+							};
 						}
-						return { profile: outcome.profile, processedSkills: outcome.processedSkills };
-					} catch (error) {
-						ctx.ui.notify(`skill-optimizer: ${label} failed (${(error as Error).message})`, "warning");
-						return undefined;
-					}
-				},
-			);
-			if (!result) {
-				ctx.ui.notify("skill-optimizer: every init batch failed; nothing written", "error");
+					},
+					async (event) => {
+						if (event.type === "rejected") {
+							reportInitProgress(
+								ctx,
+								`skill-optimizer: init ${event.index + 1}/${event.total} attempt ${event.attempt} ${event.reason}${event.retryable ? "; retrying" : ""}`,
+								"warning",
+								!event.retryable,
+							);
+							return;
+						}
+						const applied = changed.filter((name) => event.applied.has(name));
+						persist(event.partial, applied);
+						appliedChanged = applied;
+						partial = event.partial;
+						reportInitProgress(
+							ctx,
+							`skill-optimizer: init ${event.index + 1}/${event.total} saved (${event.batchNames.length} skills, ${applied.length} written)`,
+							"info",
+							false,
+						);
+					},
+				);
+			} catch (error) {
+				reportInitProgress(
+					ctx,
+					`skill-optimizer: init failed: profile not saved (${persistError(error)})${savedCount > 0 ? `; ${savedCount} skills already written` : ""}`,
+					"error",
+				);
 				return;
 			}
-			partial = result.partial;
+			if (!result) {
+				let profile = checkpointedProfile;
+				if (!profile) {
+					try {
+						profile = persist(EMPTY_PROFILE, []);
+					} catch (error) {
+						reportInitProgress(
+							ctx,
+							`skill-optimizer: init failed: profile not saved (${persistError(error)})`,
+							"error",
+						);
+						return;
+					}
+				}
+				reportInitProgress(
+					ctx,
+					`skill-optimizer: init failed: every batch failed; ${changed.length} changed skill(s) left inactive for retry; ${profileSummary(profile)}`,
+					"error",
+				);
+				return;
+			}
 			appliedChanged = changed.filter((name) => result.applied.has(name));
-			failedChanged = changed.filter((name) => !result.applied.has(name));
+			partial = result.partial;
 		}
 
-		const finalHashes = computeFinalHashes(hashes, failedChanged);
-		const profile = mergeIncrementalProfile(
-			pruneProfileNames(forceFull ? EMPTY_PROFILE : baseProfile, removed),
-			partial,
-			appliedChanged,
-		);
-		const projectNames = new Set(skills
-			.filter((skill) => skill.sourceInfo.scope === "project")
-			.map((skill) => skill.name));
-		const split = paths.project !== paths.global && projectNames.size > 0;
-		const writes: ProfileWrite[] = [];
-		if (!split) {
-			writes.push({
-				path: paths.global,
-				profile,
-				skillCount: skills.length,
-				hashes: finalHashes,
-				expectedRevision: stored.revision,
-			});
-			if (projectStored?.exists) writes.push({
-				path: paths.project,
-				profile: EMPTY_PROFILE,
-				skillCount: 0,
-				hashes: {},
-				expectedRevision: projectStored.revision,
-			});
+		let profile: SkillOptimizerProfile;
+		const finalApplied = new Set(appliedChanged);
+		const checkpointIsFinal = checkpointedProfile !== undefined
+			&& checkpointedApplied.size === finalApplied.size
+			&& [...finalApplied].every((name) => checkpointedApplied.has(name));
+		if (checkpointIsFinal && checkpointedProfile) {
+			profile = checkpointedProfile;
 		} else {
-			const scoped = splitProfileByScope(profile, projectNames);
-			writes.push(
-				{
-					path: paths.global,
-					profile: scoped.global,
-					skillCount: Object.keys(finalHashes).filter((name) => !projectNames.has(name)).length,
-					hashes: pickKeys(finalHashes, (name) => !projectNames.has(name)),
-					expectedRevision: stored.revision,
-				},
-				{
-					path: paths.project,
-					profile: scoped.project,
-					skillCount: Object.keys(finalHashes).filter((name) => projectNames.has(name)).length,
-					hashes: pickKeys(finalHashes, (name) => projectNames.has(name)),
-					expectedRevision: projectStored?.revision ?? null,
-				},
-			);
+			try {
+				profile = persist(partial, appliedChanged);
+			} catch (error) {
+				reportInitProgress(
+					ctx,
+					`skill-optimizer: init failed: profile not saved (${persistError(error)})${savedCount > 0 ? `; ${savedCount} skills already written` : ""}`,
+					"error",
+				);
+				return;
+			}
 		}
-		try {
-			writeProfileFiles(writes, INIT_VERSION);
-		} catch (error) {
-			const detail = error instanceof ConcurrentFileUpdateError
-				? "profile changed concurrently; run init again"
-				: (error as Error).message;
-			ctx.ui.notify(`skill-optimizer: profile not saved (${detail})`, "error");
-			return;
-		}
-		snapshot = undefined;
-		retryAfter = 0;
+		const appliedChangedSet = new Set(appliedChanged);
+		const failedChanged = changed.filter((name) => !appliedChangedSet.has(name));
 		const newCount = appliedChanged.filter((name) => !(name in storedHashes)).length;
-		ctx.ui.notify(
-			`skill-optimizer: init v4 +${newCount}, ~${appliedChanged.length - newCount}, -${removed.length}, retry ${failedChanged.length}; ${profileSummary(profile)}`,
-			"info",
+		reportInitProgress(
+			ctx,
+			`skill-optimizer: init done v4 +${newCount}, ~${appliedChanged.length - newCount}, -${removed.length}, retry ${failedChanged.length}; ${profileSummary(profile)}`,
+			failedChanged.length > 0 ? "warning" : "info",
 		);
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		hasStatus = false;
+		lastStatusText = undefined;
 		restorePermittedTools();
 		snapshot = undefined;
 		retryAfter = 0;
@@ -1097,7 +1199,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		restorePermittedTools();
 		historyArtifacts.clear();
 		historyOrder.length = 0;
-		setStatus(ctx, undefined);
+		setSessionStatus(ctx, undefined);
 	});
 
 	pi.registerCommand("skill-optimizer", {
@@ -1105,7 +1207,11 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const command = args.trim().toLowerCase();
 			if (command === "init") {
-				await initProfile(ctx);
+				try {
+					await initProfile(ctx);
+				} finally {
+					updateStatus(ctx);
+				}
 				return;
 			}
 			const skills = skillInputs(ctx.getSystemPromptOptions().skills ?? []);
