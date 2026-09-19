@@ -4,6 +4,8 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 2.1.0 - 2026-09-20
+
 ### Added
 
 - A deterministic `bench:perf` harness reports cold and steady request-transform latency at 284 and 2,000 synthetic skills.

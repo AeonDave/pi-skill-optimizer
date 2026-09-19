@@ -1,6 +1,6 @@
 {
   "name": "pi-skill-optimizer",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": false,
   "type": "module",
   "description": "Pi extension that reduces repeated request tokens while preserving skill discovery and loadability.",
@@ -36,7 +36,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/request.test.ts test/history.test.ts test/skills.test.ts test/skill-loader.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/generate.test.ts test/init.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts test/usage.test.ts test/persistence.test.ts test/corpus.test.ts test/evaluation.test.ts test/luna.test.ts",
+    "test": "node --import tsx --test test/request.test.ts test/history.test.ts test/skills.test.ts test/skill-loader.test.ts test/tools.test.ts test/optimize.test.ts test/profile.test.ts test/generate.test.ts test/init.test.ts test/config.test.ts test/fuzz.test.ts test/output.test.ts test/stats.test.ts test/usage.test.ts test/persistence.test.ts test/corpus.test.ts test/evaluation.test.ts test/luna.test.ts test/release-metadata.test.ts",
     "measure": "node --import tsx scripts/measure.ts",
     "bench": "node --import tsx scripts/bench.ts",
     "bench:perf": "node --import tsx scripts/perf-bench.ts",

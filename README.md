@@ -67,9 +67,20 @@ Exact skill loading accepts only registered names. Resource and location resolut
 
 ## Install
 
+Requires **Pi ≥ 0.84.4** and **Node.js ≥ 22.19**. Run in your terminal:
+
 ```bash
 pi install npm:pi-skill-optimizer
 ```
+
+| Install option | Command |
+| --- | --- |
+| This project only | `pi install -l npm:pi-skill-optimizer` |
+| Pin this release | `pi install npm:pi-skill-optimizer@2.1.0` |
+| Update an unpinned install | `pi update npm:pi-skill-optimizer` |
+
+Restart Pi after installing or updating. A pinned install stays on that version until you install a
+new version explicitly.
 
 Start Pi and generate the routing profile:
 
@@ -207,6 +218,10 @@ npm run measure <capture.json>
 ```
 
 The first five commands are local gates. `bench:perf` reports cold and steady provider-request latency at 284 and 2,000 synthetic skills; it is a regression measurement, not a hardware-independent pass threshold. `corpus:build` and `bench:real` are explicit remote workflows and may incur provider cost.
+
+Release metadata moves together: `package.json`, both root versions in `package-lock.json`, the
+changelog heading, and the pinned npm install command above. The suite checks this set before a tag
+or npm publish.
 
 ## References
 
