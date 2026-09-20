@@ -4,6 +4,12 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 2.1.1 - 2026-09-20
+
+### Fixed
+
+- `/skill-optimizer init` preserves the provider failure in terminal diagnostics, reports retries only when another attempt will run, and treats exhausted quota or billing limits as terminal instead of submitting the same batch again.
+
 ## 2.1.0 - 2026-09-20
 
 ### Added

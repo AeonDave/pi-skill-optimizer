@@ -1,6 +1,6 @@
 {
   "name": "pi-skill-optimizer",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": false,
   "type": "module",
   "description": "Pi extension that reduces repeated request tokens while preserving skill discovery and loadability.",

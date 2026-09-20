@@ -76,7 +76,7 @@ pi install npm:pi-skill-optimizer
 | Install option | Command |
 | --- | --- |
 | This project only | `pi install -l npm:pi-skill-optimizer` |
-| Pin this release | `pi install npm:pi-skill-optimizer@2.1.0` |
+| Pin this release | `pi install npm:pi-skill-optimizer@2.1.1` |
 | Update an unpinned install | `pi update npm:pi-skill-optimizer` |
 
 Restart Pi after installing or updating. A pinned install stays on that version until you install a
