@@ -762,6 +762,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				...(forceFull ? [] : ["Emit name-owned entries only for these new or modified skills."]),
 			].join("\n");
 			let result: Awaited<ReturnType<typeof generateProfileInBatches>>;
+			let lastBatchFailure: string | undefined;
 			try {
 				result = await generateProfileInBatches(
 					targetSkills,
@@ -807,11 +808,13 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 					},
 					async (event) => {
 						if (event.type === "rejected") {
+							const willRetry = event.retryable && event.attempt < batchLimits.maxAttempts;
+							lastBatchFailure = `${event.index + 1}/${event.total} attempt ${event.attempt}: ${event.reason}`;
 							reportInitProgress(
 								ctx,
-								`skill-optimizer: init ${event.index + 1}/${event.total} attempt ${event.attempt} ${event.reason}${event.retryable ? "; retrying" : ""}`,
+								`skill-optimizer: init ${event.index + 1}/${event.total} attempt ${event.attempt} ${event.reason}${willRetry ? "; retrying" : ""}`,
 								"warning",
-								!event.retryable,
+								!willRetry,
 							);
 							return;
 						}
@@ -851,7 +854,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				}
 				reportInitProgress(
 					ctx,
-					`skill-optimizer: init failed: every batch failed; ${changed.length} changed skill(s) left inactive for retry; ${profileSummary(profile)}`,
+					`skill-optimizer: init failed: every batch failed (${lastBatchFailure ?? "unknown batch failure"}); ${changed.length} changed skill(s) left inactive for retry; ${profileSummary(profile)}`,
 					"error",
 				);
 				return;

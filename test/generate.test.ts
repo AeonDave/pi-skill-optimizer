@@ -94,6 +94,15 @@ test("interpretBatchResponse fails on error/aborted with the errorMessage detail
 	const err = interpretBatchResponse({ stopReason: "error", errorMessage: "context length exceeded", content: [] });
 	assert.equal(err.status, "failed");
 	assert.match((err as { reason: string }).reason, /error: context length exceeded/);
+	assert.equal((err as { retryable: boolean }).retryable, true);
+
+	const exhausted = interpretBatchResponse({
+		stopReason: "error",
+		errorMessage: "429: Weekly/Monthly Limit Exhausted",
+		content: [],
+	});
+	assert.equal(exhausted.status, "failed");
+	assert.equal((exhausted as { retryable: boolean }).retryable, false);
 
 	const aborted = interpretBatchResponse({ stopReason: "aborted", content: [] });
 	assert.equal(aborted.status, "failed");
@@ -129,6 +138,7 @@ test("batch exception retry classification treats cancellation as terminal", () 
 	aborted.name = "AbortError";
 	assert.equal(isRetryableBatchException(aborted), false);
 	assert.equal(isRetryableBatchException(new Error("Request was aborted")), false);
+	assert.equal(isRetryableBatchException(new Error("429: Weekly/Monthly Limit Exhausted")), false);
 	assert.equal(isRetryableBatchException(new Error("temporary network failure")), true);
 });
 

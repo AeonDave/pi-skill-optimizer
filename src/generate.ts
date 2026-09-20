@@ -196,6 +196,20 @@ function generatedProfileFields(value: unknown): unknown {
 	};
 }
 
+/** Quota and billing exhaustion cannot recover within one init command. */
+function isRetryableModelError(errorMessage: string | undefined): boolean {
+	if (!errorMessage) return true;
+	const detail = errorMessage.toLowerCase();
+	return ![
+		"weekly/monthly limit exhausted",
+		"insufficient_quota",
+		"insufficient quota",
+		"quota exceeded",
+		"billing hard limit",
+		"credit balance is too low",
+	].some((marker) => detail.includes(marker));
+}
+
 /**
  * Classify truncated, errored, aborted, invalid, and explicitly uncovered batch
  * responses as failures. Successful responses must declare processed skill coverage.
@@ -210,7 +224,7 @@ export function interpretBatchResponse(response: ModelResponse): BatchResponseOu
 		return {
 			status: "failed",
 			reason: `${stopReason}${detail ? `: ${detail}` : ""}`,
-			retryable: stopReason === "error",
+			retryable: stopReason === "error" && isRetryableModelError(detail),
 		};
 	}
 	if (stopReason !== "stop") {
@@ -257,7 +271,8 @@ export type BatchGenerationAttempt = GeneratedBatchProfile | FailedBatchGenerati
 export function isRetryableBatchException(error: unknown): boolean {
 	if (!(error instanceof Error)) return true;
 	if (error.name === "AbortError") return false;
-	return error.message.trim().toLowerCase() !== "request was aborted";
+	return error.message.trim().toLowerCase() !== "request was aborted"
+		&& isRetryableModelError(error.message);
 }
 
 /** Progress from a batched generation so the caller can checkpoint and report. */

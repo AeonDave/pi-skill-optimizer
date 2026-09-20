@@ -171,7 +171,7 @@ test("init checkpoints a successful batch, avoids a stale final rewrite, and kee
 	}
 });
 
-test("init invalidates stale routing when every changed-skill batch fails", async () => {
+test("init invalidates stale routing and reports the provider cause when every changed-skill batch fails", async () => {
 	const root = mkdtempSync(join(tmpdir(), "sko-init-failed-change-"));
 	const cwd = join(root, "project");
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -207,9 +207,11 @@ test("init invalidates stale routing when every changed-skill batch fails", asyn
 			modelRegistry: {
 				async complete() {
 					modelCalls += 1;
-					const error = new Error("Request was aborted");
-					error.name = "AbortError";
-					throw error;
+					return {
+						stopReason: "error",
+						errorMessage: "429: Weekly/Monthly Limit Exhausted",
+						content: [],
+					};
 				},
 			},
 			getSystemPromptOptions: () => ({ skills: [skill] }),
@@ -230,7 +232,12 @@ test("init invalidates stale routing when every changed-skill batch fails", asyn
 			clusters: {},
 			negativeHints: {},
 		});
-		assert.ok(notifications.some((message) => message.includes("every batch failed")));
+		const attemptMessages = notifications.filter((message) => message.startsWith("skill-optimizer: init 1/1 attempt "));
+		assert.equal(attemptMessages.length, 1);
+		const finalAttempt = attemptMessages[0];
+		assert.match(finalAttempt, /429: Weekly\/Monthly Limit Exhausted/);
+		assert.doesNotMatch(finalAttempt, /retrying/);
+		assert.match(notifications.at(-1) ?? "", /every batch failed.*429: Weekly\/Monthly Limit Exhausted/);
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
