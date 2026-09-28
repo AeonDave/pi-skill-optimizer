@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -29,10 +29,30 @@ test("registry searches metadata but exact load returns no location", (t) => {
 		content: "reference body",
 	});
 	assert.ok(!("location" in registry.loadResource("alpha", "reference.txt")));
-	assert.equal(registry.locateExact("alpha").location, resolve(file));
+	assert.equal(registry.locateExact("alpha").location, realpathSync.native(file));
 	assert.throws(() => registry.loadExact("Alpha"), /Unknown skill name/);
 	assert.throws(() => registry.loadResource("alpha", "../outside.md"), /escapes its registered base/);
 	assert.throws(() => registry.loadResource("alpha", resolve(file)), /must be relative/);
+});
+
+test("registry accepts an aliased base and returns the canonical file location", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pi-skill-alias-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const realDir = join(root, "real");
+	const aliasDir = join(root, "alias");
+	mkdirSync(realDir);
+	const file = join(realDir, "SKILL.md");
+	const body = "# Alias\r\nPreserve the registered skill content.\n";
+	writeFileSync(file, body, "utf8");
+	symlinkSync(realDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
+	const registry = createSkillRegistry([{
+		name: "alias",
+		description: "Canonical location through a directory alias.",
+		filePath: join(aliasDir, "SKILL.md"),
+		baseDir: aliasDir,
+	}]);
+	assert.equal(registry.loadExact("alias").content, body);
+	assert.equal(registry.locateExact("alias").location, realpathSync.native(file));
 });
 
 test("registry rejects traversal outside the declared base", (t) => {

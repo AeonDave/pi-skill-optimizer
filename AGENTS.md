@@ -120,6 +120,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 
 - Request changes require Anthropic, OpenAI Chat and Responses, Gemini, and Mistral human/tool-result cases.
 - Ranking, base, overlay, loader, or dynamic-tool changes require focused tests and `npm run bench`.
+- Loader location assertions use canonical paths (`realpathSync.native`), not lexical `resolve`: macOS temporary paths may alias `/private/var`, and Windows temporary paths may use short names. Keep positive directory-alias and negative symlink-escape coverage.
 - Output or history changes require focused tests and `npm run bench:output`.
 - Other pure modules require their corresponding suites.
 - Hook or config changes require `npm run typecheck`, then `pi -e ./src/index.ts` with status, audit, and search/load smoke paths.
