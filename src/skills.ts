@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { contextualSkillNames } from "./activation.ts";
 import { buildCatalogAliases, expandQueryTokens, type QueryAliasMap } from "./aliases.ts";
 import { EMPTY_PROFILE, type SkillOptimizerProfile } from "./profile.ts";
 
@@ -49,7 +50,7 @@ export interface SkillPrefetchOptions {
 	fuzzyCandidateLimit?: number;
 }
 
-export type RankReason = "exact" | "lexical" | "fuzzy" | "profile" | "usage";
+export type RankReason = "exact" | "lexical" | "fuzzy" | "profile" | "usage" | "contextual";
 
 export interface RankedSkill {
 	skill: Skill;
@@ -205,10 +206,6 @@ function clamp(value: number, min: number, max: number): number {
 
 function unique<T>(values: Iterable<T>): T[] {
 	return [...new Set(values)];
-}
-
-function normalizedPhrase(text: string): string {
-	return tokenize(text).join(" ");
 }
 
 export function tokenize(text: string): string[] {
@@ -535,19 +532,26 @@ export function renderStableSkillCatalog(text: string, options: StableCatalogOpt
 
 interface TermDocument {
 	fields: Record<FieldName, Map<string, number>>;
+	fieldLengths: Record<FieldName, number>;
 	allTerms: Set<string>;
 	nameTerms: Set<string>;
 	intentTerms: Set<string>;
+	namePhraseTokens: string[];
+	namePhrase: string;
+	profileQueryPhrases: string[];
+	name: string;
+	nameSuffix: string | undefined;
 	aliasLabels: string[];
+	aliasLabelSet: Set<string>;
+	fuzzyLabels: string[] | undefined;
+	fuzzyLabelTrigrams: Set<string>[] | undefined;
 }
 
 interface CatalogAnalysis {
-	skills: readonly Skill[];
 	documents: TermDocument[];
 	df: Map<string, number>;
 	averageLengths: Record<FieldName, number>;
 	aliases: QueryAliasMap;
-	profile: SkillOptimizerProfile;
 	fingerprint: string;
 }
 
@@ -587,19 +591,33 @@ function analyzeCatalog(skills: readonly Skill[], profile: SkillOptimizerProfile
 	}
 
 	const documents = skills.map((skill): TermDocument => {
+		const namePhraseTokens = tokenize(skill.name);
 		const fields: Record<FieldName, Map<string, number>> = {
-			name: termFrequency(tokenize(skill.name)),
+			name: termFrequency(namePhraseTokens),
 			intent: termFrequency(tokenize(routingIntent(skill.description))),
 			description: termFrequency(tokenize(skill.description)),
 			queries: termFrequency((profile.queries[skill.name] ?? []).flatMap(tokenize)),
 		};
+		const fieldLengths = Object.fromEntries(FIELD_NAMES.map((field) => [
+			field,
+			[...fields[field].values()].reduce((sum, frequency) => sum + frequency, 0),
+		])) as Record<FieldName, number>;
 		const allTerms = new Set(FIELD_NAMES.flatMap((field) => [...fields[field].keys()]));
 		return {
 			fields,
+			fieldLengths,
 			allTerms,
 			nameTerms: new Set(fields.name.keys()),
 			intentTerms: new Set(fields.intent.keys()),
+			namePhraseTokens,
+			namePhrase: namePhraseTokens.join(" "),
+			profileQueryPhrases: (profile.queries[skill.name] ?? []).map((phrase) => tokenize(phrase).join(" ")),
+			name: skill.name,
+			nameSuffix: undefined,
 			aliasLabels: [],
+			aliasLabelSet: new Set(),
+			fuzzyLabels: undefined,
+			fuzzyLabelTrigrams: undefined,
 		};
 	});
 	const df = new Map<string, number>();
@@ -611,54 +629,61 @@ function analyzeCatalog(skills: readonly Skill[], profile: SkillOptimizerProfile
 		for (const [source, targets] of aliases) {
 			if (targets.some((target) => document.allTerms.has(target))) document.aliasLabels.push(source);
 		}
+		document.aliasLabelSet = new Set(document.aliasLabels);
 	}
 	const averageLengths = Object.fromEntries(FIELD_NAMES.map((field) => {
 		const total = documents.reduce((sum, document) =>
-			sum + [...document.fields[field].values()].reduce((count, frequency) => count + frequency, 0), 0);
+			sum + document.fieldLengths[field], 0);
 		return [field, Math.max(1, total / Math.max(1, documents.length))];
 	})) as Record<FieldName, number>;
-	const analysis: CatalogAnalysis = { skills, documents, df, averageLengths, aliases, profile, fingerprint };
+	const analysis: CatalogAnalysis = { documents, df, averageLengths, aliases, fingerprint };
 	analysisCache.set(cacheKey, analysis);
 	while (analysisCache.size > ANALYSIS_CACHE_MAX) analysisCache.delete(analysisCache.keys().next().value as string);
 	return analysis;
 }
 
-function bm25fScore(analysis: CatalogAnalysis, index: number, terms: readonly string[]): number {
+function bm25fScore(
+	analysis: CatalogAnalysis,
+	index: number,
+	terms: readonly string[],
+	idfByTerm: ReadonlyMap<string, number>,
+): number {
 	const document = analysis.documents[index];
-	const count = Math.max(1, analysis.documents.length);
 	let score = 0;
-	for (const term of unique(terms)) {
-		const documentFrequency = analysis.df.get(term) ?? 0;
-		if (documentFrequency === 0) continue;
+	for (const term of terms) {
+		const idf = idfByTerm.get(term) ?? 0;
+		if (idf === 0) continue;
 		let weightedFrequency = 0;
 		for (const field of FIELD_NAMES) {
 			const values = document.fields[field];
 			const frequency = values.get(term) ?? 0;
 			if (frequency === 0) continue;
-			const length = [...values.values()].reduce((sum, value) => sum + value, 0);
-			const normalization = 1 - FIELD_B[field] + FIELD_B[field] * (length / analysis.averageLengths[field]);
+			const normalization = 1 - FIELD_B[field] + FIELD_B[field] * (document.fieldLengths[field] / analysis.averageLengths[field]);
 			weightedFrequency += FIELD_WEIGHTS[field] * frequency / Math.max(0.2, normalization);
 		}
-		const idf = Math.log(1 + (count - documentFrequency + 0.5) / (documentFrequency + 0.5));
 		score += idf * (weightedFrequency * 2.2) / (weightedFrequency + 1.2);
 	}
 	return score;
 }
 
-function exactScore(analysis: CatalogAnalysis, index: number, query: string, rawTerms: readonly string[]): number {
-	const skill = analysis.skills[index];
-	const document = analysis.documents[index];
-	const queryPhrase = normalizedPhrase(query);
-	const namePhrase = normalizedPhrase(skill.name);
+function containsTokenPhrase(text: string, phrase: string): boolean {
+	return phrase.length > 0 && (` ${text} `).includes(` ${phrase} `);
+}
+
+function exactScore(
+	document: TermDocument,
+	queryPhrase: string,
+	rawTerms: readonly string[],
+	rawTermSet: ReadonlySet<string>,
+): number {
 	let score = 0;
-	if (namePhrase && (queryPhrase === namePhrase || queryPhrase.includes(namePhrase))) score = 12;
-	else if (document.nameTerms.size > 0 && [...document.nameTerms].every((term) => rawTerms.includes(term))) score = 8;
+	if (containsTokenPhrase(queryPhrase, document.namePhrase)) score = 12;
+	else if (document.nameTerms.size > 0 && [...document.nameTerms].every((term) => rawTermSet.has(term))) score = 8;
 	else if (rawTerms.some((term) => document.nameTerms.has(term))) score = 3;
-	for (const example of analysis.profile.queries[skill.name] ?? []) {
-		const examplePhrase = normalizedPhrase(example);
-		if (examplePhrase && (queryPhrase === examplePhrase || queryPhrase.includes(examplePhrase))) score = Math.max(score, 7);
+	for (const examplePhrase of document.profileQueryPhrases) {
+		if (containsTokenPhrase(queryPhrase, examplePhrase)) score = Math.max(score, 7);
 	}
-	if (rawTerms.some((term) => document.aliasLabels.includes(term))) score = Math.max(score, 4);
+	if (rawTerms.some((term) => document.aliasLabelSet.has(term))) score = Math.max(score, 4);
 	return score;
 }
 
@@ -688,25 +713,26 @@ function fuzzyScores(
 	coverage: number,
 	limit: number,
 ): number[] {
-	const scores = analysis.skills.map(() => 0);
+	const scores = analysis.documents.map(() => 0);
 	if (rawTerms.length === 0 || coverage >= 0.6 || limit <= 0) return scores;
 	const queryLabels = rawTerms.filter((term) => term.length >= 5);
 	if (queryLabels.length === 0) return scores;
+	const queryTrigrams = queryLabels.map(trigrams);
 	const querySuffix = terminalLabelSegment(query);
 	for (let index = 0; index < analysis.documents.length; index += 1) {
-		const skill = analysis.skills[index];
-		const labels = unique([
-			normalizedPhrase(skill.name).replace(/\s+/g, ""),
-			...tokenize(skill.name),
-			...analysis.documents[index].aliasLabels,
+		const document = analysis.documents[index];
+		const labels = document.fuzzyLabels ??= unique([
+			document.namePhraseTokens.join(""),
+			...document.namePhraseTokens,
+			...document.aliasLabels,
 		]).filter((label) => label.length >= 5);
+		const labelTrigrams = document.fuzzyLabelTrigrams ??= labels.map(trigrams);
 		let best = 0;
-		for (const queryLabel of queryLabels) {
-			const queryTrigrams = trigrams(queryLabel);
-			for (const label of labels) best = Math.max(best, dice(queryTrigrams, trigrams(label)));
+		for (const queryLabelTrigrams of queryTrigrams) {
+			for (const labelTri of labelTrigrams) best = Math.max(best, dice(queryLabelTrigrams, labelTri));
 		}
 		if (best >= 0.56) {
-			const nameSuffix = terminalLabelSegment(skill.name);
+			const nameSuffix = document.nameSuffix ??= terminalLabelSegment(document.name);
 			scores[index] = querySuffix && nameSuffix === querySuffix ? Math.min(1, best + 0.08) : best;
 		}
 	}
@@ -822,14 +848,25 @@ export function planSkillPrefetch(
 	const available = skills.filter((skill) => !matchesPattern(skill.name, never));
 	if (available.length === 0) return emptyPlan(query, available);
 	const analysis = analyzeCatalog(available, profile);
-	const rawTerms = unique(tokenize(query));
+	const queryTokens = tokenize(query);
+	const rawTerms = unique(queryTokens);
+	const rawTermSet = new Set(rawTerms);
+	const queryPhrase = queryTokens.join(" ");
 	const expandedTerms = expandQueryTokens(rawTerms, analysis.aliases);
 	const termMatches = rawTerms.filter((term) =>
 		analysis.df.has(term) || (analysis.aliases.get(term)?.length ?? 0) > 0
 	).length;
 	const coverage = rawTerms.length > 0 ? termMatches / rawTerms.length : 0;
-	const lexical = available.map((_, index) => bm25fScore(analysis, index, expandedTerms));
-	const exact = available.map((_, index) => exactScore(analysis, index, query, rawTerms));
+	const count = Math.max(1, available.length);
+	const idfByTerm = new Map<string, number>();
+	for (const term of expandedTerms) {
+		const documentFrequency = analysis.df.get(term) ?? 0;
+		if (documentFrequency > 0) {
+			idfByTerm.set(term, Math.log(1 + (count - documentFrequency + 0.5) / (documentFrequency + 0.5)));
+		}
+	}
+	const lexical = available.map((_, index) => bm25fScore(analysis, index, expandedTerms, idfByTerm));
+	const exact = available.map((_, index) => exactScore(analysis.documents[index], queryPhrase, rawTerms, rawTermSet));
 	const fuzzy = fuzzyScores(
 		analysis,
 		query,
@@ -909,23 +946,101 @@ export function planSkillPrefetch(
 		selectedNames.add(skill.name);
 	}
 	const budget = Math.max(0, Math.trunc(options.fullRenderBudgetChars ?? DEFAULT_FULL_RENDER_BUDGET_CHARS));
-	let marginalChars = selected.reduce((sum, skill) => sum + marginalRenderChars(skill), 0);
+	const marginalChars = selected.reduce((sum, skill) => sum + marginalRenderChars(skill), 0);
 	let ordinaryChars = 0;
-	let ordinaryCount = 0;
 	const skippedForBudget: string[] = [];
-	for (const entry of ranked) {
-		if (ordinaryCount >= desired) break;
-		if (selectedNames.has(entry.skill.name)) continue;
-		if (ordinaryChars + entry.marginalChars > budget) {
-			skippedForBudget.push(entry.skill.name);
-			continue;
+	const directSelectionOrder = new Map(ranked.map((entry, index) => [entry.skill.name, index]));
+	const availableByName = new Map(available.map((skill) => [skill.name, skill]));
+	const contextualNamesFor = (primaryName: string): string[] => {
+		if (profile.activation?.[primaryName]?.kind !== "specialist") return [];
+		return contextualSkillNames(profile.activation, primaryName).filter((name) => {
+			if (!availableByName.has(name) || selectedNames.has(name)) return false;
+			const negative = new Set((profile.negativeHints[name] ?? []).flatMap(tokenize));
+			if (rawTerms.some((term) => negative.has(term))) return false;
+			const directIndex = directSelectionOrder.get(name);
+			return directIndex === undefined || directIndex >= desired;
+		});
+	};
+	const exactDirectNames = new Set(ranked
+		.slice(0, desired)
+		.filter((entry) => entry.exactScore >= 8 && !selectedNames.has(entry.skill.name))
+		.map((entry) => entry.skill.name));
+	const reservedDirectLimit = Math.max(desired - 1, exactDirectNames.size);
+	const hasReachableContextualCandidate = desired >= 2
+		&& exactDirectNames.size < desired
+		&& ranked.slice(0, desired).some((entry) => contextualNamesFor(entry.skill.name).length > 0);
+	const directOrder = hasReachableContextualCandidate
+		? [
+			...ranked.filter((entry) => exactDirectNames.has(entry.skill.name)),
+			...ranked.filter((entry) => !exactDirectNames.has(entry.skill.name)),
+		]
+		: ranked;
+	const canReserveContextualSlot = hasReachableContextualCandidate
+		&& directOrder.slice(0, reservedDirectLimit).some((entry) => contextualNamesFor(entry.skill.name).length > 0);
+	const directLimit = canReserveContextualSlot ? reservedDirectLimit : desired;
+	const directSelected: RankedSkill[] = [];
+	const attemptedDirect = new Set<string>();
+	const selectDirectUntil = (limit: number, entries: readonly RankedSkill[]): void => {
+		for (const entry of entries) {
+			if (directSelected.length >= limit) break;
+			if (selectedNames.has(entry.skill.name) || attemptedDirect.has(entry.skill.name)) continue;
+			attemptedDirect.add(entry.skill.name);
+			if (ordinaryChars + entry.marginalChars > budget) {
+				skippedForBudget.push(entry.skill.name);
+				continue;
+			}
+			directSelected.push(entry);
+			selectedNames.add(entry.skill.name);
+			ordinaryChars += entry.marginalChars;
 		}
-		selected.push(entry.skill);
-		selectedNames.add(entry.skill.name);
-		ordinaryChars += entry.marginalChars;
-		marginalChars += entry.marginalChars;
-		ordinaryCount += 1;
+	};
+	selectDirectUntil(directLimit, directOrder);
+
+	let contextualEntry: RankedSkill | undefined;
+	if (canReserveContextualSlot) {
+		for (const primary of [...directSelected].sort((left, right) =>
+			(directSelectionOrder.get(left.skill.name) ?? 0) - (directSelectionOrder.get(right.skill.name) ?? 0)
+		)) {
+			for (const contextualName of contextualNamesFor(primary.skill.name)) {
+				const contextualSkill = availableByName.get(contextualName);
+				if (!contextualSkill || selectedNames.has(contextualName)) continue;
+				const contextualChars = marginalRenderChars(contextualSkill);
+				if (ordinaryChars + contextualChars > budget) {
+					skippedForBudget.push(contextualName);
+					continue;
+				}
+				const directEntry = ranked.find((entry) => entry.skill.name === contextualName);
+				contextualEntry = directEntry
+					? { ...directEntry, reasons: [...directEntry.reasons, "contextual"] }
+					: {
+						skill: contextualSkill,
+						score: 0,
+						lexicalScore: 0,
+						exactScore: 0,
+						fuzzyScore: 0,
+						usageScore: 0,
+						reasons: ["contextual"],
+						marginalChars: contextualChars,
+					};
+				selectedNames.add(contextualName);
+				ordinaryChars += contextualChars;
+				break;
+			}
+			if (contextualEntry) break;
+		}
 	}
+	if (!contextualEntry) selectDirectUntil(desired, ranked);
+	directSelected.sort((left, right) =>
+		(directSelectionOrder.get(left.skill.name) ?? 0) - (directSelectionOrder.get(right.skill.name) ?? 0)
+	);
+	selected.push(...directSelected.map((entry) => entry.skill));
+	if (contextualEntry) selected.push(contextualEntry.skill);
+	const contextualIsDirect = contextualEntry !== undefined && directSelectionOrder.has(contextualEntry.skill.name);
+	const rankedWithContext = contextualEntry
+		? contextualIsDirect
+			? ranked.map((entry) => entry.skill.name === contextualEntry?.skill.name ? contextualEntry : entry)
+			: [...ranked, contextualEntry]
+		: ranked;
 	return {
 		query,
 		fingerprint: analysis.fingerprint,
@@ -933,9 +1048,9 @@ export function planSkillPrefetch(
 		confidence,
 		selected,
 		selectedNames: selected.map((skill) => skill.name),
-		ranked,
-		marginalChars,
-		skippedForBudget,
+		ranked: rankedWithContext,
+		marginalChars: marginalChars + ordinaryChars,
+		skippedForBudget: unique(skippedForBudget),
 	};
 }
 
@@ -950,9 +1065,10 @@ export function renderSkillPrefetch(plan: SkillPrefetchPlan): string {
 }
 
 interface SearchCursorPayload {
-	v: 1;
+	v: 2;
 	f: string;
 	q: string;
+	r: string;
 	o: number;
 	s: string;
 }
@@ -961,34 +1077,42 @@ function searchQueryFingerprint(query: string): string {
 	return createHash("sha256").update(query, "utf8").digest("hex");
 }
 
-function cursorSignature(fingerprint: string, queryHash: string, offset: number): string {
+function rankedNamesFingerprint(ranked: readonly RankedSkill[]): string {
+	const hash = createHash("sha256").update("pi-skill-optimizer:rank-order:v1\0", "utf8");
+	for (const { skill } of ranked) hash.update(`${skill.name.length}:${skill.name}\0`, "utf8");
+	return hash.digest("hex");
+}
+
+function cursorSignature(fingerprint: string, queryHash: string, rankHash: string, offset: number): string {
 	return createHash("sha256")
-		.update(`pi-skill-optimizer:cursor:v1\0${fingerprint}\0${queryHash}\0${offset}`, "utf8")
+		.update(`pi-skill-optimizer:cursor:v2\0${fingerprint}\0${queryHash}\0${rankHash}\0${offset}`, "utf8")
 		.digest("hex")
 		.slice(0, 24);
 }
 
-function encodeSearchCursor(fingerprint: string, queryHash: string, offset: number): string {
+function encodeSearchCursor(fingerprint: string, queryHash: string, rankHash: string, offset: number): string {
 	const payload: SearchCursorPayload = {
-		v: 1,
+		v: 2,
 		f: fingerprint,
 		q: queryHash,
+		r: rankHash,
 		o: offset,
-		s: cursorSignature(fingerprint, queryHash, offset),
+		s: cursorSignature(fingerprint, queryHash, rankHash, offset),
 	};
 	return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 }
 
-function decodeSearchCursor(cursor: string, fingerprint: string, queryHash: string): number {
+function decodeSearchCursor(cursor: string, fingerprint: string, queryHash: string, rankHash: string): number {
 	try {
 		const payload = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<SearchCursorPayload>;
 		if (
-			payload.v !== 1
+			payload.v !== 2
 			|| payload.f !== fingerprint
 			|| payload.q !== queryHash
+			|| payload.r !== rankHash
 			|| !Number.isSafeInteger(payload.o)
 			|| (payload.o ?? -1) < 0
-			|| payload.s !== cursorSignature(fingerprint, queryHash, payload.o as number)
+			|| payload.s !== cursorSignature(fingerprint, queryHash, rankHash, payload.o as number)
 		) throw new Error("mismatch");
 		return payload.o as number;
 	} catch {
@@ -1004,8 +1128,9 @@ export function searchSkillCatalog(
 	const plan = planSkillPrefetch(skills, query, options);
 	const pageSize = clamp(Math.trunc(options.pageSize ?? 10), 1, 50);
 	const queryHash = searchQueryFingerprint(query);
+	const rankHash = rankedNamesFingerprint(plan.ranked);
 	const offset = options.cursor
-		? decodeSearchCursor(options.cursor, plan.fingerprint, queryHash)
+		? decodeSearchCursor(options.cursor, plan.fingerprint, queryHash, rankHash)
 		: 0;
 	const intentMaxChars = clamp(Math.trunc(options.intentMaxChars ?? DEFAULT_INTENT_MAX_CHARS), 24, 240);
 	const page = plan.ranked.slice(offset, offset + pageSize);
@@ -1029,7 +1154,7 @@ export function searchSkillCatalog(
 		total: plan.ranked.length,
 		items,
 		...(nextOffset < plan.ranked.length
-			? { nextCursor: encodeSearchCursor(plan.fingerprint, queryHash, nextOffset) }
+			? { nextCursor: encodeSearchCursor(plan.fingerprint, queryHash, rankHash, nextOffset) }
 			: {}),
 	};
 }

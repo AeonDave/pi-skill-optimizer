@@ -125,6 +125,23 @@ test("interpretBatchResponse parses valid output and rejects truncation as retry
 	assert.equal((truncated as { retryable: boolean }).retryable, true);
 });
 
+test("interpretBatchResponse includes validated activation metadata without weakening coverage", () => {
+	const withActivation = interpretBatchResponse(textResponse(JSON.stringify({
+		processedSkills: ["a"],
+		activation: { a: { kind: "workflow", tasks: ["software-change", "software-design"] } },
+	})));
+	assert.equal(withActivation.status, "ok");
+	if (withActivation.status === "ok") {
+		assert.deepEqual(withActivation.profile.activation, {
+			a: { kind: "workflow", tasks: ["software-change", "software-design"] },
+		});
+		assert.deepEqual(withActivation.processedSkills, ["a"]);
+	}
+	assert.equal(interpretBatchResponse(textResponse(JSON.stringify({
+		activation: { a: { kind: "workflow", tasks: ["software-change"] } },
+	}))).status, "failed");
+});
+
 test("interpretBatchResponse rejects non-success stop reasons", () => {
 	for (const stopReason of ["pending", "toolUse"] as const) {
 		const outcome = interpretBatchResponse(textResponse('{"processedSkills":["a"]}', stopReason));

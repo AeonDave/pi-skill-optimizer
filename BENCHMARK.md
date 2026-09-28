@@ -18,7 +18,7 @@ Status: **completed**
 | Project safety gate | **PASS** |
 | RTK external-comparator safety gate | **FAIL** |
 
-This is historical release evidence. It predates the Unreleased provider-shape and bounded runtime-cache changes and is not a measurement of the current working tree.
+This is historical release evidence. It predates the provider-shape and bounded runtime-cache changes released in v2.1.0 and is not a measurement of the current working tree.
 
 No raw request, catalog, output, path, account identifier, hostname, or private corpus record is published.
 
@@ -294,11 +294,19 @@ The benchmark also does not establish reduction of arbitrary system prompts or o
 npm run typecheck
 npm test
 npm run bench
+npm run bench:ranking
 npm run bench:perf
 npm run bench:output
 ```
 
 `npm run bench` covers discovery, loading, determinism, pagination, provider normalization, identity, and fuzz invariants. `npm run bench:output` covers byte safety, evidence, archive recovery, columnar round trips, extraction guards, history behavior, and RTK ownership.
+
+`npm run bench:ranking` compares BM25F-only, AUTO without fuzzy and full AUTO on
+a small hand-authored synthetic fixture. It is a component diagnostic, not a
+held-out relevance benchmark. [Current rationale and diagnostic results](docs/RANKING.md).
+`npm run bench:perf` reports runtime/platform, cold latency and 30 warm samples
+(mean, p50, p95) at 284 and 2,000 skills. These are request-preparation timings,
+not model, startup or terminal-redraw timings.
 
 ### Private real-model workflow
 

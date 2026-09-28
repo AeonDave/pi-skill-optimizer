@@ -116,6 +116,9 @@ export function deduplicateToolResultHistory<T extends HistoryToolResult>(
 		if (result.isError === true || result.is_error === true) continue;
 		const extracted = textContent(result.content);
 		if (!extracted) continue;
+		// In Unicode mode this range matches only unpaired surrogates, not emoji.
+		// UTF-8 hashing would replace them and create ambiguous recovery handles.
+		if (/[\uD800-\uDFFF]/u.test(extracted.text)) continue;
 		const bytes = Buffer.byteLength(extracted.text, "utf8");
 		if (bytes < minBytes || matchesProtectedEvidence(extracted.text, patterns)) continue;
 		const id = artifactId(extracted.fingerprint);
@@ -124,6 +127,8 @@ export function deduplicateToolResultHistory<T extends HistoryToolResult>(
 			firstById.set(id, { id, content: result.content, text: extracted.text, bytes });
 			continue;
 		}
+		// A matching digest is not itself proof of exact string equality.
+		if (first.text !== extracted.text) continue;
 
 		if (!next) next = results.slice() as T[];
 		next[index] = { ...result, content: extracted.replace(referenceText(id)) };

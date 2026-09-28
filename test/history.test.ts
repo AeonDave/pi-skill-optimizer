@@ -4,6 +4,19 @@ import { deduplicateToolResultHistory, type HistoryToolResult } from "../src/his
 
 const large = (value: string): string => value.repeat(5_000);
 
+test("lone-surrogate history stays unchanged without ambiguous recovery handles", () => {
+	const first = "ordinary content " + "\ud800";
+	const second = "ordinary content " + "\ud801";
+	const results = [{ content: first }, { content: second }, { content: first }];
+	const reduced = deduplicateToolResultHistory(results, { minBytes: 0 });
+	assert.equal(reduced.next, results);
+	assert.equal(reduced.duplicates, 0);
+	assert.equal(reduced.artifacts.length, 0);
+	assert.equal(deduplicateToolResultHistory([
+		{ content: "ordinary 🦋 content" }, { content: "ordinary 🦋 content" },
+	], { minBytes: 0 }).duplicates, 1);
+});
+
 test("keeps the first exact result and replaces only later duplicates with recoverable opaque references", () => {
 	const text = large("alpha ");
 	const input: HistoryToolResult[] = [

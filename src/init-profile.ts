@@ -14,6 +14,7 @@ function ownedProfileNames(profile: SkillOptimizerProfile): Set<string> {
 		...profile.critical,
 		...Object.keys(profile.queries),
 		...Object.keys(profile.negativeHints),
+		...Object.keys(profile.activation ?? {}),
 		...Object.values(profile.clusters).flat(),
 	]);
 }

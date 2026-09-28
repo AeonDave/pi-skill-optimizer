@@ -52,6 +52,25 @@ test("registry rejects traversal outside the declared base", (t) => {
 	assert.throws(() => registry.locateExact("escape"), /escapes its registered base/);
 });
 
+test("registry preserves resource bytes with Unicode, spaces and native or forward-slash paths", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pi-skill-paths-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const skillDir = join(root, "skill with spaces", "références 雪");
+	mkdirSync(join(skillDir, "nested folder"), { recursive: true });
+	const body = "# Instructions\r\n\r\nWindows path: C:\\work\\src\r\nPOSIX path: /work/src\n雪 🦋\r\n";
+	writeFileSync(join(skillDir, "SKILL.md"), body, "utf8");
+	writeFileSync(join(skillDir, "nested folder", "notes.md"), body, "utf8");
+	const registry = createSkillRegistry([{
+		name: "portable", description: "Portable path fixture.",
+		filePath: join(skillDir, "SKILL.md"), baseDir: skillDir,
+	}]);
+	assert.equal(registry.loadExact("portable").content, body);
+	for (const path of [join("nested folder", "notes.md"), "nested folder/notes.md"]) {
+		assert.equal(registry.loadResource("portable", path).content, body);
+	}
+	assert.throws(() => registry.loadResource("portable", join("..", "outside.md")), /escapes its registered base/);
+});
+
 test("registry rejects a symlink whose real target escapes the base", (t) => {
 	const parent = mkdtempSync(join(tmpdir(), "pi-skill-symlink-"));
 	t.after(() => rmSync(parent, { recursive: true, force: true }));

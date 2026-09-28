@@ -298,6 +298,26 @@ test("columnar reduction is identity for invalid, heterogeneous, protected, and 
 	assert.equal(decodeColumnarJson('{"$format":"columnar-json-v1","rows":2,"keys":["a"],"columns":[[1]]}'), undefined);
 });
 
+test("columnar reduction fails open when JSON number spelling is not losslessly representable", () => {
+	for (const number of ["9007199254740993", "1e400", "-0", "0.10000000000000001"]) {
+		const rows = Array.from({ length: 100 }, () => `  {"value":${number},"state":"ready"}`);
+		const original = `[\n${rows.join(",\n")}\n]`;
+		const result = reduceJsonArrayColumnar(original, { minSavingsBytes: 1, minSavingsRatio: 0 });
+		assert.equal(result.reduced, false, `number token ${number} must remain verbatim`);
+		assert.equal(result.text, original);
+	}
+});
+
+test("columnar decoder bounds expansion of zero-column rows", () => {
+	const encoded = JSON.stringify({
+		$format: "columnar-json-v1",
+		rows: 10_001,
+		keys: [],
+		columns: [],
+	});
+	assert.equal(decodeColumnarJson(encoded)?.length, undefined);
+});
+
 test("output tool matching supports case-insensitive wildcards", () => {
 	assert.equal(matchesOutputTool("read", ["*"]), true);
 	assert.equal(matchesOutputTool("mcp__github__search", ["mcp__*"]), true);

@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
+import { normalizeActivation, type SkillActivation } from "./activation.ts";
 
 export interface SkillOptimizerProfile {
 	critical: string[];
 	queries: Record<string, string[]>;
 	clusters: Record<string, string[]>;
 	negativeHints: Record<string, string[]>;
+	activation?: Record<string, SkillActivation>;
 }
 
 export const EMPTY_PROFILE: SkillOptimizerProfile = {
@@ -42,12 +44,15 @@ export function normalizeProfile(value: unknown): SkillOptimizerProfile {
 		return { critical: [], queries: {}, clusters: {}, negativeHints: {} };
 	}
 	const source = value as Record<string, unknown>;
-	return {
+	const profile: SkillOptimizerProfile = {
 		critical: normalizeStringArray(source.critical),
 		queries: normalizeRecord(source.queries),
 		clusters: normalizeRecord(source.clusters),
 		negativeHints: normalizeRecord(source.negativeHints),
 	};
+	const activation = normalizeActivation(source.activation);
+	if (Object.keys(activation).length > 0) profile.activation = activation;
+	return profile;
 }
 
 export function hashSkill(name: string, description: string): string {
@@ -116,20 +121,52 @@ function filterClusters(
 	return out;
 }
 
+function filterActivation(
+	activation: Record<string, SkillActivation> | undefined,
+	predicate: (owner: string) => boolean,
+): Record<string, SkillActivation> {
+	return Object.fromEntries(Object.entries(activation ?? [])
+		.filter(([owner]) => predicate(owner))
+		.map(([owner, value]) => [owner, { kind: value.kind, tasks: [...value.tasks] }]));
+}
+
+function mergeActivation(
+	base: Record<string, SkillActivation> | undefined,
+	override: Record<string, SkillActivation> | undefined,
+): Record<string, SkillActivation> {
+	const entries = new Map<string, SkillActivation>();
+	for (const [owner, value] of Object.entries(base ?? {})) {
+		entries.set(owner, { kind: value.kind, tasks: [...value.tasks] });
+	}
+	for (const [owner, value] of Object.entries(override ?? {})) {
+		entries.set(owner, { kind: value.kind, tasks: [...value.tasks] });
+	}
+	return Object.fromEntries(entries);
+}
+
+function includeActivation(
+	profile: SkillOptimizerProfile,
+	activation: Record<string, SkillActivation>,
+): SkillOptimizerProfile {
+	if (Object.keys(activation).length > 0) profile.activation = activation;
+	return profile;
+}
+
 export function pruneProfileNames(profile: SkillOptimizerProfile, removed: Iterable<string>): SkillOptimizerProfile {
 	const removedNames = new Set(removed);
 	if (removedNames.size === 0) return profile;
 	const keep = (name: string): boolean => !removedNames.has(name);
-	const next: SkillOptimizerProfile = {
+	const next = includeActivation({
 		critical: profile.critical.filter(keep),
 		queries: filterRecord(profile.queries, keep),
 		clusters: filterClusters(profile.clusters, keep),
 		negativeHints: filterRecord(profile.negativeHints, keep),
-	};
+	}, filterActivation(profile.activation, keep));
 	const unchanged = next.critical.length === profile.critical.length
 		&& Object.keys(next.queries).length === Object.keys(profile.queries).length
 		&& Object.values(next.clusters).flat().length === Object.values(profile.clusters).flat().length
-		&& Object.keys(next.negativeHints).length === Object.keys(profile.negativeHints).length;
+		&& Object.keys(next.negativeHints).length === Object.keys(profile.negativeHints).length
+		&& Object.keys(next.activation ?? {}).length === Object.keys(profile.activation ?? {}).length;
 	return unchanged ? profile : next;
 }
 
@@ -172,21 +209,25 @@ export function mergeIncrementalProfile(
 		const owned = names.filter(isRefreshed);
 		if (owned.length > 0) clusters[cluster] = union(clusters[cluster] ?? [], owned);
 	}
-	return {
+	const activation = mergeActivation(
+		filterActivation(base.activation, keepOld),
+		filterActivation(partial.activation, isRefreshed),
+	);
+	return includeActivation({
 		critical: union(base.critical.filter(keepOld), partial.critical.filter(isRefreshed)),
 		queries,
 		clusters,
 		negativeHints,
-	};
+	}, activation);
 }
 
 export function mergeProfiles(base: SkillOptimizerProfile, override: SkillOptimizerProfile): SkillOptimizerProfile {
-	return {
+	return includeActivation({
 		critical: union(base.critical, override.critical),
 		queries: mergeRecord(base.queries, override.queries),
 		clusters: mergeRecord(base.clusters, override.clusters),
 		negativeHints: mergeRecord(base.negativeHints, override.negativeHints),
-	};
+	}, mergeActivation(base.activation, override.activation));
 }
 
 export function splitProfileByScope(
@@ -196,17 +237,17 @@ export function splitProfileByScope(
 	const isProject = (name: string): boolean => projectNames.has(name);
 	const isGlobal = (name: string): boolean => !projectNames.has(name);
 	return {
-		global: {
+		global: includeActivation({
 			critical: profile.critical.filter(isGlobal),
 			queries: filterRecord(profile.queries, isGlobal),
 			clusters: filterClusters(profile.clusters, isGlobal),
 			negativeHints: filterRecord(profile.negativeHints, isGlobal),
-		},
-		project: {
+		}, filterActivation(profile.activation, isGlobal)),
+		project: includeActivation({
 			critical: profile.critical.filter(isProject),
 			queries: filterRecord(profile.queries, isProject),
 			clusters: filterClusters(profile.clusters, isProject),
 			negativeHints: filterRecord(profile.negativeHints, isProject),
-		},
+		}, filterActivation(profile.activation, isProject)),
 	};
 }

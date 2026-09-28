@@ -31,14 +31,19 @@ function measure(skillCount: number, iterations: number): void {
 	if (cold.removedChars <= 0 || cold.catalogNames.length !== skillCount) {
 		throw new Error(`performance fixture failed for ${skillCount} skills`);
 	}
-	const startSteady = performance.now();
+	const samples: number[] = [];
 	for (let index = 0; index < iterations; index += 1) {
+		const start = performance.now();
 		const result = optimizePayload(request, DEFAULT_CONFIG);
+		samples.push(performance.now() - start);
 		if (result.removedChars !== cold.removedChars) throw new Error("non-deterministic optimized size");
 	}
-	const steadyMs = (performance.now() - startSteady) / iterations;
-	console.log(`${skillCount} skills | cold ${coldMs.toFixed(2)} ms | steady ${steadyMs.toFixed(2)} ms | removed ${cold.removedChars} chars`);
+	const steadyMs = samples.reduce((total, value) => total + value, 0) / samples.length;
+	samples.sort((left, right) => left - right);
+	const percentile = (fraction: number): number => samples[Math.ceil(samples.length * fraction) - 1];
+	console.log(`${skillCount} skills | cold ${coldMs.toFixed(2)} ms | steady ${steadyMs.toFixed(2)} ms | p50 ${percentile(0.5).toFixed(2)} ms | p95 ${percentile(0.95).toFixed(2)} ms | n=${iterations} | removed ${cold.removedChars} chars`);
 }
 
-measure(284, 10);
-measure(2_000, 5);
+console.log(`Synthetic request latency | ${process.platform}/${process.arch} | Node ${process.version} | not UI/model latency`);
+measure(284, 30);
+measure(2_000, 30);

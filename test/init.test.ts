@@ -9,6 +9,7 @@ import skillOptimizer from "../src/index.ts";
 import { getProfilePaths } from "../src/config.ts";
 import { readStoredProfile, writeProfileFiles } from "../src/persistence.ts";
 import { hashSkill } from "../src/profile.ts";
+import { INIT_PROFILE_VERSION } from "../src/init-prompt.ts";
 
 type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<void> | void;
 
@@ -49,7 +50,7 @@ test("init repairs a project skill stored in the global profile without calling 
 			skillCount: 1,
 			hashes: { project_skill: hashSkill("project_skill", description) },
 			expectedRevision: null,
-		}], 4);
+		}], INIT_PROFILE_VERSION);
 
 		let modelCalls = 0;
 		const skill = {
@@ -118,11 +119,16 @@ test("init checkpoints a successful batch, avoids a stale final rewrite, and kee
 			cwd,
 			model: { provider: "test", id: "test" },
 			modelRegistry: {
-				async complete(_model: unknown, request: { messages: Array<{ content: Array<{ text: string }> }> }) {
+				async complete(_model: unknown, request: { systemPrompt: string; messages: Array<{ content: Array<{ text: string }> }> }) {
 					modelCalls += 1;
 					const body = JSON.parse(request.messages[0].content[0].text) as {
 						skills: Array<{ name: string }>;
 					};
+					assert.match(request.systemPrompt, /substitutes/);
+					assert.doesNotMatch(request.systemPrompt, /confusable or complementary/);
+					assert.match(request.systemPrompt, /behavioral kind does not imply universal/);
+					assert.match(request.systemPrompt, /software-change/);
+					assert.doesNotMatch(request.systemPrompt, /\{\{ACTIVATION_TASKS\}\}/);
 					if (modelCalls === 2) {
 						const current = readStoredProfile(paths.global);
 						writeProfileFiles([{
@@ -131,7 +137,7 @@ test("init checkpoints a successful batch, avoids a stale final rewrite, and kee
 							skillCount: Object.keys(current.hashes).length,
 							hashes: current.hashes,
 							expectedRevision: current.revision,
-						}], 4);
+						}], INIT_PROFILE_VERSION);
 						return { stopReason: "aborted", content: [] };
 					}
 					const names = body.skills.map((skill) => skill.name);
@@ -139,7 +145,13 @@ test("init checkpoints a successful batch, avoids a stale final rewrite, and kee
 						stopReason: "stop",
 						content: [{
 							type: "text",
-							text: JSON.stringify({ processedSkills: names, critical: names }),
+							text: JSON.stringify({
+								processedSkills: names, critical: names,
+								activation: {
+									skill_000: { kind: "specialist", tasks: ["software-change"] },
+									"foreign-owner": { kind: "behavioral", tasks: ["software-change"] },
+								},
+							}),
 						}],
 					};
 				},
@@ -157,6 +169,9 @@ test("init checkpoints a successful batch, avoids a stale final rewrite, and kee
 		const stored = readStoredProfile(paths.global);
 		assert.equal(Object.keys(stored.hashes).length, 80);
 		assert.equal(stored.profile.critical.includes("external-writer"), true);
+		assert.deepEqual((stored.profile as unknown as { activation: unknown }).activation, {
+			skill_000: { kind: "specialist", tasks: ["software-change"] },
+		});
 		assert.equal(notifications.length, 3);
 		assert.match(notifications[0], /init starting/);
 		assert.match(notifications[1], /aborted/);
@@ -189,7 +204,7 @@ test("init invalidates stale routing and reports the provider cause when every c
 			skillCount: 1,
 			hashes: { changed_skill: hashSkill("changed_skill", "old description") },
 			expectedRevision: null,
-		}], 4);
+		}], INIT_PROFILE_VERSION);
 
 		const skill = {
 			name: "changed_skill",
@@ -238,6 +253,54 @@ test("init invalidates stale routing and reports the provider cause when every c
 		assert.match(finalAttempt, /429: Weekly\/Monthly Limit Exhausted/);
 		assert.doesNotMatch(finalAttempt, /retrying/);
 		assert.match(notifications.at(-1) ?? "", /every batch failed.*429: Weekly\/Monthly Limit Exhausted/);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("explicit init upgrades old routing hints once and persists activation tags", async () => {
+	const root = mkdtempSync(join(tmpdir(), "sko-init-tags-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	try {
+		const paths = getProfilePaths(root);
+		const name = "language-guide";
+		const description = "Implement language-specific changes.";
+		writeProfileFiles([{
+			path: paths.global,
+			profile: { critical: [], queries: {}, clusters: {}, negativeHints: {} },
+			skillCount: 1, hashes: { [name]: hashSkill(name, description) }, expectedRevision: null,
+		}], 4);
+		let calls = 0;
+		const activation = { [name]: { kind: "specialist", tasks: ["software-change"] } };
+		const notifications: string[] = [];
+		const ctx = {
+			cwd: root, model: { provider: "test", id: "test" },
+			modelRegistry: {
+				async complete() {
+					calls += 1;
+					return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ processedSkills: [name], activation }) }] };
+				},
+			},
+			getSystemPromptOptions: () => ({ skills: [{
+				name, description, filePath: join(root, "SKILL.md"), baseDir: root,
+				disableModelInvocation: false, sourceInfo: { scope: "user" },
+			}] }),
+			ui: { notify(message: string) { notifications.push(message); }, setStatus() {} },
+		} as unknown as ExtensionContext;
+		const command = registerExtension();
+		await command("", ctx);
+		assert.equal(calls, 0, "status cannot silently upgrade a profile with model work");
+		await command("init", ctx);
+		assert.equal(calls, 1);
+		assert.equal(readStoredProfile(paths.global).initVersion, INIT_PROFILE_VERSION);
+		assert.deepEqual(readStoredProfile(paths.global).profile.activation, activation);
+		assert.ok(notifications.some((text) => text.startsWith(`skill-optimizer: init done v${INIT_PROFILE_VERSION} `)),
+			"completion must report the current init format version");
+		await command("init", ctx);
+		assert.equal(calls, 1, "already-current init must not regenerate unchanged skills");
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

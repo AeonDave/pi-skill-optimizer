@@ -2,7 +2,36 @@
 
 All notable changes are documented here.
 
-## Unreleased
+## 3.0.0 - 2026-09-28
+
+### Breaking
+
+- Require Pi 0.87.1+ and Node.js 26.3+; development dependencies, host integration tests and CI target the current APIs. Node 22/24 and older Pi releases are no longer supported. Existing profile files remain readable so users can explicitly refresh routing hints without losing their configuration.
+
+### Added
+
+- Init-generated activity tags distinguish specialists, workflow methods and behavioral discipline. A positively selected specialist can bring one contextual support skill into the ordinary budget even without literal keyword overlap. Tags do not make behavioral skills always-on; old profiles remain compatible and upgrade on explicit init.
+- Versioned init prompt and a real Pi loader/runner smoke test that runs without provider requests.
+- A brief, UI-only optional-init hint and explicit setup readiness in status. Session metadata prevents repeated hints across turns and reload/resume; manual profiles are respected and init never starts automatically.
+
+### Fixed
+
+- Replan tool activation on each agent run, retain used and explicitly searched tools, and restore optimizer-deferred tools on bypass without activating initially unavailable tools.
+- Refresh configuration between agent runs without repeated synchronous reads in provider/tool hooks. Skill search now respects exclusions and configured fuzzy/usage settings.
+- Route custom-tool errors through Pi's exception contract and keep resolver results verbatim, preventing recursive reduction of recovered output or full skill instructions.
+- Exact skill/profile phrase matches respect token boundaries; `git` no longer matches inside `digital`. Skill search cursors reject ranking-order changes caused by new profile or usage evidence.
+- Output recovery preserves LF, CRLF, CR and mixed terminators, and returns an empty page beyond EOF. Malformed Unicode cannot create lossy archive or ambiguous history handles.
+- Columnar JSON fails open on unsafe or noncanonical numeric spellings instead of silently rounding them; zero-column decoding has a bounded expansion.
+- Archive retention belongs to each stored output, not the project that happens to read or clean it. Identical-content saves can extend, never shorten, the lease; legacy files use a fixed seven-day fallback.
+- Stale lock timestamps no longer let another writer steal a live process's lock; recovery also verifies that the owner has exited.
+
+### Improved
+
+- Check complete rendered savings before writing an output archive.
+- Cache catalog-derived ranking features and calculate query-wide values once, without changing the BM25F weights or score formula.
+- Add a local ranking-component diagnostic and warm-latency percentiles; keep synthetic measurements separate from historical model-quality claims.
+- Put installation and everyday use first in the README, split out configuration/architecture/ranking references, and add the selected library banner.
+- Add Windows/Linux/macOS CI for Node 26.3 and current 26.x, portable path/newline regressions, package-link validation and consistent source line endings.
 
 ## 2.1.1 - 2026-09-20
 

@@ -135,6 +135,27 @@ test("BM25F and exact-name signals select the specialist", () => {
 	assert.ok(plan.ranked[0].reasons.includes("lexical"));
 });
 
+test("exact name matching does not match inside a longer token", () => {
+	const plan = planSkillPrefetch([skill("git", "Version control workflows.")], "digital", {
+		minTopK: 1,
+		targetTopK: 1,
+		maxTopK: 1,
+	});
+	assert.equal(plan.hasSignal, false);
+	assert.deepEqual(plan.ranked, []);
+});
+
+test("profile query matching does not match inside a longer token", () => {
+	const plan = planSkillPrefetch([skill("release-guide", "Release guidance.")], "digital", {
+		profile: normalizeProfile({ queries: { "release-guide": ["git"] } }),
+		minTopK: 1,
+		targetTopK: 1,
+		maxTopK: 1,
+	});
+	assert.equal(plan.hasSignal, false);
+	assert.deepEqual(plan.ranked, []);
+});
+
 test("reviewed aliases route APK and plugin wording without mutable global state", () => {
 	const skills = [
 		skill("mobile-technique", "Android application reverse engineering."),
@@ -321,6 +342,51 @@ test("searchSkillCatalog paginates the shared ranker with bound opaque cursors",
 	}), /Invalid or stale/);
 });
 
+test("search cursors reject usage changes that reorder ranked results", () => {
+	const skills = [
+		skill("alpha", "Cloud deployment workflow."),
+		skill("beta", "Cloud deployment workflow."),
+		skill("gamma", "Cloud deployment workflow."),
+	];
+	const first = searchSkillCatalog(skills, "cloud deployment", { pageSize: 1 });
+	assert.equal(first.items[0]?.name, "alpha");
+	assert.throws(() => searchSkillCatalog(skills, "cloud deployment", {
+		pageSize: 1,
+		cursor: first.nextCursor,
+		usagePrior: { beta: 100 },
+	}), /Invalid or stale/);
+});
+
+test("search cursors reject profile changes that reorder ranked results", () => {
+	const skills = [
+		skill("alpha", "Cloud deployment workflow."),
+		skill("beta", "Cloud deployment workflow."),
+		skill("gamma", "Cloud deployment workflow."),
+	];
+	const first = searchSkillCatalog(skills, "cloud deployment", { pageSize: 1 });
+	assert.equal(first.items[0]?.name, "alpha");
+	assert.throws(() => searchSkillCatalog(skills, "cloud deployment", {
+		pageSize: 1,
+		cursor: first.nextCursor,
+		profile: normalizeProfile({ negativeHints: { alpha: ["cloud"] } }),
+	}), /Invalid or stale/);
+});
+
+test("rank-neutral usage changes preserve search pagination", () => {
+	const skills = [
+		skill("alpha", "Cloud deployment workflow."),
+		skill("beta", "Cloud deployment workflow."),
+		skill("gamma", "Cloud deployment workflow."),
+	];
+	const first = searchSkillCatalog(skills, "cloud deployment", { pageSize: 1 });
+	const second = searchSkillCatalog(skills, "cloud deployment", {
+		pageSize: 1,
+		cursor: first.nextCursor,
+		usagePrior: { alpha: 100 },
+	});
+	assert.equal(second.items[0]?.name, "beta");
+});
+
 test("searchSkillCatalog marks an exact-name hit as high confidence", () => {
 	const result = searchSkillCatalog([
 		skill("rsa-recovery", "Recover weak RSA keys."),
@@ -361,4 +427,230 @@ test("compactDescription preserves routing signal inside one hard limit", () => 
 	);
 	assert.ok(compact.length <= 72);
 	assert.match(compact, /Use when/);
+});
+
+test("a positive specialist match reserves one bounded contextual skill without changing direct search ranking", () => {
+	const skills = [
+		skill("database-migration", "Plan safe database schema changes and data migrations. Use when changing persistent storage."),
+		skill("software-architecture", "Design system boundaries, dependencies, and tradeoffs. Use when choosing architecture for a system."),
+		skill("test-driven-development", "Plan a test-first software change. Use when implementing or validating a code change."),
+		skill("documentation-review", "Review user-facing documentation. Use when reviewing product documentation."),
+	];
+	const profile = normalizeProfile({ activation: {
+		"database-migration": { kind: "specialist", tasks: ["software-change"] },
+		"software-architecture": { kind: "workflow", tasks: ["software-change"] },
+		"test-driven-development": { kind: "workflow", tasks: ["software-test"] },
+		"documentation-review": { kind: "behavioral", tasks: ["docs-review"] },
+	} });
+	const plan = planSkillPrefetch(skills, "database migration", {
+		profile,
+		minTopK: 2,
+		targetTopK: 2,
+		maxTopK: 3,
+	});
+	assert.deepEqual(plan.selectedNames, ["database-migration", "software-architecture"]);
+	assert.deepEqual(plan.ranked.map(({ skill: entry }) => entry.name), [
+		"database-migration", "software-architecture",
+	]);
+	assert.deepEqual(plan.ranked[0].reasons, ["exact", "lexical"]);
+	assert.deepEqual(plan.ranked[1].reasons, ["contextual"]);
+	assert.equal(plan.ranked[1].score, 0);
+
+	const search = searchSkillCatalog(skills, "database migration", { profile, pageSize: 5 });
+	assert.equal(search.total, 2);
+	assert.deepEqual(search.items.map(({ name }) => name), ["database-migration", "software-architecture"]);
+	assert.deepEqual(search.items[1].reasons, ["contextual"]);
+});
+
+test("behavioral activation tags can supply one contextual skill", () => {
+	const skills = [
+		skill("api-implementation", "Implement application programming interfaces."),
+		skill("test-driven-development", "Use a test-first workflow for software changes."),
+	];
+	const profile = normalizeProfile({ activation: {
+		"api-implementation": { kind: "specialist", tasks: ["software-test"] },
+		"test-driven-development": { kind: "behavioral", tasks: ["software-test"] },
+	} });
+	const plan = planSkillPrefetch(skills, "api implementation", {
+		profile,
+		minTopK: 2,
+		targetTopK: 2,
+		maxTopK: 2,
+	});
+	assert.deepEqual(plan.selectedNames, ["api-implementation", "test-driven-development"]);
+	assert.deepEqual(plan.ranked[1].reasons, ["contextual"]);
+});
+
+test("contextual skills require a positively selected specialist and never cascade", () => {
+	const skills = [
+		skill("feature-specialist", "Plan database schema changes and data migrations."),
+		skill("software-architecture", "Design system boundaries and dependencies."),
+		skill("dependency-analysis", "Inspect dependency graphs and package coupling."),
+		skill("documentation-review", "Review documentation and user-facing guides."),
+	];
+	const profile = normalizeProfile({ activation: {
+		"feature-specialist": { kind: "specialist", tasks: ["software-change", "software-debug"] },
+		"software-architecture": { kind: "workflow", tasks: ["software-change", "software-debug"] },
+		"dependency-analysis": { kind: "workflow", tasks: ["software-debug"] },
+		"documentation-review": { kind: "behavioral", tasks: ["docs-review"] },
+	} });
+	const matched = planSkillPrefetch(skills, "database migration", {
+		profile,
+		minTopK: 1,
+		targetTopK: 2,
+		maxTopK: 3,
+	});
+	assert.deepEqual(matched.selectedNames, ["feature-specialist", "software-architecture"]);
+	assert.equal(matched.selectedNames.includes("dependency-analysis"), false);
+	assert.equal(matched.selectedNames.includes("documentation-review"), false);
+
+	const unmatched = planSkillPrefetch(skills, "unrelated request", { profile });
+	assert.equal(unmatched.hasSignal, false);
+	assert.deepEqual(unmatched.selectedNames, []);
+	assert.deepEqual(unmatched.ranked, []);
+	const protectedOnly = planSkillPrefetch(skills, "unrelated request", {
+		profile,
+		always: ["feature-specialist"],
+	});
+	assert.deepEqual(protectedOnly.selectedNames, ["feature-specialist"]);
+});
+
+test("contextual inclusion obeys count, exclusion, negative-hint, and render budgets", () => {
+	const skills = [
+		skill("feature-specialist", "Database migration."),
+		skill("software-architecture", `Architecture and dependency guidance.${LONG}`),
+	];
+	const profile = normalizeProfile({
+		activation: {
+			"feature-specialist": { kind: "specialist", tasks: ["software-change"] },
+			"software-architecture": { kind: "workflow", tasks: ["software-change"] },
+		},
+		negativeHints: { "software-architecture": ["database"] },
+	});
+	const oneSlot = planSkillPrefetch(skills, "feature specialist", {
+		profile,
+		minTopK: 1,
+		targetTopK: 1,
+		maxTopK: 1,
+	});
+	assert.deepEqual(oneSlot.selectedNames, ["feature-specialist"]);
+
+	const excluded = planSkillPrefetch(skills, "database migration", {
+		profile,
+		never: ["software-architecture"],
+		minTopK: 2,
+		targetTopK: 2,
+		maxTopK: 2,
+	});
+	assert.deepEqual(excluded.selectedNames, ["feature-specialist"]);
+
+	const negated = planSkillPrefetch(skills, "database migration", {
+		profile,
+		minTopK: 2,
+		targetTopK: 2,
+		maxTopK: 2,
+	});
+	assert.equal(negated.selectedNames.includes("software-architecture"), false);
+
+	const directOnly = planSkillPrefetch(skills, "database migration", {
+		profile: normalizeProfile({ activation: {
+			"feature-specialist": { kind: "specialist", tasks: ["software-change"] },
+			"software-architecture": { kind: "workflow", tasks: ["software-change"] },
+		} }),
+		minTopK: 2,
+		targetTopK: 2,
+		maxTopK: 2,
+		fullRenderBudgetChars: planSkillPrefetch(skills, "database migration", {
+			minTopK: 2,
+			targetTopK: 2,
+			maxTopK: 2,
+		}).ranked[0].marginalChars,
+	});
+	assert.deepEqual(directOnly.selectedNames, ["feature-specialist"]);
+});
+
+test("a budget-rejected contextual direct candidate is reported only once", () => {
+	const skills = [
+		skill("migration-primary", "Database migration."),
+		skill("bulk-guidance", `Database migration procedures.${LONG}`),
+		skill("support-guidance", `Database discipline.${LONG}`),
+	];
+	const query = "migration-primary database migration";
+	const bounds = { minTopK: 2, targetTopK: 2, maxTopK: 2 };
+	const baseline = planSkillPrefetch(skills, query, bounds);
+	assert.deepEqual(baseline.ranked.map((entry) => entry.skill.name), ["migration-primary", "bulk-guidance", "support-guidance"]);
+	const plan = planSkillPrefetch(skills, query, {
+		...bounds, fullRenderBudgetChars: baseline.ranked[0].marginalChars,
+		profile: normalizeProfile({ activation: {
+			"migration-primary": { kind: "specialist", tasks: ["software-change"] },
+			"support-guidance": { kind: "behavioral", tasks: ["software-change"] },
+		} }),
+	});
+	assert.deepEqual(plan.selectedNames, ["migration-primary"]);
+	assert.deepEqual(plan.skippedForBudget, [...new Set(plan.skippedForBudget)]);
+});
+
+test("contextual rescue preserves low-ranked direct evidence without duplicating search items", () => {
+	const skills = [
+		skill("database-migration", "Plan database schema migrations."),
+		skill("database-import", "Handle repeated database migration preparation and database migration checks."),
+		skill("database-schema", "Handle repeated database migration planning and database migration review."),
+		skill("software-architecture", "Architecture migration design."),
+	];
+	const query = "database migration";
+	const options = { minTopK: 2, targetTopK: 2, maxTopK: 2 };
+	const direct = planSkillPrefetch(skills, query, options);
+	const contextualIndex = direct.ranked.findIndex(({ skill: item }) => item.name === "software-architecture");
+	assert.ok(contextualIndex >= 2, `expected a lower-ranked direct hit, got index ${contextualIndex}`);
+
+	const profile = normalizeProfile({ activation: {
+		"database-migration": { kind: "specialist", tasks: ["software-change"] },
+		"software-architecture": { kind: "workflow", tasks: ["software-change"] },
+	} });
+	const rescued = planSkillPrefetch(skills, query, { ...options, profile });
+	assert.deepEqual(rescued.selectedNames, ["database-migration", "software-architecture"]);
+	assert.deepEqual(rescued.ranked.map(({ skill: item }) => item.name), direct.ranked.map(({ skill: item }) => item.name));
+	assert.equal(rescued.ranked[contextualIndex].score, direct.ranked[contextualIndex].score);
+	assert.deepEqual(rescued.ranked[contextualIndex].reasons, [...direct.ranked[contextualIndex].reasons, "contextual"]);
+});
+
+test("all exact direct slots are preserved, and an oversized contextual skill falls back to direct ranking", () => {
+	const exactSkills = [
+		skill("git-review", "Review git diffs and patches."),
+		skill("review-git", "Review git repositories and changes."),
+		skill("review-workflow", "A contextual review workflow."),
+	];
+	const exactProfile = normalizeProfile({ activation: {
+		"git-review": { kind: "specialist", tasks: ["software-review"] },
+		"review-workflow": { kind: "workflow", tasks: ["software-review"] },
+	} });
+	const exact = planSkillPrefetch(exactSkills, "git review", {
+		profile: exactProfile,
+		minTopK: 2,
+		targetTopK: 2,
+		maxTopK: 3,
+	});
+	assert.equal(exact.ranked.filter(({ exactScore }) => exactScore >= 8).slice(0, 2).length, 2);
+	assert.equal(exact.selectedNames.includes("review-workflow"), false);
+	assert.equal(exact.selectedNames.includes("git-review"), true);
+	assert.equal(exact.selectedNames.includes("review-git"), true);
+
+	const budgetSkills = [
+		skill("database-migration", "Plan database schema migrations."),
+		skill("database-import", "Prepare database migrations for import and validation."),
+		skill("software-architecture", `Architecture and dependency guidance.${LONG}`),
+	];
+	const query = "database migration";
+	const budgetOptions = { minTopK: 2, targetTopK: 2, maxTopK: 2 };
+	const baseline = planSkillPrefetch(budgetSkills, query, budgetOptions);
+	const contextual = planSkillPrefetch(budgetSkills, query, {
+		...budgetOptions,
+		profile: normalizeProfile({ activation: {
+			"database-migration": { kind: "specialist", tasks: ["software-change"] },
+			"software-architecture": { kind: "workflow", tasks: ["software-change"] },
+		} }),
+		fullRenderBudgetChars: baseline.marginalChars,
+	});
+	assert.deepEqual(contextual.selectedNames, baseline.selectedNames);
+	assert.ok(contextual.skippedForBudget.includes("software-architecture"));
 });

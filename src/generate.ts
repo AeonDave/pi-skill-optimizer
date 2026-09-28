@@ -193,6 +193,7 @@ function generatedProfileFields(value: unknown): unknown {
 		queries: record.queries,
 		clusters: record.clusters,
 		negativeHints: record.negativeHints,
+		activation: record.activation,
 	};
 }
 

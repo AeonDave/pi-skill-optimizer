@@ -458,6 +458,45 @@ interface ColumnarJsonV1 {
 	columns: unknown[][];
 }
 
+const MAX_EMPTY_COLUMNAR_ROWS = 10_000;
+const JSON_NUMBER_TOKEN = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+
+/**
+ * Reject number spellings that JavaScript cannot round-trip exactly through
+ * JSON.parse/JSON.stringify. The source text is what the model sees, so even
+ * safe but non-canonical spellings conservatively stay in their original form.
+ */
+function hasNonRoundTripJsonNumber(text: string): boolean {
+	let inString = false;
+	let escaped = false;
+	for (let index = 0; index < text.length; index++) {
+		const character = text[index];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (character === "\\") escaped = true;
+			else if (character === '"') inString = false;
+			continue;
+		}
+		if (character === '"') {
+			inString = true;
+			continue;
+		}
+		if (character !== "-" && !(character >= "0" && character <= "9")) continue;
+
+		JSON_NUMBER_TOKEN.lastIndex = index;
+		const match = JSON_NUMBER_TOKEN.exec(text);
+		if (!match) return true;
+		const token = match[0];
+		const value = Number(token);
+		if (!Number.isFinite(value)
+			|| Object.is(value, -0)
+			|| (Number.isInteger(value) && !Number.isSafeInteger(value))
+			|| String(value) !== token) return true;
+		index += token.length - 1;
+	}
+	return false;
+}
+
 function matchesOutputPattern(text: string, pattern: RegExp): boolean {
 	pattern.lastIndex = 0;
 	const matched = pattern.test(text);
@@ -481,6 +520,7 @@ export function decodeColumnarJson(text: string): unknown[] | undefined {
 		|| !Number.isInteger(rowCount)
 		|| rowCount < 0
 		|| !Array.isArray(encoded.keys)
+		|| (encoded.keys.length === 0 && rowCount > MAX_EMPTY_COLUMNAR_ROWS)
 		|| !encoded.keys.every((key) => typeof key === "string")
 		|| new Set(encoded.keys).size !== encoded.keys.length
 		|| !Array.isArray(encoded.columns)
@@ -521,6 +561,7 @@ export function reduceJsonArrayColumnar(text: string, options: ColumnarJsonOptio
 		return original();
 	}
 	if (!Array.isArray(parsed) || parsed.length < 2) return original();
+	if (hasNonRoundTripJsonNumber(text)) return original();
 	if (parsed.some((row) => !row || typeof row !== "object" || Array.isArray(row))) return original();
 	const records = parsed as Array<Record<string, unknown>>;
 	const keys = Object.keys(records[0]);

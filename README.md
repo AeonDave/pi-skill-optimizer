@@ -1,241 +1,131 @@
+![pi-skill-optimizer: a whole library, just the skills you need](assets/banner.png)
+
 # pi-skill-optimizer
 
-Token-efficient capability discovery and recoverable tool-output reduction for [Pi](https://github.com/earendil-works/pi).
+A [Pi](https://github.com/earendil-works/pi) extension for when your skill library has grown bigger than the task in front of you.
 
-The extension exposes one strategy: **AUTO**. It replaces repeated full skill catalogs with a stable, compact index, adds a bounded request-specific prefetch to the latest genuine human input, activates tool definitions on demand, and reduces large tool results without giving up local recovery.
+Keep every skill name visible, bring relevant descriptions into focus, and load the full instructions when needed. Large tool results can be reduced too, with the original kept locally for recovery.
 
-RTK is the recommended companion for command output. It is not required.
-
-## What AUTO changes
-
-| Surface | Stable or immediately available | Added only when needed |
-| --- | --- | --- |
-| Skills | Every eligible skill name and a short routing intent | Full verbatim definitions selected for the current request |
-| Skill files | A `skill_search` resolver instruction | Exact skill content, resource, or validated location |
-| Tools | Core, configured, already used, and bounded predicted tools | Definitions found and activated through `tool_search` |
-| Tool output | Evidence-preserving reduced content | Complete original through `retrieve_output` |
-
-AUTO targets repeated capability metadata and large tool results. It does not rewrite arbitrary instructions, ordinary conversation history, or unrelated system-prompt content.
-
-## How it works
-
-### Stable skill base
-
-AUTO renders a query-independent index in the stable prompt prefix:
-
-```xml
-<!--skill-optimizer:auto:v2-->
-<skill_index format="tsv" columns="name,intent">
-skill-name\tShort routing intent
-</skill_index>
-<skill_resolver>Use skill_search to search, load, inspect resources, or request a location.</skill_resolver>
-```
-
-The index contains no filesystem paths. With the same catalog, profile, and configuration, its bytes remain unchanged across requests. `catalogBudgetChars` is a request-global soft budget shared by every catalog found in one request. Intents yield first, but the combined all-name floor may exceed the budget.
-
-### Request-specific prefetch
-
-AUTO extracts intent only from genuine human text in Anthropic, OpenAI Chat and Responses (including developer messages in `input`), Gemini, Mistral, and Pi's structured `pi-messages` request shapes. Assistant text, tool or function results, injected context, image metadata, and empty input cannot create a ranking signal.
-
-Ranking uses exact matching, BM25F, bounded name and alias typo recovery, reciprocal-rank fusion, diversity, profile evidence, and decayed usage evidence. It scores full source descriptions, then appends a bounded set of full verbatim definitions to the latest human block. The overlay is separate from the stable prefix, fingerprinted, idempotent, and omitted when there is no valid target.
-
-### Dynamic tools
-
-AUTO keeps protected and predicted tools active and leaves the rest behind `tool_search`. Search is bounded and paginated. A returned result is activated through Pi's runtime API without replacing already active tools. Core, configured, and previously used tools remain callable, so an in-progress tool loop cannot be stranded. Weak or absent routing signal fails open to every permitted tool; safety wins, but that request may retain the full schema cost.
-
-See Pi's [extension and dynamic-tool API](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md).
-
-### Recoverable output
-
-The default `smart` reducer is deterministic and UTF-8 byte-aware. It preserves protected evidence and accepts a reduction only when the complete returned representation clears both configured saving thresholds. Size and line settings trigger reduction; they are not hard output caps. Protected evidence may make the returned result exceed them.
-
-Homogeneous JSON object arrays may use a lossless columnar form after an exact internal round trip. With `outputMode: "extract"` and an explicit `outputModel`, sufficiently large text may first use model-assisted extraction. Extracted content must be an ordered verbatim subsequence, retain protected evidence, and provide material savings. Rejection falls back to smart reduction, then to the original.
-
-Before AUTO returns any reduced result, it stores the complete original in a local, immutable, content-addressed archive. Provider-visible recovery text contains only an opaque identifier. `retrieve_output` verifies and resolves that identifier with bounded line access.
-
-History deduplication keeps the first large successful result intact and replaces only later exact copies. Errors, images, mixed media, small results, and protected evidence are never deduplicated.
-
-## Runtime tools
-
-| Tool | Purpose |
-| --- | --- |
-| `skill_search` | Paginated skill search plus exact `load`, contained `resource`, and explicit `location` actions |
-| `tool_search` | Search deferred tool definitions and activate bounded matches additively |
-| `retrieve_output` | Recover archived output or a deduplicated history result by opaque identifier |
-
-Exact skill loading accepts only registered names. Resource and location resolution use canonical paths and containment checks to reject traversal and symlink escape. Search cursors are bound to the query and catalog fingerprint. This is an exact local resolver guarantee, not a guarantee that the model will select the right skill; measured model and prefetch recall are reported separately below.
+No embedding service or extra model call for ordinary routing. No changes to your source skills.
 
 ## Install
 
-Requires **Pi ≥ 0.84.4** and **Node.js ≥ 22.19**. Run in your terminal:
+Requires **Pi 0.87.1+** and **Node.js 26.3+**. Upgrade both before installing v3.
 
 ```bash
 pi install npm:pi-skill-optimizer
 ```
 
-| Install option | Command |
-| --- | --- |
-| This project only | `pi install -l npm:pi-skill-optimizer` |
-| Pin this release | `pi install npm:pi-skill-optimizer@2.1.1` |
-| Update an unpinned install | `pi update npm:pi-skill-optimizer` |
-
-Restart Pi after installing or updating. A pinned install stays on that version until you install a
-new version explicitly.
-
-Start Pi and generate the routing profile:
+Restart Pi, then check that it loaded:
 
 ```text
-/skill-optimizer init
+/skill-optimizer
 ```
 
-`init` is explicit model work. It notifies at start and completion while per-batch progress stays in the transient status line. It batches full descriptions by skill count and UTF-8 input size, validates complete coverage and a successful provider stop reason, retries only retryable failures, and checkpoints each successful batch so interrupted work is not lost. A changed skill whose regeneration fails stays unhashed and inactive until retry, rather than serving stale routing. Init also repairs global/project profile ownership without another model call. Ordinary discovery does not call a model.
+That's enough to start. Optionally run `/skill-optimizer init` to generate routing hints for your library. **Init uses your current Pi model and may incur cost**; normal discovery does not.
 
-For local development:
-
-```bash
-npm install
-pi -e ./src/index.ts
-```
-
-## Commands
-
-| Command | Purpose |
+| Need | Command |
 | --- | --- |
-| `/skill-optimizer` | Show AUTO state, catalog budget, critical skills, usage prior, tool activation, provider telemetry, and savings |
-| `/skill-optimizer init` | Generate or incrementally update `critical`, `queries`, `clusters`, and `negativeHints` |
-| `/skill-optimizer audit` | Report bounded catalog and profile issues without editing source skills |
+| Install only in this project | `pi install -l npm:pi-skill-optimizer` |
+| Pin the current release | `pi install npm:pi-skill-optimizer@3.0.0` |
+| Update an unpinned install | `pi update npm:pi-skill-optimizer` |
+
+Restart after updating. Pinned installs stay pinned until you explicitly install another version.
+
+## What changes
+
+Say you have hundreds of skills, but you're asking Pi to fix a database migration. Sending every full description again is rarely useful.
+
+AUTO keeps a compact, stable index of **all eligible names**, adds relevant descriptions beside your latest request, and exposes `skill_search` for loading complete instructions. The stable index does not change when your question changes.
+
+| Area | What AUTO does | What stays available |
+| --- | --- | --- |
+| Skills | Shortens catalog descriptions; prefetches relevant ones | Every eligible name and exact full-instruction loading |
+| Tools | Defers less relevant schemas behind `tool_search` | Protected, configured, already-used and activated tools |
+| Large results | Applies deterministic reduction; lossless columnar JSON where suitable | Complete originals through `retrieve_output` during archive retention |
+| Repeated results | Replaces later exact duplicates with recovery references | The first result, errors, protected evidence and mixed media |
+
+Tool routing fails open when the signal is weak: all permitted tools remain active. Output reduction also fails open if it cannot archive the original or make a meaningful saving. RTK-handled shell results are left to RTK, one result at a time.
+
+[How AUTO works](docs/ARCHITECTURE.md) · [Ranking decisions and limits](docs/RANKING.md)
+
+## Everyday use
+
+You can leave AUTO running with its defaults.
+
+- `/skill-optimizer` shows setup readiness, savings, active tools and provider usage.
+- `/skill-optimizer audit` reports description issues without rewriting your skills.
+- `/skill-optimizer init` creates or updates routing hints. Successful batches are checkpointed; rerunning resumes incomplete work.
+
+An optional setup hint appears at the first eligible prompt when initialization is missing or needs attention. It never starts init for you or adds instructions to the model's context.
+
+Pi gets three tools: `skill_search`, `tool_search` and `retrieve_output`. Skill search is paginated and exact loads accept only registered names. Output recovery uses opaque identifiers, not exposed archive paths.
+
+Skills can be useful even when you never mention them. Init can tag architecture,
+testing and behavioral guidance by activity, so a matched specialist can bring
+one relevant supporting skill into prefetch. Behavioral does not mean always-on.
+[Contextual routing](docs/RANKING.md#contextual-and-behavioral-skills) explains the
+budget and limitations. Existing profiles need an explicit init rerun for these tags.
 
 ## Configuration
 
-Global configuration lives at `~/.pi/agent/skill-optimizer/config.json`. A project can override it with `.pi/skill-optimizer/config.json`.
+Start with defaults. For project-specific settings, create `.pi/skill-optimizer/config.json`:
 
-| Key | Default | Purpose |
-| --- | ---: | --- |
-| `catalogBudgetChars` | `8000` | Request-global soft budget for stable-index intents |
-| `intentMaxChars` | `96` | Maximum rendered intent length |
-| `prefetchTarget` | `5` | Ordinary prefetch target |
-| `prefetchMin` | `3` | Minimum adaptive prefetch count |
-| `prefetchMax` | `8` | Maximum adaptive prefetch count |
-| `prefetchBudgetChars` | `6000` | Full-definition overlay budget |
-| `fuzzyCandidateLimit` | `8` | Bound for name and alias typo recovery |
-| `alwaysSkills` | `[]` | Skills favored for routing and prefetch |
-| `excludeSkills` | `[]` | Skills intentionally removed from discovery |
-| `providers` | `[]` | Provider allowlist; empty means all |
-| `toolPrefetchMax` | `5` | Maximum proactive tool activation |
-| `toolSearchPageSize` | `8` | Default tool-search page size |
-| `alwaysTools` | `[]` | Tools that remain active |
-| `historyDedupMinBytes` | `4096` | Minimum result size for history deduplication |
-| `usageHalfLifeDays` | `30` | Usage-evidence decay half-life |
-| `usageMaxEntries` | `2048` | Persistent usage-evidence bound |
-| `usageStaleDays` | `180` | Age for pruning stale one-off evidence |
-| `outputMode` | `"smart"` | `"off"`, `"smart"`, or guarded `"extract"` |
-| `outputMaxLines` | `400` | Line-count activation threshold |
-| `outputMaxBytes` | `16000` | UTF-8 byte activation threshold |
-| `outputMinSavingsBytes` | `512` | Minimum absolute saving |
-| `outputMinSavingsRatio` | `0.1` | Minimum relative saving |
-| `outputTools` | `["*"]` | Eligible tool-name patterns |
-| `outputModel` | `""` | Explicit model for guarded extraction |
-| `outputExtractMinBytes` | `32000` | Minimum input size for extraction |
-| `outputExtractExclude` | common listing commands | Tools excluded from extraction |
-| `outputArchiveTtlHours` | `168` | Archive retention period |
-
-Configuration is also available through `PI_SKILL_OPTIMIZER_*` environment variables. Lists are comma-separated. The bypass exists only as `PI_SKILL_OPTIMIZER_DISABLE` and uses boolean semantics; there is no `disable` configuration key. Output exceptions retain the exact names `PI_SKILL_OPTIMIZER_OUTPUT_MIN_SAVINGS_RATIO` and `PI_SKILL_OPTIMIZER_OUTPUT_EXCLUDE`.
-
-## RTK coexistence
-
-Ownership is decided per result:
-
-| Result | Owner |
-| --- | --- |
-| Shell output already handled by RTK | RTK only |
-| Shell output not handled by RTK | AUTO eligible |
-| Read, web, MCP, and other eligible output | AUTO eligible |
-| Already reduced output | No second reduction |
-
-RTK never changes skill discovery or dynamic tool activation.
-
-## Telemetry and persistence
-
-Provider telemetry records only authoritative usage fields:
-
-```text
-requests, input, output, cacheRead, cacheWrite, totalCost
+```json
+{
+  "alwaysSkills": ["your-project-skill"],
+  "alwaysTools": ["your-required-tool"],
+  "outputMode": "smart"
+}
 ```
 
-AUTO does not infer cache hits from stable bytes. Characters, UTF-8 bytes, provider tokens, and cost remain separate metrics.
+Replace the example names with installed skills/tools. Global defaults live at `~/.pi/agent/skill-optimizer/config.json`; project settings override them, followed by environment variables.
 
-Profile, usage, and statistics updates use atomic replacement and lock-serialized additive deltas. Archives are immutable, SHA-256 verified, and TTL-cleaned. Usage evidence is bounded and decays over time.
+The default output mode is local and deterministic. Optional `extract` mode needs an explicit model and validates its output before accepting it. It is not enabled by default.
 
-## Privacy
+[Full configuration, defaults and RTK behavior](docs/CONFIGURATION.md)
 
-- Normal hooks never collect a benchmark corpus.
-- Corpus building and real-provider evaluation are explicit commands.
-- Remote evaluation receives only validated, sanitized cases with keyed irreversible identifiers.
-- Raw private sessions, catalogs, paths, credentials, hostnames, and account identifiers are not published.
-- Generated profile queries are routing hints, not benchmark labels.
-- Full output archives stay local.
-- `.pi/skill-optimizer/benchmark/` must not be committed.
+## Limits and privacy
 
-## Published v2.0.0 benchmark snapshot
+This is not a general conversation summarizer. It does not shrink arbitrary instructions, guarantee that the model picks the right skill, or guarantee lower provider bills.
 
-The published private, anonymized v2.0.0 snapshot (`8a0b28a`, 2026-09-01) covers 8 cases and 332 skills. It predates the Unreleased provider-shape and runtime-cache changes; it is retained as release evidence, not presented as a fresh measurement of this working tree. Provider and model revisions were not recorded in the original run.
+All names stay visible, so the minimum index still grows with the library. Description budgets are soft at that floor. Output size settings trigger reduction rather than enforce hard caps: protected evidence can exceed them.
 
-| Metric | Baseline/raw | AUTO | Change |
-| --- | ---: | ---: | ---: |
-| Provider input | 28,177 tokens | 5,215 tokens | **-81.5%** |
-| Stable skill base | 106,966 bytes | 11,993 bytes | **-88.8%** |
-| End-model skill recall | 38% | 50% | **+12 pp** |
-| Overlay/prefetch recall | - | 58% | - |
-| Smart output | 9,099 tokens | 6,403 tokens | **-29.6%** |
-| Guarded extract output | 9,099 tokens | 6,402 tokens | **-29.6%** |
+Original outputs stay in local archives, retained for **seven days by default**. They may contain sensitive tool output; treat them accordingly. Normal hooks do not collect benchmark corpora or send data to a separate ranking service. Your selected Pi provider still receives the ordinary request.
 
-Smart and guarded extraction retained 100% exact and semantic evidence, and the project safety gate passed. RTK 0.42.4 produced 2,537 tokens in the same three output cases but failed the benchmark's external protected-evidence gate. The evaluation used 31 Luna calls.
+Generated profile hints are not benchmark labels. Stable prompt bytes are not proof of cache hits. [Privacy, persistence and accounting](docs/CONFIGURATION.md#privacy)
 
-See [BENCHMARK.md](./BENCHMARK.md) for per-case output results, methodology, safety gates, limitations, and reproduction commands.
+## Evidence and development
 
-## Scale and limits
+The [published v2.0.0 benchmark](BENCHMARK.md#published-v200-snapshot) records eight private, anonymized cases. It is historical evidence, **not a result for the current working tree or a universal savings claim**.
 
-AUTO makes the tested large catalogs substantially cheaper, not free, and does not guarantee model discovery.
-
-- The current contract keeps every eligible skill name in the stable index. Its minimum size therefore grows linearly with the number and length of names. This all-name information floor cannot be compressed away while preserving immediate name-level discovery.
-- A catalog with 100,000 skills is outside the scale demonstrated by the current 332-skill benchmark. It may still produce an impractically large name-only base.
-- Extreme catalogs require an additional resolver-only, namespace-sharded, or server-side paginated discovery layer. That would deliberately change the current all-name visibility guarantee.
-- Arbitrarily large system prompts are not automatically reduced. AUTO transforms recognized skill catalogs, manages tool definitions, and processes eligible tool results; it does not summarize unrelated policy, instructions, or conversation content.
-- Provider tokenization, caching, and pricing remain provider-controlled. Stable bytes improve cacheability but do not prove a cache hit or guarantee a specific bill.
-- Very small catalogs or outputs may remain unchanged when framing overhead would eliminate the saving.
-
-## Development and validation
+Local checks use synthetic data, no remote model calls:
 
 ```bash
+npm install
 npm run typecheck
 npm test
 npm run bench
+npm run bench:ranking
 npm run bench:perf
 npm run bench:output
-npm run corpus:build
-npm run bench:real
-npm run measure <capture.json>
 ```
 
-The first five commands are local gates. `bench:perf` reports cold and steady provider-request latency at 284 and 2,000 synthetic skills; it is a regression measurement, not a hardware-independent pass threshold. `corpus:build` and `bench:real` are explicit remote workflows and may incur provider cost.
+Load your checkout with `pi -e ./src/index.ts`. `bench:ranking` compares routing components on a small diagnostic fixture; `bench:perf` measures cold and warm request handling at 284 and 2,000 skills. Neither establishes end-to-end model quality.
 
-Release metadata moves together: `package.json`, both root versions in `package-lock.json`, the
-changelog heading, and the pinned npm install command above. The suite checks this set before a tag
-or npm publish.
+The CI workflow covers Windows, Linux and macOS on Node 26.3 and the current 26.x. Tests
+include native/forward-slash resource paths, spaces, Unicode, symlink containment,
+and exact LF/CRLF/mixed-newline recovery. A configured matrix is not evidence of
+a successful run; check the jobs for the commit you use.
 
-## References
+`corpus:build` and `bench:real` are separate, explicit private-evaluation workflows. They are not part of the local checks and may involve provider cost. See the [benchmark protocol](BENCHMARK.md) before using them.
 
-- [Pi skills](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/skills.md)
-- [Pi extensions and dynamic tools](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md)
-- [OpenAI tool search](https://developers.openai.com/api/docs/guides/tools-tool-search)
-- [OpenAI prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching)
-- [Anthropic tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool)
-- [Anthropic prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- [Gemini context caching](https://ai.google.dev/gemini-api/docs/caching)
-- [MCP tools](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
-- [MCP resources](https://modelcontextprotocol.io/specification/2025-06-18/server/resources)
-- [OpenAI Codex skills](https://developers.openai.com/codex/skills)
+## Documentation
 
-## License
+- [Architecture and guarantees](docs/ARCHITECTURE.md)
+- [Configuration and runtime reference](docs/CONFIGURATION.md)
+- [Ranking rationale and evaluation](docs/RANKING.md)
+- [Benchmark contract and historical results](BENCHMARK.md)
+- [Changelog](CHANGELOG.md)
 
-MIT
+MIT. See [LICENSE](LICENSE).

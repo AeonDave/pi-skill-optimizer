@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
 	ConcurrentFileUpdateError,
 	cleanupTemporaryOutputs,
+	DEFAULT_OUTPUT_ARCHIVE_TTL_MS,
 	loadStatsFile,
 	loadStatsSnapshot,
 	loadExtractionTelemetryFile,
@@ -21,12 +23,45 @@ import {
 	saveTemporaryOutput,
 	saveUsageDelta,
 	writeProfileFiles,
+	withFileLocks,
 } from "../src/persistence.ts";
 import { EMPTY_PROFILE } from "../src/profile.ts";
 
 function tempDir(): string {
 	return mkdtempSync(join(tmpdir(), "skill-optimizer-test-"));
 }
+
+test("a stale timestamp cannot steal a lock from a live owner", () => {
+	const directory = tempDir();
+	try {
+		const path = join(directory, "slow-write.json");
+		withFileLocks([path], () => {
+			const old = new Date(Date.now() - 60_000);
+			utimesSync(`${path}.lock`, old, old);
+			assert.throws(() => withFileLocks([path], () => assert.fail("stole a live owner's lock")), /timed out waiting for file lock/);
+			assert.ok(existsSync(`${path}.lock`));
+		});
+		assert.equal(existsSync(`${path}.lock`), false);
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("an old lock is recovered only after its owning process has exited", () => {
+	const directory = tempDir();
+	try {
+		const owner = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8", windowsHide: true });
+		assert.equal(owner.status, 0);
+		const path = join(directory, "abandoned.json");
+		writeFileSync(`${path}.lock`, `${owner.stdout.trim()}:1:abc123`, "utf8");
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(`${path}.lock`, old, old);
+		assert.equal(withFileLocks([path], () => "recovered"), "recovered");
+		assert.equal(existsSync(`${path}.lock`), false);
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
 
 test("profile writes reject stale snapshots instead of replacing newer data", () => {
 	const dir = tempDir();
@@ -146,8 +181,8 @@ test("temporary full output uses opaque SHA-256 content handles", () => {
 test("temporary output resolution validates handles and cleanup honors TTL", () => {
 	const dir = tempDir();
 	try {
-		const stale = saveTemporaryOutput("stale", { directory: dir, now: 1_000 });
-		const fresh = saveTemporaryOutput("fresh", { directory: dir, now: 9_000 });
+		const stale = saveTemporaryOutput("stale", { directory: dir, now: 1_000, ttlMs: 5_000 });
+		const fresh = saveTemporaryOutput("fresh", { directory: dir, now: 9_000, ttlMs: 5_000 });
 		assert.ok(stale);
 		assert.ok(fresh);
 		const unrelated = join(dir, "keep.me");
@@ -157,6 +192,99 @@ test("temporary output resolution validates handles and cleanup honors TTL", () 
 		assert.equal(resolveTemporaryOutput(stale, { directory: dir, now: 10_000, ttlMs: 5_000 }), undefined);
 		assert.equal(resolveTemporaryOutput(fresh, { directory: dir, now: 10_000, ttlMs: 5_000 }), "fresh");
 		assert.equal(existsSync(unrelated), true);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("default archive lease is seven days and does not depend on the reader TTL", () => {
+	const dir = tempDir();
+	try {
+		const savedAt = 1_000;
+		const sevenDays = 7 * 24 * 60 * 60 * 1_000;
+		assert.equal(DEFAULT_OUTPUT_ARCHIVE_TTL_MS, sevenDays);
+		const id = saveTemporaryOutput("default lifetime", { directory: dir, now: savedAt });
+		assert.ok(id);
+		assert.equal(resolveTemporaryOutput(id, { directory: dir, now: savedAt + 6 * 24 * 60 * 60 * 1_000, ttlMs: 1 }), "default lifetime");
+		assert.equal(resolveTemporaryOutput(id, { directory: dir, now: savedAt + 8 * 24 * 60 * 60 * 1_000, ttlMs: 30 * 24 * 60 * 60 * 1_000 }), undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("archive cleanup uses each archive lease instead of the current project's TTL", () => {
+	const dir = tempDir();
+	try {
+		const longTtl = 7 * 24 * 60 * 60 * 1_000;
+		const id = saveTemporaryOutput("long-lived output", { directory: dir, now: 1_000, ttlMs: longTtl });
+		assert.ok(id);
+		assert.equal(cleanupTemporaryOutputs({ directory: dir, now: 2 * 60 * 60 * 1_000, ttlMs: 60 * 60 * 1_000 }), 0);
+		assert.equal(resolveTemporaryOutput(id, { directory: dir, now: 2 * 60 * 60 * 1_000, ttlMs: 60 * 60 * 1_000 }), "long-lived output");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("re-saving the same archive extends but never shortens its expiry", () => {
+	const dir = tempDir();
+	try {
+		const first = saveTemporaryOutput("shared output", { directory: dir, now: 1_000, ttlMs: 10_000 });
+		assert.ok(first);
+		const shorter = saveTemporaryOutput("shared output", { directory: dir, now: 2_000, ttlMs: 1_000 });
+		assert.equal(shorter, first);
+		assert.equal(resolveTemporaryOutput(first, { directory: dir, now: 5_000, ttlMs: 1_000 }), "shared output");
+
+		const extended = saveTemporaryOutput("shared output", { directory: dir, now: 6_000, ttlMs: 20_000 });
+		assert.equal(extended, first);
+		assert.equal(resolveTemporaryOutput(first, { directory: dir, now: 25_000, ttlMs: 1_000 }), "shared output");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("archives fail open for lone UTF-16 surrogates while preserving valid emoji", () => {
+	const dir = tempDir();
+	try {
+		for (const malformed of ["\uD800", "\uDC00", "before\uD800after", "before\uDC00after"]) {
+			assert.equal(saveTemporaryOutput(malformed, { directory: dir }), undefined);
+		}
+		const valid = "before🙂after";
+		const id = saveTemporaryOutput(valid, { directory: dir });
+		assert.ok(id);
+		assert.equal(resolveTemporaryOutput(id, { directory: dir }), valid);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("legacy archives use a fixed seven-day fallback independent of the reader TTL", () => {
+	const dir = tempDir();
+	try {
+		const savedAt = 1_000;
+		const id = saveTemporaryOutput("legacy output", { directory: dir, now: savedAt });
+		assert.ok(id);
+		const digest = id.slice("sko:".length);
+		unlinkSync(join(dir, `${digest}.meta.json`));
+
+		assert.equal(resolveTemporaryOutput(id, { directory: dir, now: savedAt + 6 * 24 * 60 * 60 * 1_000, ttlMs: 1 }), "legacy output");
+		assert.equal(resolveTemporaryOutput(id, { directory: dir, now: savedAt + 8 * 24 * 60 * 60 * 1_000, ttlMs: 30 * 24 * 60 * 60 * 1_000 }), undefined);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("corrupt archive expiry metadata fails closed without deleting the archive", () => {
+	const dir = tempDir();
+	try {
+		const id = saveTemporaryOutput("archive with bad metadata", { directory: dir, now: 1_000 });
+		assert.ok(id);
+		const digest = id.slice("sko:".length);
+		const metadata = join(dir, `${digest}.meta.json`);
+		writeFileSync(metadata, "{broken", "utf8");
+
+		assert.equal(resolveTemporaryOutput(id, { directory: dir, now: 2_000 }), undefined);
+		assert.equal(cleanupTemporaryOutputs({ directory: dir, now: 10_000_000_000 }), 0);
+		assert.equal(existsSync(join(dir, `${digest}.txt`)), true);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
