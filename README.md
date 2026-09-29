@@ -1,8 +1,12 @@
-![pi-skill-optimizer: a whole library, just the skills you need](assets/banner.png)
-
 # pi-skill-optimizer
 
-A [Pi](https://github.com/earendil-works/pi) extension for when your skill library has grown bigger than the task in front of you.
+**Keep your skill library. Cut the repeated context.**
+
+![pi-skill-optimizer: a whole library, just the skills you need](assets/banner.png)
+
+[Install](#install) · [What changes](#what-changes) · [Everyday use](#everyday-use) · [Configuration](#configuration) · [Docs](#documentation)
+
+An extension for [Pi](https://github.com/earendil-works/pi) that routes skills and tools locally and reduces large tool results without losing access to the originals.
 
 Keep every skill name visible, bring relevant descriptions into focus, and load the full instructions when needed. Large tool results can be reduced too, with the original kept locally for recovery.
 
@@ -13,7 +17,7 @@ No embedding service or extra model call for ordinary routing. No changes to you
 Requires **Pi 0.87.1+** and **Node.js 26.3+**. Upgrade both before installing v3.
 
 ```bash
-pi install npm:pi-skill-optimizer
+pi install npm:@aeondave/pi-skill-optimizer
 ```
 
 Restart Pi, then check that it loaded:
@@ -26,11 +30,24 @@ That's enough to start. Optionally run `/skill-optimizer init` to generate routi
 
 | Need | Command |
 | --- | --- |
-| Install only in this project | `pi install -l npm:pi-skill-optimizer` |
-| Pin the current release | `pi install npm:pi-skill-optimizer@3.0.0` |
-| Update an unpinned install | `pi update npm:pi-skill-optimizer` |
+| Install only in this project | `pi install -l npm:@aeondave/pi-skill-optimizer` |
+| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.0.0` |
+| Update an unpinned install | `pi update npm:@aeondave/pi-skill-optimizer` |
 
 Restart after updating. Pinned installs stay pinned until you explicitly install another version.
+
+### Moving from the unscoped package
+
+The supported npm package is **`@aeondave/pi-skill-optimizer`**; it replaces the old unscoped name. Commands and configuration paths have not changed. Version 3.0.0 keeps the same runtime code as the unscoped 3.0.0 release.
+
+Use `pi list` to check your installed sources. For an unpinned personal install:
+
+```bash
+pi remove npm:pi-skill-optimizer
+pi install npm:@aeondave/pi-skill-optimizer
+```
+
+For a pinned or Git install, remove the exact old source shown by `pi list`. Add `-l` to both commands for a project-local install. Keep only one source enabled: Pi treats scoped, unscoped and Git packages as different identities. Your optimizer config, routing profile and usage data stay in their existing locations; no re-init is needed just for this migration. Restart Pi afterward.
 
 ## What changes
 

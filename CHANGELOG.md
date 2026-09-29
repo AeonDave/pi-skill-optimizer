@@ -4,6 +4,12 @@ All notable changes are documented here.
 
 ## 3.0.0 - 2026-09-28
 
+### Scoped distribution - 2026-09-29
+
+- Move npm distribution to `@aeondave/pi-skill-optimizer`, replacing the old unscoped name at the same runtime version, with public access, the `pi-package` discovery keyword and a versioned banner URL for the Pi gallery. The existing Git tag and release history are unchanged.
+- Declare Pi host packages and TypeBox as wildcard, optional peers; keep development copies for tests, but ship no duplicate host dependencies. The supported runtime floor remains Pi 0.87.1 / Node.js 26.3.
+- Document scoped installation and migration without loading two copies. Explicitly allowlist published reference docs and cover gallery/host metadata with release tests.
+
 ### Breaking
 
 - Require Pi 0.87.1+ and Node.js 26.3+; development dependencies, host integration tests and CI target the current APIs. Node 22/24 and older Pi releases are no longer supported. Existing profile files remain readable so users can explicitly refresh routing hints without losing their configuration.

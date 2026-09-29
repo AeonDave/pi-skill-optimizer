@@ -6,6 +6,15 @@ Pi extension that reduces repeated request tokens through one AUTO discovery con
 
 Runtime floor: Pi 0.87.1 and Node.js 26.3. Use current Pi APIs; do not add shims for older runtimes. Reading existing user profiles is a data-preservation requirement, not a promise of support for old Pi versions.
 
+## Package distribution
+
+- npm identity: `@aeondave/pi-skill-optimizer`. The command and configuration directory remain `skill-optimizer`; do not rename persisted user data with the package.
+- Pi supplies `@earendil-works/pi-*` and `typebox`. Imported host packages belong in wildcard optional `peerDependencies`, never runtime `dependencies`; development copies are only for tests/typechecking. Wildcards follow Pi's loader contract, not a promise of support below the documented runtime floor.
+- Preserve `pi-package`, the explicit `pi.extensions` entry and a public, versioned `pi.image` banner URL. Only add `pi.video` when a real optimizer demonstration exists, with a working media content type.
+- Keep the npm file allowlist narrow: runtime source (including `src/prompts/init-profile.md`), the three reference docs, selected banner and public root docs. Never ship private corpora, drafts, banner alternatives or local configuration.
+- Before publication, inspect `npm pack --dry-run` and verify the packed extension with Pi's real loader outside the checkout, without package-local host dependencies. Use an isolated `PI_CODING_AGENT_DIR`; `PI_AGENT_DIR` alone does not relocate Pi's install root. Confirm registry version, integrity and gitHead after publishing; gallery eligibility is not proof that its crawler has indexed the package.
+- Set `PI_SKILL_OPTIMIZER_TEST_PACKAGE` to the absolute unpacked/installed package root and run `node --import tsx --test test/host-runtime.test.ts` to exercise the artifact with the same offline status/audit/search/verbatim-load checks as the source. This variable is test-only; do not set it for ordinary suite runs.
+
 ## Commands
 
 ```bash

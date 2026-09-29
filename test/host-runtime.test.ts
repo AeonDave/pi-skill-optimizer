@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
@@ -10,6 +10,17 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 test("real Pi loader/runner handles offline status, audit, search and verbatim skill load", async () => {
+	// Release probes reuse this test against an unpacked/installed artifact, not checkout source.
+	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
+	const extensionPath = packagedRoot
+		? join(resolve(packagedRoot), "src", "index.ts")
+		: fileURLToPath(new URL("../src/index.ts", import.meta.url));
+	if (packagedRoot) {
+		const pkg = JSON.parse(readFileSync(join(packagedRoot, "package.json"), "utf8"));
+		assert.equal(pkg.name, "@aeondave/pi-skill-optimizer");
+		assert.equal(existsSync(join(packagedRoot, "node_modules")), false, "artifact must use Pi's host dependencies");
+		assert.ok(existsSync(join(packagedRoot, "src", "prompts", "init-profile.md")));
+	}
 	const root = mkdtempSync(join(tmpdir(), "sko-host-"));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const optimizerEnvironment = Object.fromEntries(Object.entries(process.env)
@@ -28,7 +39,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 			filePath, baseDir, disableModelInvocation: false,
 			sourceInfo: { path: filePath, source: "cli", scope: "temporary", origin: "top-level" },
 		}];
-		const loaded = await discoverAndLoadExtensions([fileURLToPath(new URL("../src/index.ts", import.meta.url))], root, join(root, "agent"));
+		const loaded = await discoverAndLoadExtensions([extensionPath], root, join(root, "agent"));
 		assert.deepEqual(loaded.errors, [], "extension must load with Pi's real jiti loader");
 		assert.equal(loaded.extensions.length, 1);
 		const modelRegistry = {
