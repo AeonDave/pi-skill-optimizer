@@ -24,7 +24,7 @@ type RuntimeTool = {
 
 interface RuntimeOptions {
 	config?: Record<string, unknown>;
-	initialTools?: Array<{ name: string; description: string }>;
+	initialTools?: Array<{ name: string; description: string; exposure?: "direct" | "codemode" | "deferred" | "hidden" }>;
 	initialActive?: string[];
 	skills?: Skill[];
 	hasUI?: boolean;
@@ -107,6 +107,12 @@ function createRuntime(options: RuntimeOptions = {}) {
 		notifications,
 		entries,
 		writeConfig,
+		setHostToolExposure(name: string, exposure: "direct" | "codemode" | "deferred" | "hidden"): void {
+			const tool = allTools.get(name) as { name: string; description: string } | undefined;
+			assert.ok(tool, `unknown host tool ${name}`);
+			allTools.set(name, { ...tool, exposure });
+			if (exposure === "hidden") activeTools.delete(name);
+		},
 		reload(): void {
 			handlers.clear();
 			commands.clear();
@@ -198,6 +204,78 @@ test("tool selection replans at each human prompt while search activation is add
 		assert.ok(runtime.activeTools.has("database_query"));
 		for (const name of searchNames) assert.ok(runtime.activeTools.has(name), `${name} was stranded after tool_search`);
 		assert.ok(!runtime.activeTools.has("admin_console"));
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("inactive deferred tools stay deferred until search and remain active afterward", async () => {
+	const runtime = createRuntime({
+		config: { toolPrefetchMax: 1 },
+		initialTools: [
+			{ name: "read", description: "Read files.", exposure: "direct" },
+			{ name: "mcp__issues__find", description: "Find issue tracker tickets.", exposure: "deferred" },
+			{ name: "mcp__issues__update", description: "Update issue tracker tickets.", exposure: "codemode" },
+			{ name: "host_disabled", description: "Find issue tracker tickets.", exposure: "direct" },
+			{ name: "host_hidden", description: "Find issue tracker tickets.", exposure: "hidden" },
+		],
+		initialActive: ["read"],
+	});
+	try {
+		await beforePrompt(runtime, "");
+		assert.deepEqual([...runtime.activeTools].sort(), ["read", "retrieve_output", "skill_search", "tool_search"].sort());
+		await assert.rejects(executeTool(runtime, "tool_search", { query: "   " }), /query must not be empty/);
+		const unrelated = await executeTool(runtime, "tool_search", { query: "meteorological forecast" });
+		const unrelatedPage = JSON.parse((unrelated as { content: Array<{ text: string }> }).content[0].text) as {
+			activated: string[];
+		};
+		assert.deepEqual(unrelatedPage.activated, [], "fallback results must not activate unrelated deferred tools");
+		assert.ok(!runtime.activeTools.has("mcp__issues__find"));
+		assert.ok(!runtime.activeTools.has("mcp__issues__update"));
+
+		const first = await executeTool(runtime, "tool_search", { query: "issue tracker tickets", pageSize: 1 });
+		const firstPage = JSON.parse((first as { content: Array<{ text: string }> }).content[0].text) as {
+			results: Array<{ name: string }>;
+			activated: string[];
+			nextCursor?: string;
+		};
+		assert.equal(firstPage.results.length, 1);
+		assert.deepEqual(firstPage.activated, [firstPage.results[0].name]);
+		assert.ok(firstPage.nextCursor);
+		assert.ok(!runtime.activeTools.has("host_disabled"));
+		assert.ok(!runtime.activeTools.has("host_hidden"));
+
+		const second = await executeTool(runtime, "tool_search", {
+			query: "issue tracker tickets", cursor: firstPage.nextCursor, pageSize: 1,
+		});
+		const secondPage = JSON.parse((second as { content: Array<{ text: string }> }).content[0].text) as {
+			results: Array<{ name: string }>;
+			activated: string[];
+		};
+		assert.equal(secondPage.results.length, 1);
+		assert.notEqual(secondPage.results[0].name, firstPage.results[0].name);
+		assert.deepEqual(secondPage.activated, [secondPage.results[0].name]);
+		for (const name of ["mcp__issues__find", "mcp__issues__update"]) {
+			assert.ok(runtime.activeTools.has(name), `${name} was not activated by tool_search`);
+		}
+
+		await beforePrompt(runtime, "Review the issue tracker tickets.");
+		for (const name of ["mcp__issues__find", "mcp__issues__update"]) {
+			assert.ok(runtime.activeTools.has(name), `${name} was not retained after replanning`);
+		}
+		assert.ok(!runtime.activeTools.has("host_disabled"));
+		assert.ok(!runtime.activeTools.has("host_hidden"));
+		runtime.setHostToolExposure("mcp__issues__find", "hidden");
+		await assert.rejects(executeTool(runtime, "tool_search", {
+			query: "issue tracker tickets", cursor: firstPage.nextCursor, pageSize: 1,
+		}), /Invalid tool discovery cursor/);
+		await beforePrompt(runtime, "Find issue tracker tickets.");
+		assert.ok(!runtime.activeTools.has("mcp__issues__find"), "withdrawn tool was reactivated");
+		const afterWithdrawal = await executeTool(runtime, "tool_search", { query: "issue tracker tickets" });
+		const afterWithdrawalPage = JSON.parse((afterWithdrawal as { content: Array<{ text: string }> }).content[0].text) as {
+			results: Array<{ name: string }>;
+		};
+		assert.ok(!afterWithdrawalPage.results.some((tool) => tool.name === "mcp__issues__find"));
 	} finally {
 		runtime.dispose();
 	}

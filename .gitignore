@@ -2,6 +2,8 @@ node_modules/
 *.log
 *.jsonl
 .DS_Store
+# Local Pi resource choices depend on which extensions are installed.
+.pi/settings.json
 # optimizer generated state (config.json is user-authored and may be committed)
 .pi/skill-optimizer/profile.json
 .pi/skill-optimizer/usage.json

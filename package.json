@@ -1,6 +1,6 @@
 {
   "name": "@aeondave/pi-skill-optimizer",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "private": false,
   "type": "module",
   "description": "Less repeated context for Pi: local skill routing, on-demand tools, and recoverable output reduction.",
@@ -80,6 +80,6 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/AeonDave/pi-skill-optimizer/v3.0.0/assets/banner.png"
+    "image": "https://raw.githubusercontent.com/AeonDave/pi-skill-optimizer/v3.0.1/assets/banner.png"
   }
 }

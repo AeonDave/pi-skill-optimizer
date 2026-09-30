@@ -104,3 +104,71 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+test("real Pi loader/runner lets tool_search activate initially deferred and codemode tools", async () => {
+	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
+	const extensionPath = packagedRoot
+		? join(resolve(packagedRoot), "src", "index.ts")
+		: fileURLToPath(new URL("../src/index.ts", import.meta.url));
+	const root = mkdtempSync(join(tmpdir(), "sko-deferred-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	try {
+		const deferredPath = join(root, "deferred.ts");
+		writeFileSync(deferredPath, `export default function (pi) {
+			pi.registerTool({
+				name: "mcp__issues__find", label: "Find issues",
+				description: "Find issue tracker tickets", exposure: "deferred",
+				parameters: { type: "object", properties: {} },
+				async execute() { return { content: [{ type: "text", text: "ok" }], details: {} }; },
+			});
+			pi.registerTool({
+				name: "mcp__issues__update", label: "Update issues",
+				description: "Update issue tracker tickets", exposure: "codemode",
+				parameters: { type: "object", properties: {} },
+				async execute() { return { content: [{ type: "text", text: "ok" }], details: {} }; },
+			});
+		}`, "utf8");
+		const loaded = await discoverAndLoadExtensions([extensionPath, deferredPath], root, join(root, "agent"));
+		assert.deepEqual(loaded.errors, []);
+		const session = SessionManager.inMemory(root);
+		const modelRegistry = {
+			complete() { throw new Error("Provider calls are forbidden in this smoke test"); },
+		} as unknown as ModelRegistry;
+		const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, modelRegistry);
+		const registered = runner.getAllRegisteredTools();
+		for (const [name, exposure] of [["mcp__issues__find", "deferred"], ["mcp__issues__update", "codemode"]]) {
+			const tool = registered.find(({ definition }) => definition.name === name);
+			assert.equal((tool?.definition as { exposure?: string } | undefined)?.exposure, exposure);
+		}
+		let active = registered
+			.filter(({ definition }) => !["deferred", "codemode"].includes((definition as { exposure?: string }).exposure ?? ""))
+			.map(({ definition }) => definition.name);
+		runner.bindCore({
+			getAllTools: () => registered.map(({ definition, sourceInfo }) => ({ ...definition, sourceInfo })),
+			getActiveTools: () => [...active],
+			setActiveTools: (names: string[]) => { active = [...names]; },
+			getCommands: () => [],
+			appendEntry: () => {},
+		} as unknown as ExtensionActions, {
+			getModel: () => undefined, getScopedModels: () => [], isIdle: () => true,
+			isProjectTrusted: () => true, getSignal: () => undefined, abort() {},
+			hasPendingMessages: () => false, shutdown() {}, getContextUsage: () => undefined,
+			compact() {}, getSystemPrompt: () => "", getSystemPromptOptions: () => ({ cwd: root, skills: [] }),
+		});
+		await runner.emitBeforeAgentStart("", undefined, { cwd: root, skills: [] });
+		assert.ok(!active.includes("mcp__issues__find"), "deferred tool was activated before search");
+		assert.ok(!active.includes("mcp__issues__update"), "codemode tool was activated before search");
+		const search = wrapRegisteredTools(registered, runner).find((tool) => tool.name === "tool_search");
+		assert.ok(search);
+		const result = await search.execute("find-deferred", { query: "issue tracker tickets" });
+		const page = JSON.parse((result.content[0] as { text: string }).text) as { activated: string[] };
+		assert.deepEqual(page.activated, ["mcp__issues__find", "mcp__issues__update"]);
+		assert.ok(active.includes("mcp__issues__find"));
+		assert.ok(active.includes("mcp__issues__update"));
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(root, { recursive: true, force: true });
+	}
+});

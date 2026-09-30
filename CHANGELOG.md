@@ -2,6 +2,13 @@
 
 All notable changes are documented here.
 
+## 3.0.1 - 2026-09-30
+
+### Fixed
+
+- Keep Pi 0.99's initially inactive `deferred` and `codemode` tools discoverable through the optimizer's `tool_search`. Activate only matching search results, retain them across later replanning, and leave initially unavailable direct or hidden tools outside the catalog.
+- Reject blank tool searches without activating fallback results. Document how to disable Pi's replaceable built-in `tool-search` at the same scope as the optimizer, avoiding its startup conflict warning.
+
 ## 3.0.0 - 2026-09-28
 
 ### Scoped distribution - 2026-09-29

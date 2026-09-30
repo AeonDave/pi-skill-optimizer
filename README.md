@@ -26,12 +26,19 @@ Restart Pi, then check that it loaded:
 /skill-optimizer
 ```
 
+Pi 0.99.0+ also includes a built-in `tool-search` extension. This optimizer provides
+its own `tool_search`, so disable the built-in under **Built-in extensions** in
+`pi config` to avoid the startup conflict warning. Use the global setting for a
+personal install, or `pi config -l` for a project-only install. The optimizer
+continues to find registered `deferred` and `codemode` tools. See the
+[tool-search configuration](docs/CONFIGURATION.md#replacing-the-built-in-tool-search).
+
 That's enough to start. Optionally run `/skill-optimizer init` to generate routing hints for your library. **Init uses your current Pi model and may incur cost**; normal discovery does not.
 
 | Need | Command |
 | --- | --- |
 | Install only in this project | `pi install -l npm:@aeondave/pi-skill-optimizer` |
-| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.0.0` |
+| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.0.1` |
 | Update an unpinned install | `pi update npm:@aeondave/pi-skill-optimizer` |
 
 Restart after updating. Pinned installs stay pinned until you explicitly install another version.

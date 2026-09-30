@@ -14,6 +14,12 @@ Exact skill loading accepts only registered names. Resource and location resolut
 
 `excludeSkills` removes names from discovery and search, not from explicit exact loading. It is a routing preference, not an access-control boundary. The three resolver tools return their content without another output-reduction pass, so full skill instructions and recovered originals remain readable.
 
+### Replacing the built-in tool search
+
+The extension registers `tool_search` itself, so it replaces Pi's built-in `builtin:tool-search` extension (the built-in is marked replaceable and the tool name decides). While both are in the load set, Pi prints a startup warning that the built-in was not loaded. The optimizer indexes eligible registered tools, including ones it deferred from Pi's active set and Pi-registered `deferred` or `codemode` tools. Matching inactive results activate additively; unrelated fallback results remain inactive. Pi's built-in MCP extension can still activate `tool_search` by name when a deferred server connects.
+
+To silence the warning, disable the built-in where the optimizer runs: toggle `tool-search` off under Built-in extensions in `pi config`, or set `"extensions": ["-builtin:tool-search"]` in the applicable `settings.json`. A personal install needs the global setting in `~/.pi/agent/settings.json`; a project-only install can use `.pi/settings.json`. For development with `pi -e ./src/index.ts`, set the toggle locally or globally. Re-enable the built-in if you remove the optimizer.
+
 ## Commands
 
 | Command | Purpose |

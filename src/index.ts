@@ -112,6 +112,14 @@ const MAX_SEEN_EVIDENCE = 4_096;
 const MAX_HISTORY_ARTIFACTS = 128;
 const PROTECTED_RUNTIME_TOOLS = ["skill_search", "tool_search", "retrieve_output"] as const;
 
+function isHostSearchableTool(tool: object): boolean {
+	return "exposure" in tool && (tool.exposure === "deferred" || tool.exposure === "codemode");
+}
+
+function isHostHiddenTool(tool: object): boolean {
+	return "exposure" in tool && tool.exposure === "hidden";
+}
+
 type ConfigRecord = ReturnType<typeof getConfig>;
 
 const EMPTY_STORED_PROFILE: StoredProfile = {
@@ -565,12 +573,20 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	};
 
 	const rebuildToolCatalog = (state: RuntimeSnapshot): ToolDiscoveryCatalog => {
+		const allTools = pi.getAllTools();
 		permittedToolNames ??= new Set([
 			...pi.getActiveTools().map((name) => name.toLowerCase()),
 			...PROTECTED_RUNTIME_TOOLS,
 		]);
-		const discoverable = pi.getAllTools().filter((tool) =>
-			permittedToolNames?.has(tool.name.toLowerCase()),
+		for (const tool of allTools) {
+			if (!isHostHiddenTool(tool)) continue;
+			const name = tool.name.toLowerCase();
+			permittedToolNames.delete(name);
+			retainedToolNames.delete(name);
+			deactivatedToolNames.delete(name);
+		}
+		const discoverable = allTools.filter((tool) =>
+			!isHostHiddenTool(tool) && permittedToolNames?.has(tool.name.toLowerCase()),
 		);
 		toolCatalog = buildToolDiscoveryCatalog(discoverable, {
 			protect: [...PROTECTED_RUNTIME_TOOLS, ...state.config.alwaysTools],
@@ -578,13 +594,25 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		return toolCatalog;
 	};
 
+	const buildToolSearchCatalog = (state: RuntimeSnapshot): ToolDiscoveryCatalog => {
+		rebuildToolCatalog(state);
+		return buildToolDiscoveryCatalog(pi.getAllTools().filter((tool) =>
+			!isHostHiddenTool(tool)
+				&& (permittedToolNames?.has(tool.name.toLowerCase()) || isHostSearchableTool(tool)),
+		), {
+			protect: [...PROTECTED_RUNTIME_TOOLS, ...state.config.alwaysTools],
+		});
+	};
+
 	const activateAdditively = (names: readonly string[]): string[] => {
 		const requested = new Set(names.map((name) => name.toLowerCase()));
 		const current = new Set(pi.getActiveTools().map((name) => name.toLowerCase()));
 		const added: string[] = [];
 		for (const tool of pi.getAllTools()) {
-			if (!permittedToolNames?.has(tool.name.toLowerCase())) continue;
+			if (isHostHiddenTool(tool)) continue;
+			if (!permittedToolNames?.has(tool.name.toLowerCase()) && !isHostSearchableTool(tool)) continue;
 			if (!requested.has(tool.name.toLowerCase())) continue;
+			permittedToolNames?.add(tool.name.toLowerCase());
 			retainedToolNames.add(tool.name.toLowerCase());
 			if (current.has(tool.name.toLowerCase())) continue;
 			current.add(tool.name.toLowerCase());
@@ -592,8 +620,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			added.push(tool.name);
 		}
 		const ordered = pi.getAllTools()
-			.map((tool) => tool.name)
-			.filter((name) => permittedToolNames?.has(name.toLowerCase()) && current.has(name.toLowerCase()));
+			.filter((tool) => !isHostHiddenTool(tool) && current.has(tool.name.toLowerCase()))
+			.map((tool) => tool.name);
 		pi.setActiveTools(ordered);
 		return added;
 	};
@@ -607,8 +635,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		for (const name of deactivatedToolNames) active.add(name);
 		pi.setActiveTools(
 			pi.getAllTools()
-				.map((tool) => tool.name)
-				.filter((name) => active.has(name.toLowerCase())),
+				.filter((tool) => !isHostHiddenTool(tool) && active.has(tool.name.toLowerCase()))
+				.map((tool) => tool.name),
 		);
 		deactivatedToolNames.clear();
 		toolCatalog = undefined;
@@ -658,12 +686,13 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "tool_search",
 		label: "Tool Search",
-		description: "Search inactive tools locally. Returned tools are activated additively without disabling current tools.",
+		description: "Search local tool definitions and activate matching inactive tools without disabling current tools.",
 		promptSnippet: "Search and activate additional tools on demand",
 		parameters: TOOL_SEARCH_PARAMS,
 		async execute(_id, params, _signal, _update, ctx) {
+			if (!params.query.trim()) throw new TypeError("query must not be empty");
 			const state = ensureSnapshot(ctx);
-			const catalog = toolCatalog ?? rebuildToolCatalog(state);
+			const catalog = buildToolSearchCatalog(state);
 			const page = searchToolDiscoveryCatalog(catalog, params.query, {
 				cursor: params.cursor,
 				pageSize: Math.min(
@@ -671,7 +700,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 					state.config.toolSearchPageSize,
 				),
 			});
-			const activated = activateAdditively(page.results.map((result) => result.name));
+			const activated = activateAdditively(page.results
+				.filter((result) => result.matchedTerms.length > 0)
+				.map((result) => result.name));
 			return {
 				content: [{ type: "text", text: JSON.stringify({ ...page, activated }) }],
 				details: { activated, confidence: page.confidence, failOpen: page.failOpen },
