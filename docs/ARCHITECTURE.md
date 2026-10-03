@@ -30,9 +30,9 @@ expand dependencies or treat a behavioral tag as universal. See
 
 ## Dynamic tools
 
-AUTO keeps protected and predicted tools active and leaves the rest behind `tool_search`. Search is bounded and paginated. A returned result is activated through Pi's runtime API without replacing already active tools. Core, configured, and previously used tools remain callable, so an in-progress tool loop cannot be stranded. Weak or absent routing signal fails open to every permitted tool; safety wins, but that request may retain the full schema cost.
+AUTO keeps protected and predicted tools active and leaves the rest behind `optimizer_tool_search`. Search is bounded and paginated. A returned result is activated through Pi's runtime API without replacing already active tools. Core, configured, and previously used tools remain callable, so an in-progress tool loop cannot be stranded. Pi's built-in `tool_search` remains active when the host enables it. Weak or absent routing signal fails open to every permitted tool; safety wins, but that request may retain the full schema cost.
 
-Selection is recalculated before each agent run, not just the first request. Used tools and explicit search results stay active for the session. The discoverable set starts from Pi's initially active tools plus the optimizer's own resolvers; tools that were initially unavailable are not silently added. This is schema routing, not authorization: another extension's call-time permission checks remain authoritative.
+Selection is recalculated before each agent run, not just the first request. Used tools and explicit search results stay active for the session. The discoverable set starts from Pi's initially active tools plus the optimizer's own resolvers. Newly activated host tools are retained; inactive `deferred` and `codemode` tools can be selected through search or `alwaysTools`. Inactive direct and hidden tools are not silently added. This is schema routing, not authorization: another extension's call-time permission checks remain authoritative.
 
 See Pi's [extension and dynamic-tool API](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md).
 

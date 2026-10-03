@@ -7,18 +7,18 @@
 | Tool | Purpose |
 | --- | --- |
 | `skill_search` | Paginated skill search plus exact `load`, contained `resource`, and explicit `location` actions |
-| `tool_search` | Search deferred tool definitions and activate bounded matches additively |
+| `optimizer_tool_search` | Search deferred tool definitions and activate bounded matches additively |
 | `retrieve_output` | Recover archived output or a deduplicated history result by opaque identifier |
 
 Exact skill loading accepts only registered names. Resource and location resolution use canonical paths and containment checks to reject traversal and symlink escape. Search cursors bind to the query, catalog and ranked name order; a changed profile or usage prior that reorders results requires a new search, rather than duplicating or skipping a page. This is an exact local resolver guarantee, not a guarantee that the model will select the right skill; see the separate [ranking diagnostics](RANKING.md) and [historical model benchmark](../BENCHMARK.md).
 
 `excludeSkills` removes names from discovery and search, not from explicit exact loading. It is a routing preference, not an access-control boundary. The three resolver tools return their content without another output-reduction pass, so full skill instructions and recovered originals remain readable.
 
-### Replacing the built-in tool search
+### Tool search and Pi 1.0.0
 
-The extension registers `tool_search` itself, so it replaces Pi's built-in `builtin:tool-search` extension (the built-in is marked replaceable and the tool name decides). While both are in the load set, Pi prints a startup warning that the built-in was not loaded. The optimizer indexes eligible registered tools, including ones it deferred from Pi's active set and Pi-registered `deferred` or `codemode` tools. Matching inactive results activate additively; unrelated fallback results remain inactive. Pi's built-in MCP extension can still activate `tool_search` by name when a deferred server connects.
+The extension registers `optimizer_tool_search`, leaving Pi's built-in `tool_search` available under its own name. The optimizer indexes eligible registered tools, including ones it deferred from Pi's active set and Pi-registered `deferred` or `codemode` tools. Matching inactive results activate additively; unrelated fallback results remain inactive. An already active built-in `tool_search` stays active during optimizer replanning. Pi's built-in MCP extension can activate its own `tool_search` when a deferred server connects.
 
-To silence the warning, disable the built-in where the optimizer runs: toggle `tool-search` off under Built-in extensions in `pi config`, or set `"extensions": ["-builtin:tool-search"]` in the applicable `settings.json`. A personal install needs the global setting in `~/.pi/agent/settings.json`; a project-only install can use `.pi/settings.json`. For development with `pi -e ./src/index.ts`, set the toggle locally or globally. Re-enable the built-in if you remove the optimizer.
+If an older optimizer release led you to add `-builtin:tool-search` in `~/.pi/agent/settings.json` or `.pi/settings.json`, remove that entry after updating if you want Pi's built-in search available again. The built-in is inactive by default unless enabled in Pi's `defaultTools` or activated by Pi for deferred MCP tools; the optimizer's search stays available independently. Existing explicit calls to the optimizer's old `tool_search` name must use `optimizer_tool_search` after this update.
 
 ## Commands
 
@@ -55,7 +55,7 @@ Global configuration lives at `~/.pi/agent/skill-optimizer/config.json`. A proje
 | `providers` | `[]` | Provider allowlist; empty means all |
 | `toolPrefetchMax` | `5` | Maximum proactive tool activation |
 | `toolSearchPageSize` | `8` | Default tool-search page size |
-| `alwaysTools` | `[]` | Tools that remain active |
+| `alwaysTools` | `[]` | Keep initially active tools and named `deferred` or `codemode` tools active; hidden tools remain unavailable |
 | `historyDedupMinBytes` | `4096` | Minimum result size for history deduplication |
 | `usageHalfLifeDays` | `30` | Usage-evidence decay half-life |
 | `usageMaxEntries` | `2048` | Persistent usage-evidence bound |

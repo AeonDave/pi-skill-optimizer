@@ -113,6 +113,12 @@ function createRuntime(options: RuntimeOptions = {}) {
 			allTools.set(name, { ...tool, exposure });
 			if (exposure === "hidden") activeTools.delete(name);
 		},
+		addHostTool(tool: { name: string; description: string; exposure?: "direct" | "codemode" | "deferred" | "hidden" }): void {
+			allTools.set(tool.name, tool);
+			if (tool.exposure !== "deferred" && tool.exposure !== "codemode" && tool.exposure !== "hidden") {
+				activeTools.add(tool.name);
+			}
+		},
 		reload(): void {
 			handlers.clear();
 			commands.clear();
@@ -178,15 +184,18 @@ test("tool selection replans at each human prompt while search activation is add
 		config: { toolPrefetchMax: 1 },
 		initialTools: [
 			{ name: "read", description: "Read a file." },
+			{ name: "tool_search", description: "Pi built-in tool search." },
 			{ name: "database_query", description: "Query PostgreSQL database migrations and rollback state." },
 			{ name: "browser_accessibility", description: "Run Playwright browser accessibility tests." },
 			{ name: "admin_console", description: "Manage administrator accounts and permissions." },
 		],
-		initialActive: ["read", "database_query", "browser_accessibility"],
+		initialActive: ["read", "tool_search", "database_query", "browser_accessibility"],
 	});
 	try {
 		await beforePrompt(runtime, "Review the PostgreSQL migration rollback.");
 		assert.ok(runtime.activeTools.has("database_query"));
+		assert.ok(runtime.activeTools.has("tool_search"), "initially active Pi builtin tool_search was deactivated");
+		assert.ok(runtime.activeTools.has("optimizer_tool_search"), "optimizer_tool_search was not kept active");
 		assert.ok(!runtime.activeTools.has("browser_accessibility"));
 		assert.ok(!runtime.activeTools.has("admin_console"));
 
@@ -195,14 +204,14 @@ test("tool selection replans at each human prompt while search activation is add
 		assert.ok(!runtime.activeTools.has("database_query"));
 		assert.ok(!runtime.activeTools.has("admin_console"));
 
-		const search = await executeTool(runtime, "tool_search", { query: "PostgreSQL migration rollback" });
+		const search = await executeTool(runtime, "optimizer_tool_search", { query: "PostgreSQL migration rollback" });
 		const searchText = (search as { content: Array<{ text: string }> }).content[0].text;
 		const searchNames = (JSON.parse(searchText) as { results: Array<{ name: string }> }).results.map((tool) => tool.name);
 		assert.ok(!searchNames.includes("admin_console"));
 
 		await beforePrompt(runtime, "Review the PostgreSQL migration rollback.");
 		assert.ok(runtime.activeTools.has("database_query"));
-		for (const name of searchNames) assert.ok(runtime.activeTools.has(name), `${name} was stranded after tool_search`);
+		for (const name of searchNames) assert.ok(runtime.activeTools.has(name), `${name} was stranded after optimizer_tool_search`);
 		assert.ok(!runtime.activeTools.has("admin_console"));
 	} finally {
 		runtime.dispose();
@@ -214,6 +223,7 @@ test("inactive deferred tools stay deferred until search and remain active after
 		config: { toolPrefetchMax: 1 },
 		initialTools: [
 			{ name: "read", description: "Read files.", exposure: "direct" },
+			{ name: "tool_search", description: "Pi built-in tool search." },
 			{ name: "mcp__issues__find", description: "Find issue tracker tickets.", exposure: "deferred" },
 			{ name: "mcp__issues__update", description: "Update issue tracker tickets.", exposure: "codemode" },
 			{ name: "host_disabled", description: "Find issue tracker tickets.", exposure: "direct" },
@@ -223,9 +233,10 @@ test("inactive deferred tools stay deferred until search and remain active after
 	});
 	try {
 		await beforePrompt(runtime, "");
-		assert.deepEqual([...runtime.activeTools].sort(), ["read", "retrieve_output", "skill_search", "tool_search"].sort());
-		await assert.rejects(executeTool(runtime, "tool_search", { query: "   " }), /query must not be empty/);
-		const unrelated = await executeTool(runtime, "tool_search", { query: "meteorological forecast" });
+		assert.deepEqual([...runtime.activeTools].sort(), ["read", "retrieve_output", "skill_search", "optimizer_tool_search"].sort());
+		assert.ok(!runtime.activeTools.has("tool_search"), "initially inactive Pi builtin tool_search was activated");
+		await assert.rejects(executeTool(runtime, "optimizer_tool_search", { query: "   " }), /query must not be empty/);
+		const unrelated = await executeTool(runtime, "optimizer_tool_search", { query: "meteorological forecast" });
 		const unrelatedPage = JSON.parse((unrelated as { content: Array<{ text: string }> }).content[0].text) as {
 			activated: string[];
 		};
@@ -233,7 +244,7 @@ test("inactive deferred tools stay deferred until search and remain active after
 		assert.ok(!runtime.activeTools.has("mcp__issues__find"));
 		assert.ok(!runtime.activeTools.has("mcp__issues__update"));
 
-		const first = await executeTool(runtime, "tool_search", { query: "issue tracker tickets", pageSize: 1 });
+		const first = await executeTool(runtime, "optimizer_tool_search", { query: "issue tracker tickets", pageSize: 1 });
 		const firstPage = JSON.parse((first as { content: Array<{ text: string }> }).content[0].text) as {
 			results: Array<{ name: string }>;
 			activated: string[];
@@ -245,7 +256,7 @@ test("inactive deferred tools stay deferred until search and remain active after
 		assert.ok(!runtime.activeTools.has("host_disabled"));
 		assert.ok(!runtime.activeTools.has("host_hidden"));
 
-		const second = await executeTool(runtime, "tool_search", {
+		const second = await executeTool(runtime, "optimizer_tool_search", {
 			query: "issue tracker tickets", cursor: firstPage.nextCursor, pageSize: 1,
 		});
 		const secondPage = JSON.parse((second as { content: Array<{ text: string }> }).content[0].text) as {
@@ -256,7 +267,7 @@ test("inactive deferred tools stay deferred until search and remain active after
 		assert.notEqual(secondPage.results[0].name, firstPage.results[0].name);
 		assert.deepEqual(secondPage.activated, [secondPage.results[0].name]);
 		for (const name of ["mcp__issues__find", "mcp__issues__update"]) {
-			assert.ok(runtime.activeTools.has(name), `${name} was not activated by tool_search`);
+			assert.ok(runtime.activeTools.has(name), `${name} was not activated by optimizer_tool_search`);
 		}
 
 		await beforePrompt(runtime, "Review the issue tracker tickets.");
@@ -266,16 +277,90 @@ test("inactive deferred tools stay deferred until search and remain active after
 		assert.ok(!runtime.activeTools.has("host_disabled"));
 		assert.ok(!runtime.activeTools.has("host_hidden"));
 		runtime.setHostToolExposure("mcp__issues__find", "hidden");
-		await assert.rejects(executeTool(runtime, "tool_search", {
+		await assert.rejects(executeTool(runtime, "optimizer_tool_search", {
 			query: "issue tracker tickets", cursor: firstPage.nextCursor, pageSize: 1,
 		}), /Invalid tool discovery cursor/);
 		await beforePrompt(runtime, "Find issue tracker tickets.");
 		assert.ok(!runtime.activeTools.has("mcp__issues__find"), "withdrawn tool was reactivated");
-		const afterWithdrawal = await executeTool(runtime, "tool_search", { query: "issue tracker tickets" });
+		const afterWithdrawal = await executeTool(runtime, "optimizer_tool_search", { query: "issue tracker tickets" });
 		const afterWithdrawalPage = JSON.parse((afterWithdrawal as { content: Array<{ text: string }> }).content[0].text) as {
 			results: Array<{ name: string }>;
 		};
 		assert.ok(!afterWithdrawalPage.results.some((tool) => tool.name === "mcp__issues__find"));
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("configured alwaysTools activates inactive searchable tools within host selection", async () => {
+	const runtime = createRuntime({
+		config: { alwaysTools: ["mcp__issues__find", "mcp__issues__update", "host_disabled", "host_hidden"] },
+		initialTools: [
+			{ name: "read", description: "Read files.", exposure: "direct" },
+			{ name: "mcp__issues__find", description: "Find issue tracker tickets.", exposure: "deferred" },
+			{ name: "mcp__issues__update", description: "Update issue tracker tickets.", exposure: "codemode" },
+			{ name: "host_disabled", description: "Host-disabled direct tool.", exposure: "direct" },
+			{ name: "host_hidden", description: "Find private issue tracker tickets.", exposure: "hidden" },
+		],
+		initialActive: ["read"],
+	});
+	try {
+		await beforePrompt(runtime, "Unrelated prompt with no tool match.");
+		assert.ok(runtime.activeTools.has("mcp__issues__find"), "configured deferred tool was not activated");
+		assert.ok(runtime.activeTools.has("mcp__issues__update"), "configured codemode tool was not activated");
+		assert.ok(!runtime.activeTools.has("host_disabled"), "configured inactive direct tool must respect host selection");
+		assert.ok(!runtime.activeTools.has("host_hidden"), "configured hidden tool must remain excluded");
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("late active direct tools enter the next catalog and remain active", async () => {
+	const runtime = createRuntime({
+		config: { toolPrefetchMax: 1 },
+		initialTools: [
+			{ name: "read", description: "Read files.", exposure: "direct" },
+			{ name: "database_query", description: "Query PostgreSQL database migrations.", exposure: "direct" },
+		],
+		initialActive: ["read", "database_query"],
+	});
+	try {
+		await beforePrompt(runtime, "Review PostgreSQL database migrations.");
+		runtime.addHostTool({
+			name: "late_direct_report",
+			description: "Generate a report from the newly connected service.",
+			exposure: "direct",
+		});
+
+		await beforePrompt(runtime, "Review PostgreSQL database migrations.");
+		assert.ok(runtime.activeTools.has("late_direct_report"), "late active direct tool was removed on replanning");
+
+		const result = await executeTool(runtime, "optimizer_tool_search", { query: "newly connected service report" });
+		const page = JSON.parse((result as { content: Array<{ text: string }> }).content[0].text) as {
+			results: Array<{ name: string }>;
+		};
+		assert.ok(page.results.some((tool) => tool.name === "late_direct_report"), "late tool was missing from the search catalog");
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("tools activated by Pi's built-in search survive later optimizer replanning", async () => {
+	const runtime = createRuntime({
+		config: { toolPrefetchMax: 1 },
+		initialTools: [
+			{ name: "read", description: "Read files.", exposure: "direct" },
+			{ name: "database_query", description: "Query PostgreSQL database migrations.", exposure: "direct" },
+			{ name: "mcp__issues__find", description: "Find issue tracker tickets.", exposure: "deferred" },
+		],
+		initialActive: ["read", "database_query"],
+	});
+	try {
+		await beforePrompt(runtime, "Review PostgreSQL database migrations.");
+		assert.ok(!runtime.activeTools.has("mcp__issues__find"));
+		runtime.activeTools.add("mcp__issues__find");
+		await beforePrompt(runtime, "Review PostgreSQL database migrations.");
+		assert.ok(runtime.activeTools.has("mcp__issues__find"), "Pi-activated tool was discarded by optimizer replanning");
 	} finally {
 		runtime.dispose();
 	}
@@ -375,7 +460,7 @@ test("all runtime tool errors throw and protected tool results remain verbatim",
 			/Unknown skill name: missing-skill/,
 		);
 		await assert.rejects(
-			executeTool(runtime, "tool_search", { query: "PostgreSQL", cursor: "invalid" }),
+			executeTool(runtime, "optimizer_tool_search", { query: "PostgreSQL", cursor: "invalid" }),
 			/Invalid tool discovery cursor/,
 		);
 		await assert.rejects(
@@ -384,7 +469,7 @@ test("all runtime tool errors throw and protected tool results remain verbatim",
 		);
 
 		const largeOutput = Array.from({ length: 900 }, (_, index) => `ordinary output row ${index}`).join("\n");
-		for (const toolName of ["skill_search", "tool_search", "retrieve_output"]) {
+		for (const toolName of ["skill_search", "optimizer_tool_search", "tool_search", "retrieve_output"]) {
 			const results = await runtime.fire("tool_result", {
 				toolName,
 				toolCallId: `${toolName}-call`,

@@ -48,8 +48,8 @@ export default function captureCatalog(pi: ExtensionAPI): void {
 		captured = true;
 	};
 
-	pi.on("session_start", (_event, ctx) => {
-		save(ctx.getSystemPromptOptions().skills ?? []);
+	pi.on("before_agent_start", (event) => {
+		save(event.systemPromptOptions.skills ?? []);
 	});
 	pi.on("before_provider_request", (event) => {
 		if (captured) return;

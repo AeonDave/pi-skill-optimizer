@@ -5,9 +5,49 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
-	ExtensionRunner, discoverAndLoadExtensions, SessionManager, wrapRegisteredTools,
+	createToolSearchExtension, DefaultResourceLoader, ExtensionRunner, discoverAndLoadExtensions, SessionManager, wrapRegisteredTools,
 	type ExtensionActions, type ModelRegistry, type Skill,
 } from "@earendil-works/pi-coding-agent";
+
+test("Pi 1.0 loader keeps built-in tool_search alongside optimizer_tool_search", async () => {
+	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
+	const packageRoot = packagedRoot ? resolve(packagedRoot) : resolve(fileURLToPath(new URL("..", import.meta.url)));
+	const root = mkdtempSync(join(tmpdir(), "sko-pi-1-loader-"));
+	const agentDir = join(root, "agent");
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	try {
+		mkdirSync(agentDir, { recursive: true });
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [packageRoot] }), "utf8");
+		const loader = new DefaultResourceLoader({
+			cwd: root,
+			agentDir,
+			extensionFactories: [{ name: "tool-search", factory: createToolSearchExtension(), replaceable: true, builtin: true }],
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+		});
+		await loader.reload();
+		const result = loader.getExtensions();
+		assert.deepEqual(result.errors, []);
+		assert.ok(
+			!(result.warnings ?? []).some(({ warning }) => warning.includes("built-in extension `tool-search` was not loaded")),
+			(result.warnings ?? []).map(({ warning }) => warning).join("\n"),
+		);
+
+		const builtin = result.extensions.find((extension) => extension.path === "builtin:tool-search");
+		assert.ok(builtin, "Pi's built-in tool-search extension should stay loaded");
+		assert.ok(builtin.tools.has("tool_search"), "Pi's built-in tool_search should be registered");
+		const optimizer = result.extensions.find((extension) => extension.tools.has("optimizer_tool_search"));
+		assert.ok(optimizer, "the optimizer search tool should remain registered under its distinct name");
+		assert.equal(optimizer.tools.has("tool_search"), false, "the optimizer must not replace Pi's built-in tool");
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 test("real Pi loader/runner handles offline status, audit, search and verbatim skill load", async () => {
 	// Release probes reuse this test against an unpacked/installed artifact, not checkout source.
@@ -105,7 +145,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 	}
 });
 
-test("real Pi loader/runner lets tool_search activate initially deferred and codemode tools", async () => {
+test("real Pi loader/runner lets optimizer_tool_search activate initially deferred and codemode tools", async () => {
 	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
 	const extensionPath = packagedRoot
 		? join(resolve(packagedRoot), "src", "index.ts")
@@ -159,7 +199,7 @@ test("real Pi loader/runner lets tool_search activate initially deferred and cod
 		await runner.emitBeforeAgentStart("", undefined, { cwd: root, skills: [] });
 		assert.ok(!active.includes("mcp__issues__find"), "deferred tool was activated before search");
 		assert.ok(!active.includes("mcp__issues__update"), "codemode tool was activated before search");
-		const search = wrapRegisteredTools(registered, runner).find((tool) => tool.name === "tool_search");
+		const search = wrapRegisteredTools(registered, runner).find((tool) => tool.name === "optimizer_tool_search");
 		assert.ok(search);
 		const result = await search.execute("find-deferred", { query: "issue tracker tickets" });
 		const page = JSON.parse((result.content[0] as { text: string }).text) as { activated: string[] };

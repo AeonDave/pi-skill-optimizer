@@ -62,7 +62,7 @@ The benchmark asks:
 2. Is the stable base byte-identical across unrelated human requests?
 3. Does bounded prefetch improve first-turn recall without changing that base?
 4. Can `skill_search` recover relevant tail skills through bounded pagination?
-5. Can `tool_search` defer schemas without making required tools unavailable?
+5. Can `optimizer_tool_search` defer schemas without making required tools unavailable?
 6. Do output and history reductions preserve protected evidence and exact recovery?
 7. Is every accepted serialized transformation smaller?
 8. What do providers report for tokens, cache reads, cache writes, and cost?
@@ -174,7 +174,7 @@ Blocking invariants:
 
 - core, configured, and already used tools remain active;
 - inactive schemas are absent from the initial provider request;
-- `tool_search` remains active while searchable definitions remain;
+- `optimizer_tool_search` remains active while searchable definitions remain;
 - activation makes selected tools callable in the same session;
 - activation is additive and cannot strand an active provider tool loop;
 - schema indexing work and response pagination remain bounded;
@@ -188,7 +188,7 @@ Reported metrics:
 tool_recall
 initial_tool_schema_bytes
 activated_tool_schema_bytes
-tool_search_calls
+optimizer_tool_search_calls
 activation_failures
 ```
 

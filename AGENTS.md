@@ -4,7 +4,7 @@
 
 Pi extension that reduces repeated request tokens through one AUTO discovery contract, dynamic tool activation, and recoverable tool-output reduction. TypeScript is loaded by Pi through jiti without a build step.
 
-Runtime floor: Pi 0.87.1 and Node.js 26.3. Use current Pi APIs; do not add shims for older runtimes. Reading existing user profiles is a data-preservation requirement, not a promise of support for old Pi versions.
+Runtime floor: Pi 1.0.0 and Node.js 26.3. Use current Pi APIs; do not add shims for older runtimes. Reading existing user profiles is a data-preservation requirement, not a promise of support for old Pi versions.
 
 ## Package distribution
 
@@ -25,6 +25,7 @@ npm run bench
 npm run bench:ranking
 npm run bench:perf
 npm run bench:output
+npm run smoke:blackbox -- <absolute-unpacked-package-root>
 npm run corpus:build
 npm run bench:real
 npm run measure <capture.json>
@@ -52,7 +53,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - `src/corpus.ts` - HMAC identifiers, irreversible sanitization, private corpus schema, and evidence labels.
 - `src/evaluation.ts` - paired discovery, tool, output, cache, token, cost, and safety metrics.
 - `src/config.ts` - AUTO defaults, project/global normalization, provider scope, and boolean bypass.
-- `src/index.ts` - Pi hooks, state, activation, `skill_search`, `tool_search`, `retrieve_output`, diagnostics, and commands.
+- `src/index.ts` - Pi hooks, state, activation, `skill_search`, `optimizer_tool_search`, `retrieve_output`, diagnostics, and commands.
 - `scripts/bench.ts` - deterministic AUTO invariants.
 - `scripts/output-bench.ts` - output, evidence, archive, columnar, and RTK benchmark.
 - `scripts/build-real-corpus.ts` and `scripts/evaluate-real-corpus.ts` - explicit private real-provider workflow.
@@ -80,7 +81,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 ## Dynamic tool invariants
 
 - Keep core, configured, already used, and bounded predicted tools active.
-- Keep `tool_search` active while searchable definitions remain.
+- Keep `optimizer_tool_search` active while searchable definitions remain; preserve Pi's built-in `tool_search` when the host activates it.
 - Search is paginated and activates bounded results through Pi's runtime API.
 - Never strand an in-progress provider tool loop by deactivating a used tool.
 - Bound schema indexing work so recursive or large schemas cannot dominate processing.
@@ -133,6 +134,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - Output or history changes require focused tests and `npm run bench:output`.
 - Other pure modules require their corresponding suites.
 - Hook or config changes require `npm run typecheck`, then `pi -e ./src/index.ts` with status, audit, and search/load smoke paths.
+- Release candidates require `smoke:blackbox` against the unpacked npm tarball with Pi 1.0.0; the fixture model is local and needs no provider key.
 - Run focused tests after edits, then all local gates before a completion claim.
 - Never invoke `corpus:build` or `bench:real` implicitly.
 

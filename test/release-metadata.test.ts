@@ -28,29 +28,41 @@ test("release metadata stays aligned", () => {
 	assert.match(changelog, new RegExp(`^## ${pkg.version.replaceAll(".", "\\.")}`, "m"));
 });
 
-test("runtime floors match development dependencies, installation docs and CI", () => {
+test("runtime floors and tested Pi version match installation docs and CI", () => {
 	const pkg = JSON.parse(readFileSync(new URL("package.json", root), "utf8")) as {
 		engines: { node: string };
 		peerDependencies: Record<string, string>;
 		devDependencies: Record<string, string>;
 	};
 	const readme = readFileSync(new URL("README.md", root), "utf8");
+	const agents = readFileSync(new URL("AGENTS.md", root), "utf8");
 	const ci = readFileSync(new URL(".github/workflows/ci.yml", root), "utf8");
 	const nodeFloor = pkg.engines.node.replace(/^>=/, "");
-	// Host peers are wildcard by Pi's packaging contract; the tested floor lives in devDependencies/docs.
-	const piFloor = pkg.devDependencies["@earendil-works/pi-coding-agent"].replace(/^\^/, "");
-	assert.ok(readme.includes(`Pi ${piFloor}+`));
+	// Host peers are wildcard by Pi's packaging contract. The supported floor can
+	// remain below the current Pi version used for development and host tests.
+	const piFloor = readme.match(/Requires \*\*Pi (\d+\.\d+\.\d+)\+\*\*/)?.[1];
+	assert.ok(piFloor, "README must state the supported Pi floor");
+	assert.ok(agents.includes(`Runtime floor: Pi ${piFloor}`));
+	const testedPi = pkg.devDependencies["@earendil-works/pi-coding-agent"].replace(/^\^/, "");
+	const compareVersions = (left: string, right: string): number => {
+		const a = left.split(".").map(Number);
+		const b = right.split(".").map(Number);
+		for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] - b[i];
+		return 0;
+	};
+	assert.ok(compareVersions(testedPi, piFloor) >= 0, "tested Pi version must meet the supported floor");
 	assert.ok(readme.includes(`Node.js ${nodeFloor.replace(/\.0$/, "")}+`));
 	assert.ok(ci.includes(`"${nodeFloor}"`), "CI must validate the exact minimum Node version");
 	for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent"]) {
 		assert.equal(pkg.peerDependencies[name], "*");
-		assert.equal(pkg.devDependencies[name], `^${piFloor}`);
+		assert.equal(pkg.devDependencies[name], `^${testedPi}`);
 	}
 	assert.equal(pkg.devDependencies["@types/node"].match(/\d+/)?.[0], nodeFloor.split(".")[0]);
 });
 
 test("public Pi gallery metadata uses the shipped banner and host-provided dependencies", () => {
 	const pkg = JSON.parse(readFileSync(new URL("package.json", root), "utf8")) as {
+		version: string;
 		private: boolean;
 		publishConfig?: { access: string };
 		keywords: string[];
@@ -70,6 +82,7 @@ test("public Pi gallery metadata uses the shipped banner and host-provided depen
 	assert.equal(image.protocol, "https:");
 	assert.equal(image.hostname, "raw.githubusercontent.com");
 	assert.match(image.pathname, /^\/AeonDave\/pi-skill-optimizer\/(?:v\d+\.\d+\.\d+|[a-f0-9]{40})\/assets\/banner\.png$/);
+	assert.ok(image.pathname.endsWith(`/v${pkg.version}/assets/banner.png`), "gallery banner must use this release tag");
 	assert.ok(existsSync(new URL("assets/banner.png", root)));
 	assert.ok(existsSync(new URL("src/prompts/init-profile.md", root)), "init needs its runtime prompt in the package");
 	assert.deepEqual(pkg.files, [

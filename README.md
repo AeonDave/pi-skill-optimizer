@@ -14,7 +14,7 @@ No embedding service or extra model call for ordinary routing. No changes to you
 
 ## Install
 
-Requires **Pi 0.87.1+** and **Node.js 26.3+**. Upgrade both before installing v3.
+Requires **Pi 1.0.0+** and **Node.js 26.3+**. Upgrade both before installing v3.1.
 
 ```bash
 pi install npm:@aeondave/pi-skill-optimizer
@@ -26,19 +26,18 @@ Restart Pi, then check that it loaded:
 /skill-optimizer
 ```
 
-Pi 0.99.0+ also includes a built-in `tool-search` extension. This optimizer provides
-its own `tool_search`, so disable the built-in under **Built-in extensions** in
-`pi config` to avoid the startup conflict warning. Use the global setting for a
-personal install, or `pi config -l` for a project-only install. The optimizer
-continues to find registered `deferred` and `codemode` tools. See the
-[tool-search configuration](docs/CONFIGURATION.md#replacing-the-built-in-tool-search).
+On Pi 1.0.0, the optimizer's search tool is `optimizer_tool_search`. Pi's
+built-in `tool_search` can load alongside it without a name conflict. If you
+previously disabled `builtin:tool-search` to avoid the warning, you can remove
+that setting after updating the optimizer. See the
+[tool-search configuration](docs/CONFIGURATION.md#tool-search-and-pi-100).
 
 That's enough to start. Optionally run `/skill-optimizer init` to generate routing hints for your library. **Init uses your current Pi model and may incur cost**; normal discovery does not.
 
 | Need | Command |
 | --- | --- |
 | Install only in this project | `pi install -l npm:@aeondave/pi-skill-optimizer` |
-| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.0.1` |
+| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.1.0` |
 | Update an unpinned install | `pi update npm:@aeondave/pi-skill-optimizer` |
 
 Restart after updating. Pinned installs stay pinned until you explicitly install another version.
@@ -65,7 +64,7 @@ AUTO keeps a compact, stable index of **all eligible names**, adds relevant desc
 | Area | What AUTO does | What stays available |
 | --- | --- | --- |
 | Skills | Shortens catalog descriptions; prefetches relevant ones | Every eligible name and exact full-instruction loading |
-| Tools | Defers less relevant schemas behind `tool_search` | Protected, configured, already-used and activated tools |
+| Tools | Defers less relevant schemas behind `optimizer_tool_search` | Protected, configured, already-used and activated tools |
 | Large results | Applies deterministic reduction; lossless columnar JSON where suitable | Complete originals through `retrieve_output` during archive retention |
 | Repeated results | Replaces later exact duplicates with recovery references | The first result, errors, protected evidence and mixed media |
 
@@ -83,7 +82,7 @@ You can leave AUTO running with its defaults.
 
 An optional setup hint appears at the first eligible prompt when initialization is missing or needs attention. It never starts init for you or adds instructions to the model's context.
 
-Pi gets three tools: `skill_search`, `tool_search` and `retrieve_output`. Skill search is paginated and exact loads accept only registered names. Output recovery uses opaque identifiers, not exposed archive paths.
+Pi gets three optimizer tools: `skill_search`, `optimizer_tool_search` and `retrieve_output`. Pi may also provide its built-in `tool_search`. Skill search is paginated and exact loads accept only registered names. Output recovery uses opaque identifiers, not exposed archive paths.
 
 Skills can be useful even when you never mention them. Init can tag architecture,
 testing and behavioral guidance by activity, so a matched specialist can bring

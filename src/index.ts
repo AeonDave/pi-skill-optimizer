@@ -110,7 +110,8 @@ const FLUSH_INTERVAL_MS = 15_000;
 const LOAD_RETRY_MS = 1_000;
 const MAX_SEEN_EVIDENCE = 4_096;
 const MAX_HISTORY_ARTIFACTS = 128;
-const PROTECTED_RUNTIME_TOOLS = ["skill_search", "tool_search", "retrieve_output"] as const;
+const PROTECTED_RUNTIME_TOOLS = ["skill_search", "optimizer_tool_search", "retrieve_output"] as const;
+const RESOLVER_RESULT_TOOLS = new Set<string>([...PROTECTED_RUNTIME_TOOLS, "tool_search"]);
 
 function isHostSearchableTool(tool: object): boolean {
 	return "exposure" in tool && (tool.exposure === "deferred" || tool.exposure === "codemode");
@@ -574,16 +575,30 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 
 	const rebuildToolCatalog = (state: RuntimeSnapshot): ToolDiscoveryCatalog => {
 		const allTools = pi.getAllTools();
+		const activeNames = new Set(pi.getActiveTools().map((name) => name.toLowerCase()));
+		const alwaysToolPrefixes = state.config.alwaysTools
+			.map((pattern) => pattern.trim().toLowerCase())
+			.filter((pattern) => pattern.length > 0);
 		permittedToolNames ??= new Set([
-			...pi.getActiveTools().map((name) => name.toLowerCase()),
+			...activeNames,
 			...PROTECTED_RUNTIME_TOOLS,
 		]);
 		for (const tool of allTools) {
-			if (!isHostHiddenTool(tool)) continue;
 			const name = tool.name.toLowerCase();
-			permittedToolNames.delete(name);
-			retainedToolNames.delete(name);
-			deactivatedToolNames.delete(name);
+			if (isHostHiddenTool(tool)) {
+				permittedToolNames.delete(name);
+				retainedToolNames.delete(name);
+				deactivatedToolNames.delete(name);
+				continue;
+			}
+			if (activeNames.has(name)) {
+				const newlyActive = !permittedToolNames.has(name);
+				const reactivated = deactivatedToolNames.delete(name);
+				if (newlyActive || reactivated) retainedToolNames.add(name);
+				permittedToolNames.add(name);
+			} else if (isHostSearchableTool(tool) && alwaysToolPrefixes.some((pattern) => name.startsWith(pattern))) {
+				permittedToolNames.add(name);
+			}
 		}
 		const discoverable = allTools.filter((tool) =>
 			!isHostHiddenTool(tool) && permittedToolNames?.has(tool.name.toLowerCase()),
@@ -684,8 +699,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
-		name: "tool_search",
-		label: "Tool Search",
+		name: "optimizer_tool_search",
+		label: "Optimizer Tool Search",
 		description: "Search local tool definitions and activate matching inactive tools without disabling current tools.",
 		promptSnippet: "Search and activate additional tools on demand",
 		parameters: TOOL_SEARCH_PARAMS,
@@ -1177,7 +1192,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 
 	pi.on("tool_result", async (event, ctx) => {
 		usedTools.add(event.toolName.toLowerCase());
-		if (PROTECTED_RUNTIME_TOOLS.includes(event.toolName as typeof PROTECTED_RUNTIME_TOOLS[number])) return;
+		if (RESOLVER_RESULT_TOOLS.has(event.toolName)) return;
 		if (isDisabled(ctx.cwd) || event.isError) return;
 		const config = getRuntimeConfig(ctx);
 		const providers = config.providers.length > 0 ? config.providers : undefined;
@@ -1373,7 +1388,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				`  enabled:        ${isDisabled(ctx.cwd) ? "no" : "yes"}`,
 				"  skills mode:    AUTO (stable TSV + skill_search resolver)",
 				`  catalog budget:${lastBudget.usedChars}/${lastBudget.requestedChars} chars, ${lastBudget.nameOnlyCount} name-only`,
-				`  tools:          ${pi.getActiveTools().length}/${pi.getAllTools().length} active; tool_search additive`,
+				`  tools:          ${pi.getActiveTools().length}/${pi.getAllTools().length} active; optimizer_tool_search additive`,
 				`  output:         ${getOutputConfig(state.config).mode}; RTK ${rtkExtensionPresent() ? "detected per result" : "not detected"}`,
 				`  scope:          ${state.config.providers.join(", ") || "all providers"}`,
 				`  init readiness: ${retryAfter !== 0 ? "unavailable (profile could not be read)" : readiness.skillCount === 0 ? "not available (no model-invocable skills)" : initReadinessSummary(readiness)}`,

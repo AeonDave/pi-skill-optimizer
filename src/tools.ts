@@ -23,7 +23,7 @@ export const CORE_TOOLS = new Set(
 		"read", "bash", "edit", "write", "multiedit", "str_replace_editor", "notebookedit",
 		"glob", "grep", "ls", "find", "todo", "todowrite", "todoread",
 		"subagent", "fork", "task", "mcp", "skill", "exitplanmode", "enterplanmode",
-		"webfetch", "websearch", "askuserquestion", "powershell",
+		"webfetch", "websearch", "askuserquestion", "powershell", "tool_search",
 	].map((name) => name.toLowerCase()),
 );
 

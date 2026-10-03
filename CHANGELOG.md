@@ -2,6 +2,24 @@
 
 All notable changes are documented here.
 
+## 3.1.0 - 2026-10-03
+
+### Breaking
+
+- Rename the optimizer's model-callable `tool_search` to `optimizer_tool_search`. Explicit tool calls must use the new name. Pi's built-in `tool_search` now loads alongside the optimizer without a replacement warning.
+
+### Fixed
+
+- Preserve an active built-in `tool_search` during optimizer replanning.
+- Retain tools activated later by Pi or another extension, and honor `alwaysTools` for initially inactive `deferred` or `codemode` tools while respecting hidden and inactive direct tools.
+- Capture an explicitly requested benchmark catalog from Pi 1.0's `before_agent_start` skill options.
+
+### Changed
+
+- Require Pi 1.0.0 or newer for this release.
+- Run typechecking and host integration tests against Pi 1.0.0 development packages.
+- Add a reproducible Pi CLI black-box smoke test for the packed artifact.
+
 ## 3.0.1 - 2026-09-30
 
 ### Fixed
