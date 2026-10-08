@@ -37,7 +37,7 @@ That's enough to start. Optionally run `/skill-optimizer init` to generate routi
 | Need | Command |
 | --- | --- |
 | Install only in this project | `pi install -l npm:@aeondave/pi-skill-optimizer` |
-| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.1.0` |
+| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.1.1` |
 | Update an unpinned install | `pi update npm:@aeondave/pi-skill-optimizer` |
 
 Restart after updating. Pinned installs stay pinned until you explicitly install another version.
@@ -60,6 +60,10 @@ For a pinned or Git install, remove the exact old source shown by `pi list`. Add
 Say you have hundreds of skills, but you're asking Pi to fix a database migration. Sending every full description again is rarely useful.
 
 AUTO keeps a compact, stable index of **all eligible names**, adds relevant descriptions beside your latest request, and exposes `skill_search` for loading complete instructions. The stable index does not change when your question changes.
+
+Prefetch is a catalog, not loaded instructions or evidence that a skill was used. Worker updates,
+extension notifications and summaries do not replace your request as the routing signal or receive
+its overlay; there is no need to acknowledge the catalog.
 
 | Area | What AUTO does | What stays available |
 | --- | --- | --- |

@@ -2,6 +2,20 @@
 
 All notable changes are documented here.
 
+## Unreleased
+
+## 3.1.1 - 2026-10-08
+
+### Fixed
+
+- Optimize the native Pi transcript before provider conversion, keeping worker notifications, shell
+  output and summaries out of human-intent routing and prefetch insertion.
+- Preserve structured system sections and tool declarations; respect provider scoping when the
+  request has no selected model.
+- Label prefetch as catalog metadata, not loaded instructions or usage evidence. Emit its actual
+  catalog fingerprint and report selected skills only when an overlay was inserted.
+- Recognize native Pi skill-activation calls without double-counting `skill_search` usage.
+
 ## 3.1.0 - 2026-10-03
 
 ### Breaking

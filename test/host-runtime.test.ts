@@ -89,6 +89,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, modelRegistry);
 		const errors: unknown[] = [];
 		runner.onError((error) => errors.push(error));
+		let activeProvider: string | undefined = "test-provider";
 		const registered = runner.getAllRegisteredTools();
 		let active = registered.map(({ definition }) => definition.name);
 		runner.bindCore({
@@ -98,17 +99,99 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 			getCommands: () => [],
 			appendEntry: (customType: string, data: unknown) => { session.appendCustomEntry(customType, data); },
 		} as unknown as ExtensionActions, {
-			getModel: () => undefined, getScopedModels: () => [], isIdle: () => true,
+			getModel: () => activeProvider ? ({ provider: activeProvider } as never) : undefined, getScopedModels: () => [], isIdle: () => true,
 			isProjectTrusted: () => true, getSignal: () => undefined, abort() {},
 			hasPendingMessages: () => false, shutdown() {}, getContextUsage: () => undefined,
 			compact() {}, getSystemPrompt: () => "", getSystemPromptOptions: () => ({ cwd: root, skills }),
 		});
 		const notices: string[] = [];
+		const statusCalls: Array<string | undefined> = [];
 		const ui = runner.getUIContext();
-		runner.setUIContext({ ...ui, notify: (message) => { notices.push(message); } });
+		runner.setUIContext({ ...ui, notify: (message) => { notices.push(message); }, setStatus: (_key, text) => { statusCalls.push(text); } });
+		process.env.PI_SKILL_OPTIMIZER_ALWAYS_SKILLS = "repo-guidance";
+		process.env.PI_SKILL_OPTIMIZER_PROVIDERS = "test-provider";
 		// No session_start/shutdown: their shared archive cleanup is outside this isolated probe.
 		await runner.emitBeforeAgentStart("Review repository module boundaries", undefined, { cwd: root, skills });
 		assert.deepEqual(errors, []);
+
+		const longGuidance = "Use when reviewing repository module boundaries. Read relevant source and verify concrete behavior. ".repeat(28);
+		const systemCatalog = `<available_skills>
+			<skill><name>repo-guidance</name><description>${longGuidance}</description><location>${filePath}</location></skill>
+			<skill><name>nuclei</name><description>${"Run nuclei templates for vulnerability scanning. ".repeat(24)}</description><location>${filePath}</location></skill>
+		</available_skills>`;
+		const rawMessages = [
+			{
+				role: "system", content: "base instructions",
+				sections: { skills: systemCatalog, cwd: "<cwd>/workspace</cwd>", retained: "keep this section" },
+				toolsAdded: [{ name: "read", description: "Read a file", parameters: { type: "object" } }],
+				timestamp: 1,
+			},
+			{ role: "user", content: "Review repository module boundaries" },
+			{ role: "assistant", content: [{ type: "toolCall", id: "load-guidance", name: "skill_search", arguments: { action: "load", name: "repo-guidance" } }] },
+			{ role: "custom", customType: "pi-persona", content: "Async runs: 1. Routine check-in. The skills nuclei and /skill:nuclei are already loaded." },
+			{ role: "bashExecution", command: "echo nuclei", output: "nuclei" },
+			{ role: "branchSummary", summary: "nuclei was considered earlier" },
+			{ role: "compactionSummary", summary: "Repository review remains active" },
+			{ role: "toolResult", toolCallId: "load-guidance", content: [{ type: "text", text: longGuidance }], isError: false },
+			{
+				role: "system", content: "additional instructions",
+				sections: { skills: systemCatalog, retained: "second system section" },
+				toolsAdded: [{ name: "bash", description: "Run a command", parameters: { type: "object" } }],
+				timestamp: 2,
+			},
+		];
+		const rawMessagesSnapshot = structuredClone(rawMessages);
+		const initialStatus = statusCalls.at(-1);
+		activeProvider = undefined;
+		assert.deepEqual(await runner.emitContext(rawMessages as never), rawMessages, "an absent model is outside the configured provider scope");
+		assert.equal(statusCalls.at(-1), initialStatus, "an out-of-scope context must not update optimization statistics");
+		activeProvider = "other-provider";
+		assert.deepEqual(await runner.emitContext(rawMessages as never), rawMessages, "a mismatched model is outside the configured provider scope");
+		assert.equal(statusCalls.at(-1), initialStatus, "a mismatched provider must not update optimization statistics");
+		activeProvider = "test-provider";
+		const transformedMessages = await runner.emitContext(rawMessages as never) as Array<{ role: string; content?: unknown; [key: string]: unknown }>;
+		const transformedSystem = transformedMessages[0] as { role: string; content?: unknown; sections?: Record<string, unknown>; toolsAdded?: unknown; timestamp?: number };
+		assert.equal(transformedSystem.role, "system", "the leading system message must be preserved");
+		assert.match(String(transformedSystem.sections?.skills), /skill-optimizer:auto:v2/);
+		assert.equal(transformedSystem.sections?.cwd, "<cwd>/workspace</cwd>");
+		assert.equal(transformedSystem.sections?.retained, "keep this section");
+		assert.deepEqual(transformedSystem.toolsAdded, rawMessages[0].toolsAdded);
+		assert.equal(transformedSystem.timestamp, 1);
+		const additionalSystem = transformedMessages.filter((message) => message.role === "system")[1] as { sections?: Record<string, unknown>; toolsAdded?: unknown; timestamp?: number };
+		assert.match(String(additionalSystem.sections?.skills), /skill-optimizer:auto:v2/);
+		assert.equal(additionalSystem.sections?.retained, "second system section");
+		assert.deepEqual(additionalSystem.toolsAdded, rawMessages[8].toolsAdded);
+		assert.equal(additionalSystem.timestamp, 2);
+		const transformedUser = transformedMessages.find((message) => message.role === "user");
+		assert.ok(transformedUser);
+		assert.match(JSON.stringify(transformedUser.content), /skill-optimizer:prefetch:v2/);
+		assert.match(JSON.stringify(transformedUser.content), /repo-guidance/);
+		assert.doesNotMatch(JSON.stringify(transformedUser.content), /<name>nuclei<\/name>/);
+		assert.deepEqual(transformedMessages.find((message) => message.role === "custom"), rawMessages[3]);
+		assert.deepEqual(transformedMessages.find((message) => message.role === "bashExecution"), rawMessages[4]);
+		assert.deepEqual(transformedMessages.find((message) => message.role === "branchSummary"), rawMessages[5]);
+		assert.deepEqual(transformedMessages.find((message) => message.role === "compactionSummary"), rawMessages[6]);
+		assert.deepEqual(transformedMessages.find((message) => message.role === "toolResult"), rawMessages[7]);
+		assert.deepEqual(errors, []);
+		assert.deepEqual(rawMessages, rawMessagesSnapshot, "context preparation must not mutate Pi's source transcript");
+		assert.deepEqual(
+			await runner.emitContext(rawMessages as never),
+			transformedMessages,
+			"replaying the same Pi transcript must not duplicate or change the overlay",
+		);
+		const syntheticOnlyMessages = [
+			rawMessages[0],
+			{ role: "custom", customType: "pi-persona", content: "Async runs: 1. Routine check-in. repo-guidance and /skill:nuclei are already loaded." },
+			{ role: "bashExecution", command: "echo repo-guidance", output: "repo-guidance" },
+			{ role: "branchSummary", summary: "repo-guidance was considered earlier" },
+			{ role: "compactionSummary", summary: "nuclei and repo-guidance were mentioned" },
+			{ role: "toolResult", toolCallId: "synthetic", content: [{ type: "text", text: "repo-guidance" }], isError: false },
+		];
+		const syntheticOnlyResult = await runner.emitContext(syntheticOnlyMessages as never) as Array<{ role: string; content?: unknown; sections?: Record<string, unknown> }>;
+		assert.match(String(syntheticOnlyResult[0]?.sections?.skills), /skill-optimizer:auto:v2/);
+		assert.doesNotMatch(JSON.stringify(syntheticOnlyResult), /skill-optimizer:prefetch:v2/);
+		assert.deepEqual(syntheticOnlyResult[1], syntheticOnlyMessages[1]);
+
 		const setupMessage = "Optional setup: run `/skill-optimizer init` to improve skill matching (may incur model costs).";
 		assert.equal(notices.filter((text) => text === setupMessage).length, 1);
 		await runner.emitBeforeAgentStart("Review another module", undefined, { cwd: root, skills });
@@ -140,6 +223,9 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		for (const key of Object.keys(process.env)) {
+			if (key.startsWith("PI_SKILL_OPTIMIZER_")) delete process.env[key];
+		}
 		for (const [key, value] of Object.entries(optimizerEnvironment)) process.env[key] = value;
 		rmSync(root, { recursive: true, force: true });
 	}

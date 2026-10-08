@@ -302,6 +302,8 @@ test("prefetch content is separate from the cache-stable base", () => {
 	const prefetch = renderSkillPrefetch(result.plan);
 	assert.ok(prefetch.includes(fullDescription));
 	assert.match(prefetch, /skill_search/);
+	assert.match(prefetch, /Catalog metadata only, not loaded instructions or usage evidence/);
+	assert.match(prefetch, /skill_search\(action=load, name\); no acknowledgment is needed/);
 	assert.ok(!prefetch.includes("C:/skills"));
 	assert.match(prefetch, /catalog_sha256="[a-f0-9]{64}"/);
 });

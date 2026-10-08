@@ -67,7 +67,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - The base remains byte-identical when catalog, profile, and configuration are unchanged.
 - Score full source text. Limit only rendered base, overlay, or search responses.
 - Exact names and profile phrases match whole normalized token sequences, never character substrings (`git` is not an exact match for `digital`). Cache catalog-derived features, not mutable caller objects or query-specific scores.
-- Prefetch is separate from the base and appends full verbatim text only to the latest genuine human block.
+- Prefetch is separate from the base and appends only selected skill names and descriptions (catalog metadata, not full `SKILL.md` instructions) to the latest genuine human block.
 - Never derive intent from tool or function results, assistant text, injected context, or image metadata.
 - Overlay insertion is idempotent, minimally clones the modified provider branch, and preserves identity without a target.
 - Empty input must not manufacture a ranking signal.

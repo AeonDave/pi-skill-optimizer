@@ -91,16 +91,18 @@ export function collectSkillUsageEvidence(payload: unknown, selectedSkills: read
 		const rawMessage = rawMessages[messageIndex];
 		if (!rawMessage || typeof rawMessage !== "object") continue;
 		const message = rawMessage as Record<string, unknown>;
+		if (message.role !== "assistant") continue;
 		if (!Array.isArray(message.content)) continue;
 		for (let blockIndex = 0; blockIndex < message.content.length; blockIndex++) {
 			const rawBlock = message.content[blockIndex];
 			if (!rawBlock || typeof rawBlock !== "object") continue;
 			const block = rawBlock as Record<string, unknown>;
-			if (block.type !== "tool_use" || typeof block.name !== "string") continue;
+			if ((block.type !== "tool_use" && block.type !== "toolCall") || typeof block.name !== "string") continue;
 			const toolName = block.name.toLowerCase();
 			if (toolName !== "skill" && toolName !== "activate_skill") continue;
-			if (!block.input || typeof block.input !== "object") continue;
-			const input = block.input as Record<string, unknown>;
+			const rawInput = block.type === "toolCall" ? block.arguments : block.input;
+			if (!rawInput || typeof rawInput !== "object") continue;
+			const input = rawInput as Record<string, unknown>;
 			let serialized = "";
 			try { serialized = JSON.stringify(input); } catch { serialized = String(input); }
 			const sourceId = objectId(block);

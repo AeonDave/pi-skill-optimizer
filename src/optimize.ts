@@ -361,25 +361,24 @@ export function optimizePayload<T>(
   }
 
   let addedPrefetchChars = 0;
-  const selectedSkills =
-    planSkillPrefetch(catalogSkills, query, {
-      profile: config.profile,
-      usagePrior: config.usagePrior,
-      always: uniqueInOrder([
-        ...(config.profile?.critical ?? []),
-        ...(config.alwaysSkills ?? []),
-      ]),
-      never: config.excludeSkills,
-      targetTopK: config.prefetchTarget,
-      minTopK: config.prefetchMin,
-      maxTopK: config.prefetchMax,
-      fullRenderBudgetChars: config.prefetchBudgetChars,
-      fuzzyCandidateLimit: config.fuzzyCandidateLimit,
-    }).selected;
+  let injectedSkills: string[] = [];
+  const prefetchPlan = planSkillPrefetch(catalogSkills, query, {
+    profile: config.profile,
+    usagePrior: config.usagePrior,
+    always: uniqueInOrder([
+      ...(config.profile?.critical ?? []),
+      ...(config.alwaysSkills ?? []),
+    ]),
+    never: config.excludeSkills,
+    targetTopK: config.prefetchTarget,
+    minTopK: config.prefetchMin,
+    maxTopK: config.prefetchMax,
+    fullRenderBudgetChars: config.prefetchBudgetChars,
+    fuzzyCandidateLimit: config.fuzzyCandidateLimit,
+  });
+  const selectedSkills = prefetchPlan.selected;
   if (selectedSkills.length > 0) {
-    const appendix = renderSkillPrefetch({
-      selected: selectedSkills,
-    } as Parameters<typeof renderSkillPrefetch>[0]);
+    const appendix = renderSkillPrefetch(prefetchPlan);
     if (appendix) {
       const withPrefetch = appendToLatestHumanInput(
         next,
@@ -389,6 +388,7 @@ export function optimizePayload<T>(
       if (withPrefetch !== next) {
         addedPrefetchChars = serializedLength(withPrefetch) - serializedLength(next);
         next = withPrefetch;
+        injectedSkills = selectedSkills.map((skill) => skill.name);
       }
     }
   }
@@ -416,7 +416,7 @@ export function optimizePayload<T>(
     removedChars: originalLength - finalLength,
     baseRemovedChars,
     addedPrefetchChars: Math.max(0, addedPrefetchChars),
-    selected: selectedSkills.map((skill) => skill.name),
+    selected: injectedSkills,
     catalogNames: uniqueInOrder(catalogNames),
     fingerprints: uniqueInOrder(fingerprints),
     budget,

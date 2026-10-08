@@ -20,7 +20,18 @@ The index contains no filesystem paths. With the same catalog, profile, and conf
 
 AUTO extracts intent only from genuine human text in Anthropic, OpenAI Chat and Responses, Gemini, Mistral, and Pi's structured `pi-messages` request shapes. A catalog may live in a system or developer block, but neither is treated as human intent. Assistant text, tool or function results, injected context, image metadata, and empty input cannot create a ranking signal.
 
+At runtime, catalog optimization and usage extraction run in Pi's `context_with_system` hook,
+before provider conversion erases custom-message provenance. Native `custom`, `bashExecution`,
+`branchSummary`, `compactionSummary` and `toolResult` messages remain intact and cannot become
+the query or overlay target. Structured system sections and tool declarations are preserved;
+request-local clones do not modify persisted conversation entries.
+
 Ranking uses exact matching, BM25F, bounded name and alias typo recovery, reciprocal-rank fusion, diversity, profile evidence, and decayed usage evidence. It scores full source descriptions, then appends a bounded set of verbatim skill names and descriptions (not the full `SKILL.md` instructions) to the latest human block. The overlay is separate from the stable prefix, fingerprinted, idempotent, and omitted when there is no valid target.
+
+The resolver labels prefetch as discovery metadata, not loaded instructions or usage evidence.
+Diagnostics count only overlays actually inserted. Usage follows explicit human mentions and skill
+activations; the `skill_search` executor records its own loads/resources, so transcript scanning
+does not count those calls twice. Catalog selections and assistant acknowledgments are not usage.
 
 Optional init-generated activation tags distinguish specialists, workflow methods
 and behavioral discipline. An admitted specialist can bring one activity-matched

@@ -1084,13 +1084,14 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("before_provider_request", (event, ctx) => {
+	pi.on("context_with_system", (event, ctx) => {
 		if (isDisabled(ctx.cwd)) return;
 		const config = getRuntimeConfig(ctx);
 		const providers = config.providers.length > 0 ? config.providers : undefined;
-		if (providers && ctx.model && !providers.includes(ctx.model.provider)) return;
+		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) return;
 		const state = ensureSnapshot(ctx);
-		const transformed = optimizePayload(event.payload, {
+		const payload = { messages: event.messages };
+		const transformed = optimizePayload(payload, {
 			...state.config,
 			profile: state.profile,
 			usagePrior: buildUsagePrior(state.usage, {
@@ -1109,7 +1110,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			addPending(getStatsFilePath(ctx.cwd), { skills: transformed.removedChars, tools: 0, output: 0 });
 		}
 		if (registry) {
-			const evidence = collectSkillUsageEvidence(event.payload, registry.skills.map((skill) => skill.name)).slice(-MAX_SEEN_EVIDENCE);
+			const evidence = collectSkillUsageEvidence(payload, registry.skills.map((skill) => skill.name)).slice(-MAX_SEEN_EVIDENCE);
 			const names: string[] = [];
 			for (const item of evidence) {
 				if (seenEvidence.has(item.key)) continue;
@@ -1124,7 +1125,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 		maybeFlush(ctx);
 		updateStatus(ctx);
-		return transformed.next === event.payload ? undefined : transformed.next;
+		return transformed.next === payload
+			? undefined
+			: { messages: (transformed.next as typeof payload).messages };
 	});
 
 	pi.on("context", (event, ctx) => {

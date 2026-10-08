@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { optimizePayload } from "../src/optimize.js";
+import { normalizeProfile } from "../src/profile.js";
 
 function catalog(count = 24): string {
   const entries = Array.from({ length: count }, (_, index) => {
@@ -121,6 +122,8 @@ test("AUTO never ranks or decorates a pi-persona identity pseudo-turn", () => {
 	const messages = (result.next as typeof request).messages;
 	assert.equal(result.selected.includes("database-migration"), true);
 	assert.match(messages[0].content, /skill-optimizer:prefetch:v2/);
+	assert.match(messages[0].content, /catalog_sha256="[a-f0-9]{64}"/);
+	assert.doesNotMatch(messages[0].content, /catalog_sha256="undefined"/);
 	assert.equal(messages[2].content, request.messages[2].content);
 });
 
@@ -230,6 +233,33 @@ test("no-signal requests do not invent an ordinary prefetch", () => {
   assert.doesNotMatch(textOf(result.next), /skill-optimizer:prefetch:v2/);
   assert.match(textOf(result.next), /database-migration/);
   assert.match(textOf(result.next), /ordinary-skill-23/);
+});
+
+test("critical prefetch diagnostics require a real text target", () => {
+	const critical = config({ profile: normalizeProfile({ critical: ["database-migration"] }) });
+	const system = catalog();
+	const syntheticOnly = optimizePayload({
+		messages: [
+			{ role: "system", content: system },
+			{ role: "custom", content: "Async runs: 1. Use /skill:database-migration." },
+			{ role: "bashExecution", command: "echo database-migration", output: "database-migration" },
+			{ role: "branchSummary", summary: "database-migration" },
+			{ role: "toolResult", content: "database-migration" },
+		],
+	}, critical);
+	assert.ok(syntheticOnly.removedChars > 0, "base catalog compression should still run");
+	assert.deepEqual(syntheticOnly.selected, []);
+	assert.doesNotMatch(textOf(syntheticOnly.next), /skill-optimizer:prefetch:v2/);
+
+	const imageOnly = optimizePayload({
+		messages: [
+			{ role: "system", content: system },
+			{ role: "user", content: [{ type: "image", source: "opaque" }] },
+		],
+	}, critical);
+	assert.ok(imageOnly.removedChars > 0, "base catalog compression should still run");
+	assert.deepEqual(imageOnly.selected, []);
+	assert.doesNotMatch(textOf(imageOnly.next), /skill-optimizer:prefetch:v2/);
 });
 
 test("critical skills are selected independently from weak lexical evidence", () => {

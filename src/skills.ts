@@ -1058,7 +1058,7 @@ export function renderSkillPrefetch(plan: SkillPrefetchPlan): string {
 	if (plan.selected.length === 0) return "";
 	return [
 		`<skill_prefetch catalog_sha256="${plan.fingerprint}">`,
-		"  <skill_resolver>Use skill_search(name) to load the full skill resource.</skill_resolver>",
+		"  <skill_resolver>Catalog metadata only, not loaded instructions or usage evidence. Load a relevant full skill with skill_search(action=load, name); no acknowledgment is needed.</skill_resolver>",
 		...plan.selected.map(renderFullSkill),
 		"</skill_prefetch>",
 	].join("\n");

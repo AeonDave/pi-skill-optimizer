@@ -29,6 +29,31 @@ test("usage evidence is stable across provider loops and distinct per event", ()
 	assert.equal(usageRecordSignature(payload, ["alpha"]), usageRecordSignature(payload, ["alpha"]));
 });
 
+test("usage evidence recognizes native Pi skill activations, not catalog text, notices, acknowledgments, or searches", () => {
+	const evidence = collectSkillUsageEvidence({ messages: [
+		{ id: "system-1", role: "system", content: "Critical skill catalog: alpha; beta. These are metadata only." },
+		{ id: "user-1", role: "user", content: "Continue the current task." },
+		{ id: "check-in", role: "custom", customType: "pi-persona", content: "Use /skill:beta and review nuclei." },
+		{ id: "assistant-text", role: "assistant", content: "Both alpha and beta are already loaded." },
+		{
+			id: "assistant-1",
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "load-alpha", name: "skill_search", arguments: { action: "load", name: "alpha" } },
+				{ type: "toolCall", id: "search-beta", name: "skill_search", arguments: { action: "search", query: "beta" } },
+				{ type: "toolCall", id: "activate-alpha", name: "activate_skill", arguments: { skillName: "alpha" } },
+				{ type: "toolCall", id: "activate-beta", name: "activate_skill", arguments: { skillName: "beta" } },
+			],
+		},
+	] }, ["alpha", "beta"]);
+
+	assert.deepEqual(evidence.map((entry) => entry.name), ["alpha", "beta"]);
+	assert.deepEqual(evidence.map((entry) => entry.key), [
+		"tool:id:activate-alpha:alpha",
+		"tool:id:activate-beta:beta",
+	]);
+});
+
 test("distinct source IDs count identical user evidence as distinct events", () => {
 	const payload = {
 		messages: [
