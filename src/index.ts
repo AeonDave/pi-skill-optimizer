@@ -1059,7 +1059,13 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
-		latestPrompt = event.prompt;
+		// Pi 1.2 also starts runs from custom messages, which have no human prompt.
+		// Keep their content out of routing and preserve the last real request for extraction.
+		const customStart = "messageType" in event && event.messageType === "custom";
+		const prompt = !customStart && "prompt" in event && typeof event.prompt === "string"
+			? event.prompt
+			: undefined;
+		if (prompt !== undefined) latestPrompt = prompt;
 		if (isDisabled(ctx.cwd)) {
 			restorePermittedTools();
 			return;
@@ -1074,7 +1080,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		try {
 			const skills = skillInputs(event.systemPromptOptions.skills ?? []);
 			registry = makeSkillRegistry(skills);
-			initializeToolSelection(state, event.prompt);
+			initializeToolSelection(state, prompt ?? "");
 			maybeShowInitNotice(ctx, state, skills);
 			updateStatus(ctx);
 			return;

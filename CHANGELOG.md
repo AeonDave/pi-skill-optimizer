@@ -4,6 +4,12 @@ All notable changes are documented here.
 
 ## Unreleased
 
+## 3.1.2 - 2026-10-13
+
+### Fixed
+
+- Handle Pi 1.2 custom-triggered runs as no-intent starts: fail open for permitted tools, ignore custom message text even if a stray prompt field is present, and preserve the previous human request for output extraction.
+
 ## 3.1.1 - 2026-10-08
 
 ### Fixed

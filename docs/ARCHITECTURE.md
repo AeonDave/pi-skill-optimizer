@@ -26,6 +26,14 @@ before provider conversion erases custom-message provenance. Native `custom`, `b
 the query or overlay target. Structured system sections and tool declarations are preserved;
 request-local clones do not modify persisted conversation entries.
 
+Pi 1.2's `before_agent_start` event distinguishes user starts (`messageType: "user"` with `prompt`)
+from custom-triggered starts (`messageType: "custom"` with `message`). Only a user prompt updates the
+last human request and drives tool activation. A custom start has no routing signal, so optimizer
+activation fails open across permitted named tools while retaining protected, used, and searched
+tools; custom message text is ignored even if the event also carries a `prompt` property. The
+previous human request remains available to output extraction. On Pi 1.0, the supported event has no
+`messageType` discriminator, so its string `prompt` continues to identify user intent.
+
 Ranking uses exact matching, BM25F, bounded name and alias typo recovery, reciprocal-rank fusion, diversity, profile evidence, and decayed usage evidence. It scores full source descriptions, then appends a bounded set of verbatim skill names and descriptions (not the full `SKILL.md` instructions) to the latest human block. The overlay is separate from the stable prefix, fingerprinted, idempotent, and omitted when there is no valid target.
 
 The resolver labels prefetch as discovery metadata, not loaded instructions or usage evidence.

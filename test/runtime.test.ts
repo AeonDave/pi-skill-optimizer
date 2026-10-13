@@ -218,6 +218,72 @@ test("tool selection replans at each human prompt while search activation is add
 	}
 });
 
+test("native custom wake keeps human intent and fails open without routing from custom content", async () => {
+	const runtime = createRuntime({
+		config: {
+			toolPrefetchMax: 1,
+			outputMode: "extract",
+			outputModel: "test/extract",
+			outputExtractMinBytes: 1,
+			outputMaxLines: 1,
+			outputMaxBytes: 1,
+			outputMinSavingsBytes: 1,
+			outputMinSavingsRatio: 0,
+		},
+		initialTools: [
+			{ name: "read", description: "Read a file." },
+			{ name: "database_query", description: "Query PostgreSQL database migrations and rollback state." },
+			{ name: "browser_accessibility", description: "Run Playwright browser accessibility tests." },
+		],
+		initialActive: ["read", "database_query", "browser_accessibility"],
+	});
+	const extractionRequests: string[] = [];
+	Object.assign(runtime.ctx, {
+		modelRegistry: {
+			find: () => ({}),
+			async complete(_model: unknown, request: { messages: Array<{ content: Array<{ text: string }> }> }) {
+				extractionRequests.push(request.messages[0]?.content[0]?.text ?? "");
+				return { content: [{ type: "text", text: "" }], usage: {} };
+			},
+		},
+	});
+	try {
+		await beforePrompt(runtime, "Review the PostgreSQL migration rollback.");
+		assert.ok(runtime.activeTools.has("database_query"));
+		assert.ok(!runtime.activeTools.has("browser_accessibility"));
+
+		await runtime.fire("before_agent_start", {
+			messageType: "custom",
+			prompt: "Run Playwright browser accessibility tests.",
+			message: {
+				role: "custom",
+				customType: "optimizer-wake",
+				content: [{ type: "text", text: "Run Playwright browser accessibility tests." }],
+			},
+			systemPromptOptions: { skills: [] },
+		});
+		assert.ok(!runtime.notifications.some((text) => text.includes("AUTO prefetch failed open")));
+		assert.ok(runtime.activeTools.has("read"));
+		assert.ok(runtime.activeTools.has("database_query"));
+		assert.ok(runtime.activeTools.has("browser_accessibility"), "missing human input should fail open, not select from custom content");
+		assert.ok(runtime.activeTools.has("optimizer_tool_search"));
+
+		await runtime.fire("tool_result", {
+			toolName: "read",
+			toolCallId: "read-call",
+			input: { command: "npm run check" },
+			content: [{ type: "text", text: Array.from({ length: 20 }, (_, index) => `output row ${index}`).join("\n") }],
+			details: {},
+			isError: false,
+		});
+		assert.equal(extractionRequests.length, 1);
+		assert.match(extractionRequests[0] ?? "", /REQUEST:\nReview the PostgreSQL migration rollback\./);
+		assert.doesNotMatch(extractionRequests[0] ?? "", /Run Playwright browser accessibility tests/);
+	} finally {
+		runtime.dispose();
+	}
+});
+
 test("inactive deferred tools stay deferred until search and remain active afterward", async () => {
 	const runtime = createRuntime({
 		config: { toolPrefetchMax: 1 },

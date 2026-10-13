@@ -37,7 +37,7 @@ That's enough to start. Optionally run `/skill-optimizer init` to generate routi
 | Need | Command |
 | --- | --- |
 | Install only in this project | `pi install -l npm:@aeondave/pi-skill-optimizer` |
-| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.1.1` |
+| Pin the current release | `pi install npm:@aeondave/pi-skill-optimizer@3.1.2` |
 | Update an unpinned install | `pi update npm:@aeondave/pi-skill-optimizer` |
 
 Restart after updating. Pinned installs stay pinned until you explicitly install another version.
