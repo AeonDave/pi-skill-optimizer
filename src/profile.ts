@@ -1,5 +1,10 @@
-import { createHash } from "node:crypto";
 import { normalizeActivation, type SkillActivation } from "./activation.ts";
+import {
+	catalogSourceHash,
+	normalizeCatalogMetadata,
+	type CatalogCard,
+	type CatalogMetadata,
+} from "./catalog.ts";
 
 export interface SkillOptimizerProfile {
 	critical: string[];
@@ -7,6 +12,7 @@ export interface SkillOptimizerProfile {
 	clusters: Record<string, string[]>;
 	negativeHints: Record<string, string[]>;
 	activation?: Record<string, SkillActivation>;
+	catalog?: CatalogMetadata;
 }
 
 export const EMPTY_PROFILE: SkillOptimizerProfile = {
@@ -18,6 +24,19 @@ export const EMPTY_PROFILE: SkillOptimizerProfile = {
 
 function normalizeName(value: string): string {
 	return value.trim();
+}
+
+function setOwnRecordValue<T>(record: Record<string, T>, key: string, value: T): void {
+	Object.defineProperty(record, key, {
+		value,
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+}
+
+function ownRecordValue<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+	return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
 }
 
 function normalizeStringArray(value: unknown): string[] {
@@ -34,7 +53,7 @@ function normalizeRecord(value: unknown): Record<string, string[]> {
 	for (const [rawName, rawValues] of Object.entries(value)) {
 		const name = normalizeName(rawName);
 		const values = normalizeStringArray(rawValues);
-		if (name && values.length > 0) out[name] = values;
+		if (name && values.length > 0) setOwnRecordValue(out, name, values);
 	}
 	return out;
 }
@@ -52,19 +71,13 @@ export function normalizeProfile(value: unknown): SkillOptimizerProfile {
 	};
 	const activation = normalizeActivation(source.activation);
 	if (Object.keys(activation).length > 0) profile.activation = activation;
+	const catalog = normalizeCatalogMetadata(source.catalog);
+	if (catalog && Object.keys(catalog.cards).length > 0) profile.catalog = catalog;
 	return profile;
 }
 
 export function hashSkill(name: string, description: string): string {
-	const hash = createHash("sha256");
-	hash.update("pi-skill-optimizer:skill:v2\0", "utf8");
-	hash.update(String(Buffer.byteLength(name, "utf8")), "utf8");
-	hash.update(":", "utf8");
-	hash.update(name, "utf8");
-	hash.update(String(Buffer.byteLength(description, "utf8")), "utf8");
-	hash.update(":", "utf8");
-	hash.update(description, "utf8");
-	return hash.digest("hex");
+	return catalogSourceHash(name, description);
 }
 
 export interface SkillRef {
@@ -83,18 +96,30 @@ export function diffSkills(current: readonly SkillRef[], stored: Record<string, 
 	const changed: string[] = [];
 	for (const skill of current) {
 		const name = normalizeName(skill.name);
-		if (!name || name in hashes) continue;
+		if (!name || Object.prototype.hasOwnProperty.call(hashes, name)) continue;
 		const hash = hashSkill(name, skill.description);
-		hashes[name] = hash;
-		if (stored[name] !== hash) changed.push(name);
+		setOwnRecordValue(hashes, name, hash);
+		if (!Object.prototype.hasOwnProperty.call(stored, name) || stored[name] !== hash) changed.push(name);
 	}
-	const removed = Object.keys(stored).filter((name) => !(name in hashes));
+	const removed = Object.keys(stored).filter((name) => !Object.prototype.hasOwnProperty.call(hashes, name));
 	return { changed, removed, hashes };
 }
 
-export function computeFinalHashes(hashes: Record<string, string>, failed: Iterable<string>): Record<string, string> {
-	const failedNames = new Set(failed);
-	if (![...failedNames].some((name) => name in hashes)) return hashes;
+/**
+ * Pending replacements cannot advance a source identity. Preserve an already known,
+ * unchanged identity so repeated catalog migrations retain valid prior hints;
+ * missing or stale catalog cards independently keep those owners eligible for init.
+ */
+export function computeFinalHashes(
+	hashes: Record<string, string>,
+	failed: Iterable<string>,
+	previousHashes?: Readonly<Record<string, string>>,
+): Record<string, string> {
+	const failedNames = new Set([...failed].filter((name) =>
+		Object.prototype.hasOwnProperty.call(hashes, name)
+		&& (!previousHashes || !Object.prototype.hasOwnProperty.call(previousHashes, name) || previousHashes[name] !== hashes[name]),
+	));
+	if (failedNames.size === 0) return hashes;
 	const out = { ...hashes };
 	for (const name of failedNames) delete out[name];
 	return out;
@@ -113,12 +138,9 @@ function filterClusters(
 	clusters: Record<string, string[]>,
 	predicate: (name: string) => boolean,
 ): Record<string, string[]> {
-	const out: Record<string, string[]> = {};
-	for (const [cluster, names] of Object.entries(clusters)) {
-		const retained = names.filter(predicate);
-		if (retained.length > 0) out[cluster] = retained;
-	}
-	return out;
+	return Object.fromEntries(Object.entries(clusters)
+		.map(([cluster, names]) => [cluster, names.filter(predicate)] as const)
+		.filter(([, retained]) => retained.length > 0));
 }
 
 function filterActivation(
@@ -128,6 +150,40 @@ function filterActivation(
 	return Object.fromEntries(Object.entries(activation ?? [])
 		.filter(([owner]) => predicate(owner))
 		.map(([owner, value]) => [owner, { kind: value.kind, tasks: [...value.tasks] }]));
+}
+
+function filterCatalog(
+	catalog: CatalogMetadata | undefined,
+	predicate: (owner: string) => boolean,
+): CatalogMetadata | undefined {
+	if (!catalog) return undefined;
+	const cards: Record<string, CatalogCard> = {};
+	for (const [owner, card] of Object.entries(catalog.cards)) {
+		if (predicate(owner)) setOwnRecordValue(cards, owner, {
+			summary: card.summary,
+			tags: [...card.tags],
+			sourceHash: card.sourceHash,
+		});
+	}
+	return Object.keys(cards).length > 0 ? { version: catalog.version, cards } : undefined;
+}
+
+function mergeCatalog(
+	base: CatalogMetadata | undefined,
+	override: CatalogMetadata | undefined,
+): CatalogMetadata | undefined {
+	const cards: Record<string, CatalogCard> = {};
+	for (const source of [base, override]) {
+		for (const [owner, card] of Object.entries(source?.cards ?? {})) {
+			setOwnRecordValue(cards, owner, {
+				summary: card.summary,
+				tags: [...card.tags],
+				sourceHash: card.sourceHash,
+			});
+		}
+	}
+	if (Object.keys(cards).length === 0) return undefined;
+	return { version: override?.version ?? base!.version, cards };
 }
 
 function mergeActivation(
@@ -162,11 +218,14 @@ export function pruneProfileNames(profile: SkillOptimizerProfile, removed: Itera
 		clusters: filterClusters(profile.clusters, keep),
 		negativeHints: filterRecord(profile.negativeHints, keep),
 	}, filterActivation(profile.activation, keep));
+	const catalog = filterCatalog(profile.catalog, keep);
+	if (catalog) next.catalog = catalog;
 	const unchanged = next.critical.length === profile.critical.length
 		&& Object.keys(next.queries).length === Object.keys(profile.queries).length
 		&& Object.values(next.clusters).flat().length === Object.values(profile.clusters).flat().length
 		&& Object.keys(next.negativeHints).length === Object.keys(profile.negativeHints).length
-		&& Object.keys(next.activation ?? {}).length === Object.keys(profile.activation ?? {}).length;
+		&& Object.keys(next.activation ?? {}).length === Object.keys(profile.activation ?? {}).length
+		&& Object.keys(next.catalog?.cards ?? {}).length === Object.keys(profile.catalog?.cards ?? {}).length;
 	return unchanged ? profile : next;
 }
 
@@ -179,7 +238,9 @@ function mergeRecord(
 	override: Record<string, string[]>,
 ): Record<string, string[]> {
 	const out = Object.fromEntries(Object.entries(base).map(([name, values]) => [name, [...values]]));
-	for (const [name, values] of Object.entries(override)) out[name] = union(out[name] ?? [], values);
+	for (const [name, values] of Object.entries(override)) {
+		setOwnRecordValue(out, name, union(ownRecordValue(out, name) ?? [], values));
+	}
 	return out;
 }
 
@@ -199,35 +260,44 @@ export function mergeIncrementalProfile(
 	const queries = filterRecord(base.queries, keepOld);
 	const negativeHints = filterRecord(base.negativeHints, keepOld);
 	for (const [name, values] of Object.entries(partial.queries)) {
-		if (isRefreshed(name)) queries[name] = [...values];
+		if (isRefreshed(name)) setOwnRecordValue(queries, name, [...values]);
 	}
 	for (const [name, values] of Object.entries(partial.negativeHints)) {
-		if (isRefreshed(name)) negativeHints[name] = [...values];
+		if (isRefreshed(name)) setOwnRecordValue(negativeHints, name, [...values]);
 	}
 	const clusters = filterClusters(base.clusters, keepOld);
 	for (const [cluster, names] of Object.entries(partial.clusters)) {
 		const owned = names.filter(isRefreshed);
-		if (owned.length > 0) clusters[cluster] = union(clusters[cluster] ?? [], owned);
+		if (owned.length > 0) setOwnRecordValue(clusters, cluster, union(ownRecordValue(clusters, cluster) ?? [], owned));
 	}
 	const activation = mergeActivation(
 		filterActivation(base.activation, keepOld),
 		filterActivation(partial.activation, isRefreshed),
 	);
-	return includeActivation({
+	const result = includeActivation({
 		critical: union(base.critical.filter(keepOld), partial.critical.filter(isRefreshed)),
 		queries,
 		clusters,
 		negativeHints,
 	}, activation);
+	const catalog = mergeCatalog(
+		filterCatalog(base.catalog, keepOld),
+		filterCatalog(partial.catalog, isRefreshed),
+	);
+	if (catalog) result.catalog = catalog;
+	return result;
 }
 
 export function mergeProfiles(base: SkillOptimizerProfile, override: SkillOptimizerProfile): SkillOptimizerProfile {
-	return includeActivation({
+	const result = includeActivation({
 		critical: union(base.critical, override.critical),
 		queries: mergeRecord(base.queries, override.queries),
 		clusters: mergeRecord(base.clusters, override.clusters),
 		negativeHints: mergeRecord(base.negativeHints, override.negativeHints),
 	}, mergeActivation(base.activation, override.activation));
+	const catalog = mergeCatalog(base.catalog, override.catalog);
+	if (catalog) result.catalog = catalog;
+	return result;
 }
 
 export function splitProfileByScope(
@@ -236,18 +306,21 @@ export function splitProfileByScope(
 ): { global: SkillOptimizerProfile; project: SkillOptimizerProfile } {
 	const isProject = (name: string): boolean => projectNames.has(name);
 	const isGlobal = (name: string): boolean => !projectNames.has(name);
-	return {
-		global: includeActivation({
+	const global = includeActivation({
 			critical: profile.critical.filter(isGlobal),
 			queries: filterRecord(profile.queries, isGlobal),
 			clusters: filterClusters(profile.clusters, isGlobal),
 			negativeHints: filterRecord(profile.negativeHints, isGlobal),
-		}, filterActivation(profile.activation, isGlobal)),
-		project: includeActivation({
+		}, filterActivation(profile.activation, isGlobal));
+	const project = includeActivation({
 			critical: profile.critical.filter(isProject),
 			queries: filterRecord(profile.queries, isProject),
 			clusters: filterClusters(profile.clusters, isProject),
 			negativeHints: filterRecord(profile.negativeHints, isProject),
-		}, filterActivation(profile.activation, isProject)),
-	};
+		}, filterActivation(profile.activation, isProject));
+	const globalCatalog = filterCatalog(profile.catalog, isGlobal);
+	const projectCatalog = filterCatalog(profile.catalog, isProject);
+	if (globalCatalog) global.catalog = globalCatalog;
+	if (projectCatalog) project.catalog = projectCatalog;
+	return { global, project };
 }

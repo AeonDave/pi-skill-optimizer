@@ -156,6 +156,78 @@ test("profile query matching does not match inside a longer token", () => {
 	assert.deepEqual(plan.ranked, []);
 });
 
+test("alias-only test overlap cannot outrank reliability evidence", () => {
+	const skills = [
+		skill("arjun", "HTTP parameter testing for finding hidden request inputs."),
+		skill("testing-reliability", "Testing reliability for flaky tests that pass locally but fail in CI because shared state leaks across workers."),
+	];
+	const profile = normalizeProfile({ queries: {
+		"testing-reliability": ["Diagnose tests passing locally but failing in CI due to shared state"],
+	} });
+	const plan = planSkillPrefetch(
+		skills,
+		"This test passes locally but randomly fails in CI because shared state leaks between parallel workers.",
+		{ profile, minTopK: 1, targetTopK: 1, maxTopK: 1 },
+	);
+	const reliability = plan.ranked.find(({ skill: entry }) => entry.name === "testing-reliability");
+	const unrelated = plan.ranked.find(({ skill: entry }) => entry.name === "arjun");
+	assert.ok(reliability && unrelated);
+	assert.ok(reliability.lexicalScore > unrelated.lexicalScore);
+	assert.equal(plan.ranked[0].skill.name, "testing-reliability");
+	assert.equal(unrelated.exactScore, 0, "a generic test/testing alias is not an exact match");
+});
+
+test("only whole-name or exact profile-phrase matches enter the exact channel", () => {
+	const hardware = planSkillPrefetch([
+		skill("can-bus-modules", "CAN bus hardware interface over SPI."),
+	], "Plan application modules and boundaries", { minTopK: 1, targetTopK: 1, maxTopK: 1 });
+	assert.ok(hardware.ranked[0].lexicalScore > 0);
+	assert.equal(hardware.ranked[0].exactScore, 0, "one generic name token is only lexical evidence");
+	const domainSkills = [
+		skill("can-bus-modules", "Hardware CAN bus interface over SPI using an MCP2515 to inspect OBD-II frames."),
+		skill("software-architecture", "Design software modules, API boundaries, data contracts, and testable storage."),
+		skill("arjun", "HTTP parameter fuzzing to discover hidden query inputs."),
+	];
+	assert.equal(planSkillPrefetch(domainSkills, "Connect a CAN bus interface over SPI to inspect OBD-II frames", {
+		minTopK: 1, targetTopK: 1, maxTopK: 1,
+	}).selectedNames[0], "can-bus-modules");
+	assert.equal(planSkillPrefetch(domainSkills, "Fuzz HTTP query parameters to discover hidden request inputs", {
+		minTopK: 1, targetTopK: 1, maxTopK: 1,
+	}).selectedNames[0], "arjun");
+
+	const reorderedName = planSkillPrefetch([
+		skill("database-migration", "Database change workflow."),
+	], "migration database", { minTopK: 1, targetTopK: 1, maxTopK: 1 });
+	assert.equal(reorderedName.ranked[0].exactScore, 8, "all skill-name terms still count as exact");
+
+	const profilePhrase = planSkillPrefetch([
+		skill("release-guide", "Release workflow guidance."),
+	], "Please stage a canary rollout now", {
+		profile: normalizeProfile({ queries: { "release-guide": ["stage a canary rollout"] } }),
+		minTopK: 1,
+		targetTopK: 1,
+		maxTopK: 1,
+	});
+	assert.equal(profilePhrase.ranked[0].exactScore, 7, "an exact learned phrase keeps its exact signal");
+});
+
+test("ranking treats prototype-named skill owners as ordinary names", () => {
+	const failures: string[] = [];
+	for (const name of ["constructor", "toString", "__proto__"]) {
+		try {
+			const plan = planSkillPrefetch(
+				[skill(name, "Routing guide for safe changes.")],
+				"routing guide",
+				{ profile: normalizeProfile({}), minTopK: 1, targetTopK: 1, maxTopK: 1 },
+			);
+			assert.deepEqual(plan.selectedNames, [name]);
+		} catch (error) {
+			failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	assert.deepEqual(failures, []);
+});
+
 test("reviewed aliases route APK and plugin wording without mutable global state", () => {
 	const skills = [
 		skill("mobile-technique", "Android application reverse engineering."),

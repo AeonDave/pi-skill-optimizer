@@ -572,6 +572,10 @@ function stableObject(value: unknown): unknown {
 		.map(([key, item]) => [key, stableObject(item)]));
 }
 
+function ownRecordValue<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+	return record && Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
 function profileFingerprint(profile: SkillOptimizerProfile): string {
 	return createHash("sha256").update(JSON.stringify(stableObject(profile)), "utf8").digest("hex");
 }
@@ -592,11 +596,12 @@ function analyzeCatalog(skills: readonly Skill[], profile: SkillOptimizerProfile
 
 	const documents = skills.map((skill): TermDocument => {
 		const namePhraseTokens = tokenize(skill.name);
+		const profileQueries = ownRecordValue(profile.queries, skill.name) ?? [];
 		const fields: Record<FieldName, Map<string, number>> = {
 			name: termFrequency(namePhraseTokens),
 			intent: termFrequency(tokenize(routingIntent(skill.description))),
 			description: termFrequency(tokenize(skill.description)),
-			queries: termFrequency((profile.queries[skill.name] ?? []).flatMap(tokenize)),
+			queries: termFrequency(profileQueries.flatMap(tokenize)),
 		};
 		const fieldLengths = Object.fromEntries(FIELD_NAMES.map((field) => [
 			field,
@@ -611,7 +616,7 @@ function analyzeCatalog(skills: readonly Skill[], profile: SkillOptimizerProfile
 			intentTerms: new Set(fields.intent.keys()),
 			namePhraseTokens,
 			namePhrase: namePhraseTokens.join(" "),
-			profileQueryPhrases: (profile.queries[skill.name] ?? []).map((phrase) => tokenize(phrase).join(" ")),
+			profileQueryPhrases: profileQueries.map((phrase) => tokenize(phrase).join(" ")),
 			name: skill.name,
 			nameSuffix: undefined,
 			aliasLabels: [],
@@ -673,17 +678,14 @@ function containsTokenPhrase(text: string, phrase: string): boolean {
 function exactScore(
 	document: TermDocument,
 	queryPhrase: string,
-	rawTerms: readonly string[],
 	rawTermSet: ReadonlySet<string>,
 ): number {
 	let score = 0;
 	if (containsTokenPhrase(queryPhrase, document.namePhrase)) score = 12;
 	else if (document.nameTerms.size > 0 && [...document.nameTerms].every((term) => rawTermSet.has(term))) score = 8;
-	else if (rawTerms.some((term) => document.nameTerms.has(term))) score = 3;
 	for (const examplePhrase of document.profileQueryPhrases) {
 		if (containsTokenPhrase(queryPhrase, examplePhrase)) score = Math.max(score, 7);
 	}
-	if (rawTerms.some((term) => document.aliasLabelSet.has(term))) score = Math.max(score, 4);
 	return score;
 }
 
@@ -752,7 +754,7 @@ function isUsageMap(
 
 function usageValue(prior: SkillPrefetchOptions["usagePrior"], name: string): number {
 	if (!prior) return 0;
-	const value = isUsageMap(prior) ? prior.get(name) : prior[name];
+	const value = isUsageMap(prior) ? prior.get(name) : ownRecordValue(prior, name);
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
@@ -866,7 +868,7 @@ export function planSkillPrefetch(
 		}
 	}
 	const lexical = available.map((_, index) => bm25fScore(analysis, index, expandedTerms, idfByTerm));
-	const exact = available.map((_, index) => exactScore(analysis.documents[index], queryPhrase, rawTerms, rawTermSet));
+	const exact = available.map((_, index) => exactScore(analysis.documents[index], queryPhrase, rawTermSet));
 	const fuzzy = fuzzyScores(
 		analysis,
 		query,
@@ -880,7 +882,7 @@ export function planSkillPrefetch(
 	}
 	const hasSignal = rawTerms.length > 0 && eligible.size > 0;
 	const usage = available.map((skill) => usageValue(options.usagePrior, skill.name));
-	const maximumUsage = Math.max(0, ...usage);
+	const maximumUsage = usage.reduce((maximum, value) => Math.max(maximum, value), 0);
 	const normalizedUsage = usage.map((value) => maximumUsage > 0 ? value / maximumUsage : 0);
 	const fused = available.map(() => 0);
 	addRrfSignal(fused, lexical, 1.5);
@@ -889,7 +891,7 @@ export function planSkillPrefetch(
 	if (hasSignal) addRrfSignal(fused, normalizedUsage, 0.35, eligible);
 
 	for (let index = 0; index < available.length; index += 1) {
-		const negative = new Set((profile.negativeHints[available[index].name] ?? []).flatMap(tokenize));
+		const negative = new Set((ownRecordValue(profile.negativeHints, available[index].name) ?? []).flatMap(tokenize));
 		if (rawTerms.some((term) => negative.has(term))) fused[index] *= 0.55;
 	}
 
@@ -899,7 +901,7 @@ export function planSkillPrefetch(
 			if (exact[index] > 0) reasons.push("exact");
 			if (lexical[index] > 0) reasons.push("lexical");
 			if (fuzzy[index] > 0) reasons.push("fuzzy");
-			if ((profile.queries[skill.name]?.length ?? 0) > 0 && lexical[index] > 0) reasons.push("profile");
+			if ((ownRecordValue(profile.queries, skill.name)?.length ?? 0) > 0 && lexical[index] > 0) reasons.push("profile");
 			if (normalizedUsage[index] > 0 && eligible.has(index)) reasons.push("usage");
 			return {
 				skill,
@@ -952,10 +954,10 @@ export function planSkillPrefetch(
 	const directSelectionOrder = new Map(ranked.map((entry, index) => [entry.skill.name, index]));
 	const availableByName = new Map(available.map((skill) => [skill.name, skill]));
 	const contextualNamesFor = (primaryName: string): string[] => {
-		if (profile.activation?.[primaryName]?.kind !== "specialist") return [];
+		if (ownRecordValue(profile.activation, primaryName)?.kind !== "specialist") return [];
 		return contextualSkillNames(profile.activation, primaryName).filter((name) => {
 			if (!availableByName.has(name) || selectedNames.has(name)) return false;
-			const negative = new Set((profile.negativeHints[name] ?? []).flatMap(tokenize));
+			const negative = new Set((ownRecordValue(profile.negativeHints, name) ?? []).flatMap(tokenize));
 			if (rawTerms.some((term) => negative.has(term))) return false;
 			const directIndex = directSelectionOrder.get(name);
 			return directIndex === undefined || directIndex >= desired;

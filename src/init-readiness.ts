@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 
-import { diffSkills, type SkillOptimizerProfile, type SkillRef } from "./profile.ts";
+import { diffSkills, hashSkill, type SkillOptimizerProfile, type SkillRef } from "./profile.ts";
 
 export const INIT_READINESS_ENTRY_TYPE = "skill-optimizer-init-readiness";
+const CATALOG_CARDS_INIT_VERSION = 6;
 
 export type InitReadinessStatus = "empty" | "manual" | "outdated" | "incomplete" | "current";
 export type InitNoticeStatus = Extract<InitReadinessStatus, "empty" | "outdated" | "incomplete">;
@@ -37,7 +38,8 @@ function hasProfileContent(profile: SkillOptimizerProfile): boolean {
 		|| Object.keys(profile.queries).length > 0
 		|| Object.keys(profile.clusters).length > 0
 		|| Object.keys(profile.negativeHints).length > 0
-		|| Object.keys(profile.activation ?? {}).length > 0;
+		|| Object.keys(profile.activation ?? {}).length > 0
+		|| Object.keys(profile.catalog?.cards ?? {}).length > 0;
 }
 
 function hasGeneratedMetadata(stored: InitReadinessProfile): boolean {
@@ -46,6 +48,20 @@ function hasGeneratedMetadata(stored: InitReadinessProfile): boolean {
 
 function digest(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function hasCurrentCatalogCards(scope: InitReadinessScope): boolean {
+	const cards = scope.stored.profile.catalog?.cards;
+	if (!cards) return scope.skills.length === 0;
+	const currentNames = new Set<string>();
+	for (const skill of scope.skills) {
+		currentNames.add(skill.name);
+		if (!Object.prototype.hasOwnProperty.call(cards, skill.name)) return false;
+		if (cards[skill.name].sourceHash !== hashSkill(skill.name, skill.description)) return false;
+	}
+	return currentNames.size === scope.skills.length
+		&& Object.keys(cards).length === currentNames.size
+		&& Object.keys(cards).every((name) => currentNames.has(name));
 }
 
 export function buildInitCatalogKey(input: InitReadinessInput): string {
@@ -91,6 +107,9 @@ export function buildInitReadiness(input: InitReadinessInput, catalogKey = build
 		}
 		const diff = diffSkills(scope.skills, scope.stored.hashes);
 		if (diff.changed.length > 0 || diff.removed.length > 0) {
+			return { status: "incomplete", skillCount, catalogKey };
+		}
+		if (input.initVersion >= CATALOG_CARDS_INIT_VERSION && !hasCurrentCatalogCards(scope)) {
 			return { status: "incomplete", skillCount, catalogKey };
 		}
 	}

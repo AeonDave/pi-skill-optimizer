@@ -6,6 +6,8 @@ Pi extension that reduces repeated request tokens through one AUTO discovery con
 
 Runtime floor: Pi 1.0.0 and Node.js 26.3. Use current Pi APIs; do not add shims for older runtimes. Reading existing user profiles is a data-preservation requirement, not a promise of support for old Pi versions.
 
+Development host packages and integration tests currently target Pi 1.3.0; keep both Pi development packages aligned. Wildcard peers remain host-provided.
+
 ## Package distribution
 
 - npm identity: `@aeondave/pi-skill-optimizer`. The command and configuration directory remain `skill-optimizer`; do not rename persisted user data with the package.
@@ -41,9 +43,12 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - `src/skill-loader.ts` - exact skill, resource, and location resolution with canonical-path containment.
 - `src/tools.ts` - dynamic tool catalog, schema-aware ranking, protected activation, and paginated search.
 - `src/optimize.ts` - stable-base and latest-human overlay orchestration with identity preservation.
-- `src/profile.ts` - normalization and scope handling for `critical`, `queries`, `clusters`, `negativeHints`, and optional `activation` tags.
+- `src/profile.ts` - normalization and scope handling for `critical`, `queries`, `clusters`, `negativeHints`, optional `activation`, and versioned semantic catalog cards.
+- `src/catalog.ts` - the shared fixed tag vocabulary, host-bound card validation, bounded tag directory, and immutable paginated card browser.
 - `src/activation.ts` - typed activity tags for specialist/workflow/behavioral support; no hardcoded skill identities or runtime model calls.
 - `src/generate.ts` - UTF-8-weighted init batching, complete validation, and incomplete-batch retry.
+- `src/init-worker.ts` - isolated init streaming, activity-only observation, authoritative final responses, and cancellation.
+- `src/init-progress.ts` - live above-editor init widget, committed progress, bounded redraws, and timer disposal.
 - `src/init-readiness.ts` - pure setup-state classification from scoped profile metadata and catalog hashes; manual profiles remain supported.
 - `src/usage.ts` - bounded, decayed, deduplicated usage evidence.
 - `src/history.ts` - monotonic exact deduplication with opaque recovery artifacts.
@@ -62,20 +67,23 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 ## AUTO invariants
 
 - AUTO is the only public discovery strategy. The only global bypass is boolean `PI_SKILL_OPTIMIZER_DISABLE`; there is no `disable` config key.
-- The base is query-independent `<skill_index format="tsv" columns="name,intent">` with marker `<!--skill-optimizer:auto:v2-->`.
-- The base contains no path. Every eligible name survives; intent yields first at the all-name floor.
-- The base remains byte-identical when catalog, profile, and configuration are unchanged.
+- Without valid semantic catalog metadata, the base is query-independent `<skill_index format="tsv" columns="name,intent">` with marker `<!--skill-optimizer:auto:v2-->`; this compatibility path keeps every eligible name and yields intent first at the all-name floor.
+- Init v6 may add `profile.catalog` with one host-source-bound card per skill and tags from the shared fixed 38-tag vocabulary. `discipline` covers execution habits such as evidence-preserving reading, persistence, verification and safe judgment; `other` honestly marks topics outside the vocabulary for inspection rather than forcing a nearby tag. With current v1 catalog metadata, replace the per-skill TSV with a bounded category directory and counts; names are discovered by the main model through `skill_search`, not all emitted into the prompt. Missing or stale cards use a current-description summary and the `unclassified` tag.
+- The tag directory is capped at `min(4,000, catalogBudgetChars)` characters per catalog. Its counts and card metadata affect stable bytes. If the complete directory cannot fit, preserve the native Pi catalog.
+- Only in the compatible no-card mode does AUTO add its lexical prefetch overlay. In catalog mode, `critical` and configured `alwaysSkills` names are stable metadata hints, not automatic skill selection or full-definition prefetch. No per-language query keys, embeddings, or hidden per-turn model calls.
+- The stable base remains byte-identical when the eligible catalog, profile, and configuration are unchanged.
 - Score full source text. Limit only rendered base, overlay, or search responses.
 - Exact names and profile phrases match whole normalized token sequences, never character substrings (`git` is not an exact match for `digital`). Cache catalog-derived features, not mutable caller objects or query-specific scores.
 - Prefetch is separate from the base and appends only selected skill names and descriptions (catalog metadata, not full `SKILL.md` instructions) to the latest genuine human block.
 - Never derive intent from tool or function results, assistant text, injected context, or image metadata.
 - Overlay insertion is idempotent, minimally clones the modified provider branch, and preserves identity without a target.
 - Empty input must not manufacture a ranking signal.
-- `skill_search` cursors bind to query, catalog fingerprint, and ranked name order; rank-changing usage/profile updates invalidate pagination.
+- `skill_search` cursors bind to query, catalog fingerprint, and ranked name order; rank-changing usage/profile updates invalidate pagination. Tag browsing supports `any`/`all`; with tags, query only orders the complete tag-filtered bucket and never removes candidates for lexical mismatch (including cross-language queries). Query without tags retains lexical filtering/ranking. Each complete JSON page is at most 3,000 characters (not bytes), and can contain fewer than the requested page size.
 - Exact load accepts only a registered name. Resource and location actions stay inside the canonical skill root.
-- The profile is `critical`, `queries`, `clusters`, `negativeHints`, plus optional name-owned `activation` metadata. Empty activation is omitted for legacy compatibility; init version 5 regenerates tags only on explicit init.
-- `critical` is universal discipline; `behavioral` alone is not always-on. Only a selected, positively matched specialist can seed at most one activity-matched support slot, inside ordinary count/character budgets. No recursion, no excluded or negative-hint matches, no displacement of an explicit exact choice.
-- `clusters` are substitutes, not complements. Contextual candidates expose their reason and do not invent lexical scores. Generated tags are hints, not independently verified relevance labels.
+- The profile preserves `critical`, `queries`, `clusters`, and `negativeHints`, plus optional name-owned `activation` and v1 `catalog` metadata. Older profiles remain readable; init version 6 regenerates cards only on explicit init, and failed migration preserves existing fields for unchanged skill sources.
+- In the no-card compatibility router, `critical` is universal discipline; `behavioral` alone is not always-on. Only a selected, positively matched specialist can seed at most one activity-matched support slot, inside ordinary count/character budgets. No recursion, no excluded or negative-hint matches, no displacement of an explicit exact choice. This contextual overlay is not used in catalog mode.
+- In the compatibility router, `clusters` are substitutes, not complements. Contextual candidates expose their reason and do not invent lexical scores. Init-generated queries, activation tasks, summaries, and catalog tags are hints—not independently verified relevance labels or benchmark truth.
+- The v6 directory leaves tag selection to the main model and does not add a language router. Optional explicit free-text search still uses the existing local BM25F ranker over source descriptions. A persona or host policy that withholds `skill_search` keeps the native Pi skill catalog; the optimizer never force-grants its resolver.
 - Init hints are optional, UI-only and never trigger provider calls. Classify from actual profile metadata/catalog ownership, not activation-tag counts. Persist only dedupe metadata in session entries, keyed by profile scope/state/init version; keep readiness visible in the status command and avoid file reads in provider/tool hot hooks.
 
 ## Dynamic tool invariants
@@ -86,13 +94,14 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - Never strand an in-progress provider tool loop by deactivating a used tool.
 - Bound schema indexing work so recursive or large schemas cannot dominate processing.
 - Empty or unrelated input preserves protected tools.
-- Replan at each `before_agent_start`, not every provider/tool event. Retain used and explicitly searched tools; the frozen initial active set is the discovery baseline, not a replacement for host authorization.
+- Replan at each `before_agent_start`, not every provider/tool event. Retain used and explicitly searched tools within the current baseline; distinguish the optimizer's own selection from an external active-set change and honor that new baseline. Never restore tools removed by a persona restriction. Schema routing is not a replacement for host authorization.
 - Refresh config at session/agent start and explicit commands; hot hooks reuse it without reloading profile/usage or losing pending deltas. The environment bypass stays immediate.
 - Custom tool failures must throw: Pi does not treat an `isError` field returned by `execute` as a failed tool call.
 
 ## Output and history invariants
 
 - Reducers fail open and use real UTF-8 bytes.
+- Nested results with Pi's explicit `parentToolCallId` are programmatic data: never rewrite them or count output savings for them.
 - Never return reduced output unless the complete archive was written.
 - Recovery text contains an opaque content identifier, never an archive path.
 - `retrieve_output` verifies content identity and supports bounded lines.
@@ -103,6 +112,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - Columnar JSON requires homogeneous rows, exact round trip, and a smaller complete representation.
 - RTK ownership is per result. Skip only shell output RTK already handled; read, web, MCP, and other eligible results remain available.
 - History keeps the first large successful result and changes only later exact copies with recoverable artifacts.
+- Admit history artifacts within the session's 128-handle capacity; do not emit a handle and then evict an earlier visible one. New duplicates fail open when full.
 - Never deduplicate errors, protected evidence, images, mixed media, or small results.
 - A second pass cannot be larger or more destructive.
 
@@ -110,6 +120,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 
 - Persistent updates use atomic replacement.
 - Shared usage and statistics use a process lock and additive read-modify-write deltas.
+- Publish only complete, synced owner records atomically. Never auto-delete an abandoned/corrupt lock with a racy compare-and-unlink; fail closed with exact manual-recovery guidance.
 - Archives are immutable, content-addressed, SHA-256 verified, and TTL-cleaned.
 - Archive expiry is per-content metadata under the archive lock; readers/cleaners cannot impose their own shorter TTL. Re-saves only extend expiry; missing legacy metadata uses seven days, while malformed metadata fails closed without deletion.
 - Telemetry v3 is `requests`, `input`, `output`, `cacheRead`, `cacheWrite`, and `totalCost`.
@@ -123,7 +134,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - Corpus creation and remote evaluation require explicit commands.
 - Never send an unsanitized session or catalog remotely.
 - Use keyed irreversible identifiers and remove secrets, identities, hostnames, and absolute paths.
-- Generated profile queries are not labels.
+- Generated profile queries and semantic catalog tags are hints, not labels or quality proof.
 - Never commit `.pi/skill-optimizer/benchmark/`.
 
 ## Testing
@@ -134,7 +145,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - Output or history changes require focused tests and `npm run bench:output`.
 - Other pure modules require their corresponding suites.
 - Hook or config changes require `npm run typecheck`, then `pi -e ./src/index.ts` with status, audit, and search/load smoke paths.
-- Release candidates require `smoke:blackbox` against the unpacked npm tarball with Pi 1.0.0; the fixture model is local and needs no provider key.
+- Release candidates require `smoke:blackbox` against the unpacked npm tarball with the current development Pi and the supported Pi 1.0.0 floor. The default expected version follows the development manifest; select another CLI with `PI_CLI` and pass its exact version as the second argument (for example `<package-root> 1.0.0`). The fixture model is local and needs no provider key.
 - Run focused tests after edits, then all local gates before a completion claim.
 - Never invoke `corpus:build` or `bench:real` implicitly.
 

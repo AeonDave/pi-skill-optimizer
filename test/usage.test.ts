@@ -4,11 +4,31 @@ import {
 	buildUsagePrior,
 	collectSkillUsageEvidence,
 	mergeUsageStats,
+	normalizeUsageFile,
 	pruneUsageStats,
+	recordSkillUsage,
 	scoreSkillUsage,
 	selectUsageRecordSkills,
 	usageRecordSignature,
 } from "../src/usage.ts";
+
+test("usage records preserve prototype-colliding skill names without inherited counts", () => {
+	const names = ["constructor", "toString", "__proto__"];
+	const first = recordSkillUsage({}, names, 100);
+	for (const name of names) {
+		assert.ok(Object.hasOwn(first, name), `${name} must be an own record`);
+		assert.deepEqual(first[name], { count: 1, lastUsed: 100 });
+	}
+	assert.equal(Object.getPrototypeOf(first), Object.prototype);
+	const merged = mergeUsageStats({}, first);
+	assert.deepEqual(merged, first);
+	assert.deepEqual(recordSkillUsage(merged, names, 200), Object.fromEntries(
+		names.map((name) => [name, { count: 2, lastUsed: 200 }]),
+	));
+	const restored = normalizeUsageFile(JSON.parse(JSON.stringify({ skills: merged })));
+	assert.deepEqual(restored, merged);
+	assert.equal(Object.getPrototypeOf(restored), Object.prototype);
+});
 
 test("usage evidence is stable across provider loops and distinct per event", () => {
 	const messages = [

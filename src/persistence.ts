@@ -12,6 +12,7 @@ import {
 	closeSync,
 	existsSync,
 	fsyncSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -29,7 +30,6 @@ import { addExtractionTelemetry, addProviderCacheTelemetry, addSavings, EMPTY_EX
 import { mergeUsageStats, normalizeUsageFile, pruneUsageStats, toUsageFile, type SkillUsageStats, type UsagePruneOptions } from "./usage.ts";
 
 const LOCK_WAIT_MS = 250;
-const LOCK_STALE_MS = 30_000;
 const LOCK_SLEEP = new Int32Array(new SharedArrayBuffer(4));
 
 const OUTPUT_ARCHIVE_ID_PREFIX = "sko:";
@@ -117,51 +117,54 @@ export function writeJsonAtomic(path: string, value: unknown): void {
 	}
 }
 
-function recoverAbandonedLock(lockPath: string): void {
-	const info = lstatSync(lockPath);
-	if (!info.isFile() || info.isSymbolicLink() || Date.now() - info.mtimeMs <= LOCK_STALE_MS) return;
-	const token = readFileSync(lockPath, "utf8");
-	const pidText = /^(\d+):\d+:[a-z0-9]+$/.exec(token)?.[1];
-	const ownerPid = Number(pidText);
-	if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) return;
-	try {
-		// Signal 0 probes liveness; it does not terminate the owner. EPERM is not death.
-		process.kill(ownerPid, 0);
-		return;
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
+function publishCompleteLock(lockPath: string, token: string): boolean {
+	let tempPath = "";
+	let fd: number | undefined;
+	while (fd === undefined) {
+		tempPath = `${lockPath}.${process.pid}-${randomBytes(12).toString("hex")}.tmp`;
+		try {
+			fd = openSync(tempPath, "wx", 0o600);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
 	}
-	// Another process may already have recovered and replaced the lock.
-	if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath);
+	try {
+		writeFileSync(fd, token, "utf8");
+		fsyncSync(fd);
+		closeSync(fd);
+		fd = undefined;
+		try {
+			// Hard-link publication is exclusive and atomic: readers see either no lock
+			// or the complete, synced owner record, never an empty lock file.
+			linkSync(tempPath, lockPath);
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+			throw error;
+		}
+	} finally {
+		if (fd !== undefined) {
+			try { closeSync(fd); } catch { /* best effort */ }
+		}
+		try { unlinkSync(tempPath); } catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") { /* best effort */ }
+		}
+	}
 }
 
 function acquireLock(path: string): { lockPath: string; token: string } {
 	mkdirSync(dirname(path), { recursive: true });
 	const lockPath = `${path}.lock`;
-	const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 	const deadline = Date.now() + LOCK_WAIT_MS;
 	while (true) {
-		let fd: number | undefined;
-		try {
-			fd = openSync(lockPath, "wx", 0o600);
-			writeFileSync(fd, token, "utf8");
-			fsyncSync(fd);
-			closeSync(fd);
-			return { lockPath, token };
-		} catch (err) {
-			if (fd !== undefined) {
-				try { closeSync(fd); } catch { /* best effort */ }
-				try { unlinkSync(lockPath); } catch { /* best effort */ }
-			}
-			if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-			try {
-				recoverAbandonedLock(lockPath);
-			} catch {
-				// Another process may have released or replaced it.
-			}
-			if (Date.now() >= deadline) throw new Error(`timed out waiting for file lock: ${lockPath}`);
-			Atomics.wait(LOCK_SLEEP, 0, 0, 10);
+		const token = `${process.pid}:${Date.now()}:${randomBytes(12).toString("hex")}`;
+		if (publishCompleteLock(lockPath, token)) return { lockPath, token };
+		if (Date.now() >= deadline) {
+			throw new Error(
+				`timed out waiting for file lock: ${lockPath}. If the lock is stale or corrupt, confirm no optimizer process is using it, then remove the lock file and retry.`,
+			);
 		}
+		Atomics.wait(LOCK_SLEEP, 0, 0, 10);
 	}
 }
 
@@ -169,7 +172,7 @@ function releaseLock(lock: { lockPath: string; token: string }): void {
 	try {
 		if (readFileSync(lock.lockPath, "utf8") === lock.token) unlinkSync(lock.lockPath);
 	} catch {
-		// A stale-lock recovery may already have replaced or removed it.
+		// Release is best effort; never remove an externally changed lock.
 	}
 }
 
@@ -188,7 +191,9 @@ function sanitizeHashes(value: unknown): Record<string, string> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 	const out: Record<string, string> = {};
 	for (const [name, hash] of Object.entries(value as Record<string, unknown>)) {
-		if (typeof hash === "string" && hash) out[name] = hash;
+		if (typeof hash === "string" && hash) {
+			Object.defineProperty(out, name, { value: hash, enumerable: true, configurable: true, writable: true });
+		}
 	}
 	return out;
 }

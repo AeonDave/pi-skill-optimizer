@@ -8,11 +8,23 @@ import {
 	readInitNoticeKeys,
 	type InitReadinessProfile,
 } from "../src/init-readiness.ts";
-import { EMPTY_PROFILE, hashSkill } from "../src/profile.ts";
+import { EMPTY_PROFILE, hashSkill, normalizeProfile } from "../src/profile.ts";
 
 const currentVersion = 5;
+const catalogInitVersion = 6;
 const skill = { name: "typescript", description: "Review TypeScript code." };
 const skillHash = hashSkill(skill.name, skill.description);
+
+function catalogProfile(sourceHash = skillHash) {
+	return normalizeProfile({
+		catalog: {
+			version: 1,
+			cards: {
+				typescript: { summary: "Review TypeScript code", tags: ["programming"], sourceHash },
+			},
+		},
+	});
+}
 
 function storedProfile(overrides: Partial<InitReadinessProfile> = {}): InitReadinessProfile {
 	return {
@@ -87,6 +99,52 @@ test("readiness accepts current hashes even when no activation tags were generat
 		global: { stored: storedProfile(), skills: [skill] },
 	});
 	assert.equal(readiness.status, "current");
+});
+
+test("version 6 generated readiness rejects missing and stale per-skill catalog cards", () => {
+	const missing = buildInitReadiness({
+		scopeKey: "global::project",
+		initVersion: catalogInitVersion,
+		global: { stored: storedProfile({ initVersion: catalogInitVersion }), skills: [skill] },
+	});
+	assert.equal(missing.status, "incomplete");
+
+	const stale = buildInitReadiness({
+		scopeKey: "global::project",
+		initVersion: catalogInitVersion,
+		global: {
+			stored: storedProfile({
+				profile: catalogProfile("0".repeat(64)),
+				initVersion: catalogInitVersion,
+			}),
+			skills: [skill],
+		},
+	});
+	assert.equal(stale.status, "incomplete");
+});
+
+test("version 6 generated readiness accepts complete current catalog cards and hashes", () => {
+	const readiness = buildInitReadiness({
+		scopeKey: "global::project",
+		initVersion: catalogInitVersion,
+		global: {
+			stored: storedProfile({ profile: catalogProfile(), initVersion: catalogInitVersion }),
+			skills: [skill],
+		},
+	});
+	assert.equal(readiness.status, "current");
+});
+
+test("an unversioned catalog-only profile is manual rather than empty", () => {
+	const readiness = buildInitReadiness({
+		scopeKey: "global::project",
+		initVersion: catalogInitVersion,
+		global: {
+			stored: storedProfile({ profile: catalogProfile(), hashes: {}, initVersion: 0 }),
+			skills: [skill],
+		},
+	});
+	assert.equal(readiness.status, "manual");
 });
 
 test("readiness checks project and global skill scopes independently", () => {

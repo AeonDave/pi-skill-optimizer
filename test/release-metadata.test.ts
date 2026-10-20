@@ -14,6 +14,7 @@ test("release metadata stays aligned", () => {
 		packages: Record<string, { name?: string; version?: string }>;
 	};
 	const readme = readFileSync(new URL("README.md", root), "utf8");
+	const configuration = readFileSync(new URL("docs/CONFIGURATION.md", root), "utf8");
 	const changelog = readFileSync(new URL("CHANGELOG.md", root), "utf8");
 
 	assert.equal(pkg.name, "@aeondave/pi-skill-optimizer");
@@ -21,10 +22,10 @@ test("release metadata stays aligned", () => {
 	assert.equal(lock.packages[""]?.name, pkg.name);
 	assert.equal(lock.version, pkg.version, "package-lock top-level version must match package.json");
 	assert.equal(lock.packages[""]?.version, pkg.version, "package-lock root package version must match package.json");
-	assert.ok(readme.includes(`pi install npm:${pkg.name}@${pkg.version}`));
 	assert.ok(readme.includes(`pi install npm:${pkg.name}`));
-	assert.ok(readme.includes(`pi update npm:${pkg.name}`));
-	assert.ok(readme.includes("pi remove npm:pi-skill-optimizer"), "migration must avoid loading both package identities");
+	assert.ok(configuration.includes(`pi install npm:${pkg.name}@${pkg.version}`), "reference docs must include the current pinned install");
+	assert.ok(configuration.includes(`pi update npm:${pkg.name}`), "reference docs must document package updates");
+	assert.ok(configuration.includes("pi remove npm:pi-skill-optimizer"), "migration must avoid loading both package identities");
 	assert.match(changelog, new RegExp(`^## ${pkg.version.replaceAll(".", "\\.")}`, "m"));
 });
 

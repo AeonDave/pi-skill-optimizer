@@ -6,6 +6,13 @@
  */
 
 import { EMPTY_PROFILE, mergeProfiles, normalizeProfile, type SkillOptimizerProfile, type SkillRef } from "./profile.ts";
+import {
+	CATALOG_TAGS,
+	CATALOG_VERSION,
+	catalogSourceHash,
+	normalizeCatalogMetadata,
+	type CatalogMetadata,
+} from "./catalog.ts";
 
 /** Minimal shape of a model response we care about (subset of `AssistantMessage`). */
 export interface ModelResponse {
@@ -109,20 +116,24 @@ export function parseJsonObject(text: string): unknown {
 	throw new Error("model response did not contain a JSON object");
 }
 
-export const DEFAULT_INIT_BATCH_MAX_SKILLS = 80;
+export const DEFAULT_INIT_BATCH_MAX_SKILLS = 20;
 export const DEFAULT_INIT_BATCH_MAX_UTF8_BYTES = 32 * 1_024;
 export const DEFAULT_INIT_BATCH_MAX_ATTEMPTS = 2;
+export const DEFAULT_INIT_BATCH_MAX_RECOVERY_CALLS = 8;
 
 export interface SkillBatchLimits {
 	maxSkills: number;
 	maxUtf8Bytes: number;
 	maxAttempts?: number;
+	/** Additional calls shared by all subdivisions of each original batch. */
+	maxRecoveryCalls?: number;
 }
 
 interface NormalizedSkillBatchLimits {
 	maxSkills: number;
 	maxUtf8Bytes: number;
 	maxAttempts: number;
+	maxRecoveryCalls: number;
 }
 
 function positiveInteger(value: number, fallback: number): number {
@@ -134,12 +145,22 @@ function normalizeBatchLimits(value: SkillBatchLimits): NormalizedSkillBatchLimi
 		maxSkills: positiveInteger(value.maxSkills, DEFAULT_INIT_BATCH_MAX_SKILLS),
 		maxUtf8Bytes: positiveInteger(value.maxUtf8Bytes, DEFAULT_INIT_BATCH_MAX_UTF8_BYTES),
 		maxAttempts: positiveInteger(value.maxAttempts ?? DEFAULT_INIT_BATCH_MAX_ATTEMPTS, DEFAULT_INIT_BATCH_MAX_ATTEMPTS),
+		maxRecoveryCalls: Number.isFinite(value.maxRecoveryCalls) && value.maxRecoveryCalls! >= 0
+			? Math.floor(value.maxRecoveryCalls!) : DEFAULT_INIT_BATCH_MAX_RECOVERY_CALLS,
 	};
 }
 
-/** Exact UTF-8 weight of the complete skill line sent by init. */
-export function skillBatchUtf8Bytes(skill: SkillRef): number {
-	return Buffer.byteLength(`- ${skill.name}: ${skill.description}\n`, "utf8");
+/** Serialize the exact skill-input JSON sent for one init batch. */
+export function serializeSkillBatch(skills: readonly SkillRef[], previousFailure?: string): string {
+	return JSON.stringify({
+		skills: skills.map(({ name, description }) => ({ name, description })),
+		...(previousFailure ? { retryFeedback: previousFailure.slice(0, 600) } : {}),
+	});
+}
+
+/** Exact UTF-8 weight of the skill-input JSON sent by init. */
+export function skillBatchUtf8Bytes(skills: readonly SkillRef[]): number {
+	return Buffer.byteLength(serializeSkillBatch(skills), "utf8");
 }
 
 /**
@@ -153,16 +174,15 @@ export function batchSkillsByWeight(
 	const normalized = normalizeBatchLimits(limits);
 	const batches: SkillRef[][] = [];
 	let batch: SkillRef[] = [];
-	let bytes = 0;
 	for (const skill of items) {
-		const weight = skillBatchUtf8Bytes(skill);
-		if (batch.length > 0 && (batch.length >= normalized.maxSkills || bytes + weight > normalized.maxUtf8Bytes)) {
+		if (batch.length > 0 && (
+			batch.length >= normalized.maxSkills
+			|| skillBatchUtf8Bytes([...batch, skill]) > normalized.maxUtf8Bytes
+		)) {
 			batches.push(batch);
 			batch = [];
-			bytes = 0;
 		}
 		batch.push(skill);
-		bytes += weight;
 	}
 	if (batch.length > 0) batches.push(batch);
 	return batches;
@@ -171,7 +191,70 @@ export function batchSkillsByWeight(
 /** Outcome of interpreting a single batch's model response. */
 export type BatchResponseOutcome =
 	| { status: "ok"; profile: SkillOptimizerProfile; processedSkills: string[] }
-	| { status: "failed"; reason: string; retryable: boolean };
+	| { status: "failed"; reason: string; retryable: boolean; splittable?: boolean };
+
+const MAX_VALIDATION_REASON_CHARS = 600;
+const VALIDATION_TAG_IDS = new Set(CATALOG_TAGS.map(({ id }) => id));
+
+/** Diagnostics quote bounded names, never descriptions or complete model output. */
+function diagnosticName(name: string): string {
+	let clipped = "";
+	let count = 0;
+	for (const character of name) {
+		if (count++ === 48) {
+			clipped += "...";
+			break;
+		}
+		clipped += character;
+	}
+	return JSON.stringify(clipped)
+		.replace(/[\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu, (character) =>
+			`\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+function boundedReason(reason: string): string {
+	const escaped = (character: string): string => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+	const safe = reason
+		.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/gu, escaped)
+		.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu, escaped);
+	if (safe.length <= MAX_VALIDATION_REASON_CHARS) return safe;
+	let end = MAX_VALIDATION_REASON_CHARS - 3;
+	if (/[\uD800-\uDBFF]/u.test(safe[end - 1] ?? "")) end -= 1;
+	return `${safe.slice(0, end)}...`;
+}
+
+function diagnosticNames(names: readonly string[]): string {
+	return `${names.length} (${diagnosticName(names[0]!)}${names.length > 1 ? ", ..." : ""})`;
+}
+
+function missingProcessedCoverage(value: unknown): string {
+	const raw = (value as Record<string, unknown>).processedSkills;
+	if (raw === undefined) return "processedSkills is missing; return every exact input name";
+	if (!Array.isArray(raw)) return "processedSkills must be an array of exact input names";
+	if (raw.length === 0) return "processedSkills is empty; return every exact input name";
+	return "processedSkills contains no non-empty string names";
+}
+
+function coverageDiagnostic(value: unknown, expected: ReadonlySet<string>): string {
+	const raw = (value as Record<string, unknown>).processedSkills;
+	if (!Array.isArray(raw)) return missingProcessedCoverage(value);
+	const names = raw.filter((name): name is string => typeof name === "string");
+	const actual = new Set(names);
+	const seen = new Set<string>();
+	const duplicates = new Set<string>();
+	for (const name of names) {
+		if (seen.has(name)) duplicates.add(name);
+		seen.add(name);
+	}
+	const missing = [...expected].filter((name) => !actual.has(name));
+	const extra = [...actual].filter((name) => !expected.has(name));
+	return [
+		...(missing.length ? [`missing ${diagnosticNames(missing)}`] : []),
+		...(extra.length ? [`extra ${diagnosticNames(extra)}`] : []),
+		...(duplicates.size ? [`duplicate ${diagnosticNames([...duplicates])}`] : []),
+		...(names.length !== raw.length ? [`non-string ${raw.length - names.length}`] : []),
+	].join("; ") || "names must match every exact input name once";
+}
 
 function readProcessedSkills(value: unknown): string[] | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -185,7 +268,7 @@ function readProcessedSkills(value: unknown): string[] | undefined {
 }
 
 /** Keep only fields in the current generated-profile contract. */
-function generatedProfileFields(value: unknown): unknown {
+function generatedProfileFields(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
 	const record = value as Record<string, unknown>;
 	return {
@@ -195,6 +278,116 @@ function generatedProfileFields(value: unknown): unknown {
 		negativeHints: record.negativeHints,
 		activation: record.activation,
 	};
+}
+
+function hasExactNameCoverage(names: readonly string[] | undefined, expected: ReadonlySet<string>): boolean {
+	if (!Array.isArray(names)) return false;
+	if (names.length !== expected.size) return false;
+	const actual = new Set(names);
+	return actual.size === expected.size && [...actual].every((name) => expected.has(name));
+}
+
+function hasExactRawProcessedCoverage(value: unknown, expected: ReadonlySet<string>): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const names = (value as Record<string, unknown>).processedSkills;
+	return Array.isArray(names)
+		&& names.every((name): name is string => typeof name === "string")
+		&& hasExactNameCoverage(names, expected);
+}
+
+type CatalogBindingOutcome =
+	| { status: "ok"; catalog: CatalogMetadata }
+	| { status: "failed"; reason: string; splittable: boolean };
+
+function rejectedCatalog(reason: string, splittable = true): CatalogBindingOutcome {
+	return { status: "failed", reason, splittable };
+}
+
+/** Explain a rejected normalized card without duplicating its acceptance decision. */
+function rejectedCardReason(name: string, card: Record<string, unknown>): string {
+	const owner = `card ${diagnosticName(name)}`;
+	if (typeof card.summary !== "string") return `${owner} summary must be a string`;
+	if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(card.summary)) {
+		return `${owner} summary contains malformed Unicode`;
+	}
+	const summary = card.summary.replace(/\s+/gu, " ").trim();
+	if (!summary) return `${owner} summary is empty`;
+	if (summary.length > 200) return `${owner} summary exceeds 200 characters (${summary.length})`;
+	if (!Array.isArray(card.tags)) return `${owner} tags must be an array of 1-3 distinct canonical IDs`;
+	if (card.tags.length < 1 || card.tags.length > 3) return `${owner} tags must contain 1-3 distinct canonical IDs`;
+	if (!card.tags.every((tag): tag is string => typeof tag === "string")) return `${owner} tags must contain only string canonical IDs`;
+	if (card.tags.some((tag) => !VALIDATION_TAG_IDS.has(tag))) return `${owner} tags contain an unknown ID; use the fixed catalog vocabulary`;
+	if (new Set(card.tags).size !== card.tags.length) return `${owner} tags contain duplicate IDs`;
+	return `${owner} violates the semantic catalog schema`;
+}
+
+function bindCatalogCards(value: unknown, skills: readonly SkillRef[]): CatalogBindingOutcome {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return rejectedCatalog("catalogCards must be an object keyed by exact input name");
+	const cardRecord = value as Record<string, unknown>;
+	const expected = new Map<string, SkillRef>();
+	for (const skill of skills) {
+		if (expected.has(skill.name)) return rejectedCatalog(`input contains duplicate skill name ${diagnosticName(skill.name)}`, false);
+		expected.set(skill.name, skill);
+	}
+	const rawNames = Object.keys(cardRecord);
+	const missing = [...expected.keys()].filter((name) => !Object.prototype.hasOwnProperty.call(cardRecord, name));
+	const extra = rawNames.filter((name) => !expected.has(name));
+	if (missing.length || extra.length) return rejectedCatalog([
+		...(missing.length ? [`missing ${diagnosticNames(missing)}`] : []),
+		...(extra.length ? [`extra ${diagnosticNames(extra)}`] : []),
+	].join("; "));
+
+	const boundCards: Record<string, unknown> = {};
+	for (const [name, skill] of expected) {
+		const raw = cardRecord[name];
+		const owner = `card ${diagnosticName(name)}`;
+		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return rejectedCatalog(`${owner} must be an object`);
+		const card = raw as Record<string, unknown>;
+		const missingFields = ["summary", "tags"].filter((field) => !Object.prototype.hasOwnProperty.call(card, field));
+		if (missingFields.length) return rejectedCatalog(`${owner} missing fields: ${missingFields.join(", ")}`);
+		const extraFields = Object.keys(card).filter((field) => field !== "summary" && field !== "tags");
+		if (extraFields.length) return rejectedCatalog(`${owner} extra fields: ${diagnosticNames(extraFields)}; emit only summary and tags`);
+		Object.defineProperty(boundCards, name, {
+			value: {
+				summary: card.summary,
+				tags: card.tags,
+				sourceHash: catalogSourceHash(name, skill.description),
+			},
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+	}
+	const metadata = normalizeCatalogMetadata({ version: CATALOG_VERSION, cards: boundCards });
+	for (const name of expected.keys()) {
+		if (metadata && Object.prototype.hasOwnProperty.call(metadata.cards, name)) continue;
+		if (!name || name !== name.trim() || /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(name)) {
+			return rejectedCatalog(`input skill name ${diagnosticName(name)} is not a valid exact catalog name`, false);
+		}
+		return rejectedCatalog(rejectedCardReason(name, cardRecord[name] as Record<string, unknown>));
+	}
+	if (!metadata || Object.keys(metadata.cards).length !== expected.size || Object.keys(metadata.cards).some((name) => !expected.has(name))) {
+		return rejectedCatalog("catalogCards must cover every exact input name once");
+	}
+	return { status: "ok", catalog: metadata };
+}
+
+function hasCompleteBoundCatalog(profile: SkillOptimizerProfile, skills: readonly SkillRef[]): boolean {
+	if (!profile || typeof profile !== "object") return false;
+	const metadata = normalizeCatalogMetadata(profile.catalog);
+	if (!metadata || metadata.version !== CATALOG_VERSION || metadata.cards === undefined) return false;
+	const expected = new Map<string, SkillRef>();
+	for (const skill of skills) {
+		if (expected.has(skill.name)) return false;
+		expected.set(skill.name, skill);
+	}
+	const names = Object.keys(metadata.cards);
+	if (names.length !== expected.size || names.some((name) => !expected.has(name))) return false;
+	for (const [name, skill] of expected) {
+		const card = Object.prototype.hasOwnProperty.call(metadata.cards, name) ? metadata.cards[name] : undefined;
+		if (!card || card.sourceHash !== catalogSourceHash(name, skill.description)) return false;
+	}
+	return true;
 }
 
 /** Quota and billing exhaustion cannot recover within one init command. */
@@ -215,37 +408,54 @@ function isRetryableModelError(errorMessage: string | undefined): boolean {
  * Classify truncated, errored, aborted, invalid, and explicitly uncovered batch
  * responses as failures. Successful responses must declare processed skill coverage.
  */
-export function interpretBatchResponse(response: ModelResponse): BatchResponseOutcome {
+export function interpretBatchResponse(response: ModelResponse, expectedSkills?: readonly SkillRef[]): BatchResponseOutcome {
 	const stopReason = response.stopReason;
 	if (stopReason === "length") {
-		return { status: "failed", reason: "output was truncated (length limit)", retryable: true };
+		return { status: "failed", reason: "output was truncated (length limit)", retryable: true, splittable: true };
 	}
 	if (stopReason === "error" || stopReason === "aborted") {
 		const detail = response.errorMessage;
 		return {
 			status: "failed",
-			reason: `${stopReason}${detail ? `: ${detail}` : ""}`,
+			reason: boundedReason(`${stopReason}${detail ? `: ${detail}` : ""}`),
 			retryable: stopReason === "error" && isRetryableModelError(detail),
 		};
 	}
 	if (stopReason !== "stop") {
 		return {
 			status: "failed",
-			reason: `unexpected stop reason: ${stopReason ?? "missing"}`,
+			reason: boundedReason(`unexpected stop reason: ${stopReason ?? "missing"}`),
 			retryable: false,
 		};
 	}
 	let parsed: unknown;
 	try {
 		parsed = parseJsonObject(responseText(response));
-	} catch (err) {
-		return { status: "failed", reason: `produced no valid JSON (${(err as Error).message})`, retryable: true };
+	} catch {
+		return { status: "failed", reason: "produced no valid JSON; return one complete JSON object", retryable: true, splittable: true };
 	}
 	const processedSkills = readProcessedSkills(parsed);
 	if (!processedSkills || processedSkills.length === 0) {
-		return { status: "failed", reason: "omitted explicit processedSkills coverage", retryable: true };
+		return { status: "failed", reason: boundedReason(`omitted explicit processedSkills coverage: ${missingProcessedCoverage(parsed)}`), retryable: true, splittable: true };
 	}
-	return { status: "ok", profile: normalizeProfile(generatedProfileFields(parsed)), processedSkills };
+	let catalog: CatalogMetadata | undefined;
+	if (expectedSkills) {
+		const expectedNames = new Set(expectedSkills.map((skill) => skill.name));
+		if (!hasExactRawProcessedCoverage(parsed, expectedNames)) {
+			return { status: "failed", reason: boundedReason(`incomplete processedSkills coverage: ${coverageDiagnostic(parsed, expectedNames)}`), retryable: true, splittable: true };
+		}
+		const record = parsed as Record<string, unknown>;
+		const binding = bindCatalogCards(record.catalogCards, expectedSkills);
+		if (binding.status === "failed") {
+			return { status: "failed", reason: boundedReason(`missing or invalid semantic catalog cards: ${binding.reason}`), retryable: true, ...(binding.splittable ? { splittable: true } : {}) };
+		}
+		catalog = binding.catalog;
+	}
+	return {
+		status: "ok",
+		profile: normalizeProfile({ ...generatedProfileFields(parsed), ...(catalog ? { catalog } : {}) }),
+		processedSkills,
+	};
 }
 
 /** Result of a batched profile generation: the merged partial plus which skills landed. */
@@ -264,9 +474,18 @@ export interface FailedBatchGeneration {
 	status: "failed";
 	reason: string;
 	retryable: boolean;
+	/** Only response-content failures benefit from smaller batches. */
+	splittable?: boolean;
 }
 
 export type BatchGenerationAttempt = GeneratedBatchProfile | FailedBatchGeneration;
+
+export interface BatchAttemptContext {
+	/** Original batch ordinal plus stable subdivision suffixes, e.g. 1/5.2. */
+	label: string;
+	/** Host validation feedback only; never provider/network error details. */
+	previousFailure?: string;
+}
 
 /** Provider/network failures may be retried, but explicit cancellation is terminal. */
 export function isRetryableBatchException(error: unknown): boolean {
@@ -282,6 +501,7 @@ export type BatchGenerationEvent =
 		type: "committed";
 		index: number;
 		total: number;
+		label: string;
 		batchNames: readonly string[];
 		applied: ReadonlySet<string>;
 		partial: SkillOptimizerProfile;
@@ -290,9 +510,12 @@ export type BatchGenerationEvent =
 		type: "rejected";
 		index: number;
 		total: number;
+		label: string;
 		attempt: number;
 		reason: string;
 		retryable: boolean;
+		willRetry: boolean;
+		willSplit: boolean;
 	};
 
 /**
@@ -302,13 +525,14 @@ export type BatchGenerationEvent =
  * Returns `undefined` only when *every* batch failed, so a single bad batch never loses
  * the whole run and the caller can persist a partial profile.
  *
- * `onEvent` fires after each successful batch (`committed`) so the caller can checkpoint
- * immediately, and when a parsed response fails coverage (`rejected`) before retry.
+ * Content failures receive feedback on retry, then split into smaller complete batches
+ * within a per-original-batch call budget. Provider failures never trigger splitting.
+ * Terminal failures stop the entire run. Every accepted child checkpoints immediately.
  */
 export async function generateProfileInBatches(
 	targetSkills: readonly SkillRef[],
 	limits: SkillBatchLimits,
-	runBatch: (batch: SkillRef[], index: number, total: number, attempt: number) => Promise<BatchGenerationAttempt | undefined>,
+	runBatch: (batch: SkillRef[], index: number, total: number, attempt: number, context: BatchAttemptContext) => Promise<BatchGenerationAttempt | undefined>,
 	onEvent?: (event: BatchGenerationEvent) => Promise<void> | void,
 ): Promise<BatchGenerationResult | undefined> {
 	const normalizedLimits = normalizeBatchLimits(limits);
@@ -316,49 +540,65 @@ export async function generateProfileInBatches(
 	let partial = EMPTY_PROFILE;
 	const applied = new Set<string>();
 	let committed = 0;
-	for (let i = 0; i < batches.length; i++) {
-		const batch = batches[i];
+	let stopped = false;
+	const run = async (batch: SkillRef[], index: number, label: string, callBudget: number, previousFailure?: string): Promise<void> => {
 		const expected = new Set(batch.map((skill) => skill.name));
-		for (let attempt = 1; attempt <= normalizedLimits.maxAttempts; attempt++) {
-			const generated = await runBatch(batch, i, batches.length, attempt);
-			if (!generated) continue;
-			if ("status" in generated) {
+		for (let attempt = 1; attempt <= normalizedLimits.maxAttempts && callBudget > 0 && !stopped; attempt++) {
+			callBudget--;
+			const generated = await runBatch(batch, index, batches.length, attempt, { label, previousFailure });
+			let failure: FailedBatchGeneration | undefined;
+			if (!generated) failure = { status: "failed", reason: "no batch result", retryable: true };
+			else if ("status" in generated) failure = generated;
+			else if (!hasExactNameCoverage(generated.processedSkills, expected)) {
+				failure = { status: "failed", reason: "incomplete coverage", retryable: true, splittable: true };
+			} else if (!hasCompleteBoundCatalog(generated.profile, batch)) {
+				failure = { status: "failed", reason: "incomplete catalog coverage", retryable: true, splittable: true };
+			}
+			if (failure) {
+				const willRetry = failure.retryable && attempt < normalizedLimits.maxAttempts && callBudget > 0;
+				const willSplit = failure.retryable && failure.splittable === true && !willRetry && batch.length > 1 && callBudget >= 2;
 				await onEvent?.({
 					type: "rejected",
-					index: i,
+					index,
 					total: batches.length,
+					label,
 					attempt,
-					reason: generated.reason,
-					retryable: generated.retryable,
+					reason: failure.reason,
+					retryable: failure.retryable,
+					willRetry,
+					willSplit,
 				});
-				if (!generated.retryable) break;
+				if (!failure.retryable) { stopped = true; return; }
+				previousFailure = failure.splittable ? failure.reason.slice(0, 600) : undefined;
+				if (willSplit) {
+					const middle = Math.ceil(batch.length / 2);
+					// Reserve a share for each child so one invalid branch cannot starve its sibling.
+					const leftBudget = Math.floor(callBudget / 2);
+					await run(batch.slice(0, middle), index, `${label}.1`, leftBudget, previousFailure);
+					if (!stopped) await run(batch.slice(middle), index, `${label}.2`, callBudget - leftBudget, previousFailure);
+					return;
+				}
+				if (!willRetry) return;
 				continue;
 			}
-			const covered = new Set(generated.processedSkills);
-			if (covered.size !== expected.size || [...covered].some((name) => !expected.has(name))) {
-				await onEvent?.({
-					type: "rejected",
-					index: i,
-					total: batches.length,
-					attempt,
-					reason: "incomplete coverage",
-					retryable: true,
-				});
-				continue;
-			}
+			if (!generated || "status" in generated) return;
 			partial = mergeProfiles(partial, generated.profile);
 			for (const name of expected) applied.add(name);
 			committed += 1;
 			await onEvent?.({
 				type: "committed",
-				index: i,
+				index,
 				total: batches.length,
+				label,
 				batchNames: batch.map((skill) => skill.name),
 				applied: new Set(applied),
 				partial,
 			});
-			break;
+			return;
 		}
+	};
+	for (let i = 0; i < batches.length && !stopped; i++) {
+		await run(batches[i]!, i, `${i + 1}/${batches.length}`, normalizedLimits.maxAttempts + normalizedLimits.maxRecoveryCalls);
 	}
 	if (committed === 0) return undefined;
 	return { partial, applied };

@@ -25,6 +25,10 @@ export interface HistoryDedupOptions {
 	minBytes?: number;
 	/** Additional evidence patterns that make a result ineligible. */
 	protectedPatterns?: readonly RegExp[];
+	/** Handles already retained by the caller; they remain eligible for reuse. */
+	retainedIds?: ReadonlySet<string>;
+	/** Maximum total retained handles, including `retainedIds`; defaults to unbounded. */
+	maxArtifacts?: number;
 }
 
 export interface HistoryDedupResult<T extends HistoryToolResult> {
@@ -106,8 +110,15 @@ export function deduplicateToolResultHistory<T extends HistoryToolResult>(
 		? Math.floor(options.minBytes)
 		: DEFAULT_HISTORY_DEDUP_MIN_BYTES;
 	const patterns = [...DEFAULT_OUTPUT_PATTERNS, ...(options.protectedPatterns ?? [])];
+	const retainedIds = options.retainedIds ?? new Set<string>();
+	const maxArtifacts = typeof options.maxArtifacts === "number"
+		&& Number.isFinite(options.maxArtifacts)
+		&& options.maxArtifacts >= 0
+		? Math.floor(options.maxArtifacts)
+		: Number.POSITIVE_INFINITY;
 	const firstById = new Map<string, HistoryArtifact>();
 	const usedArtifacts = new Map<string, HistoryArtifact>();
+	const admittedIds = new Set<string>();
 	let next: T[] | undefined;
 	let duplicates = 0;
 
@@ -129,10 +140,12 @@ export function deduplicateToolResultHistory<T extends HistoryToolResult>(
 		}
 		// A matching digest is not itself proof of exact string equality.
 		if (first.text !== extracted.text) continue;
+		if (!retainedIds.has(id) && !admittedIds.has(id) && retainedIds.size + admittedIds.size >= maxArtifacts) continue;
 
 		if (!next) next = results.slice() as T[];
 		next[index] = { ...result, content: extracted.replace(referenceText(id)) };
 		usedArtifacts.set(id, first);
+		if (!retainedIds.has(id)) admittedIds.add(id);
 		duplicates += 1;
 	}
 

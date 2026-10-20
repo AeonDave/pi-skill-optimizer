@@ -55,6 +55,7 @@ function createRuntime(options: RuntimeOptions = {}) {
 	const commands = new Map<string, (args: string, ctx: ExtensionContext) => unknown>();
 	const tools = new Map<string, RuntimeTool>();
 	const notifications: string[] = [];
+	const statuses: Array<string | undefined> = [];
 	const entries: Array<{ type: string; customType: string; data: unknown }> = [];
 	const allTools = new Map<string, unknown>(
 		(options.initialTools ?? []).map((tool) => [tool.name, tool]),
@@ -95,7 +96,10 @@ function createRuntime(options: RuntimeOptions = {}) {
 		sessionManager: { getBranch: () => entries },
 		getSystemPromptOptions: () => ({ skills: options.skills ?? [] }),
 		hasUI: options.hasUI ?? true,
-		ui: { notify(message: string) { notifications.push(message); }, setStatus() {} },
+		ui: {
+			notify(message: string) { notifications.push(message); },
+			setStatus(_key: string, text: string | undefined) { statuses.push(text); },
+		},
 	} as unknown as ExtensionContext;
 
 	return {
@@ -105,6 +109,7 @@ function createRuntime(options: RuntimeOptions = {}) {
 		tools,
 		activeTools,
 		notifications,
+		statuses,
 		entries,
 		writeConfig,
 		setHostToolExposure(name: string, exposure: "direct" | "codemode" | "deferred" | "hidden"): void {
@@ -213,6 +218,133 @@ test("tool selection replans at each human prompt while search activation is add
 		assert.ok(runtime.activeTools.has("database_query"));
 		for (const name of searchNames) assert.ok(runtime.activeTools.has(name), `${name} was stranded after optimizer_tool_search`);
 		assert.ok(!runtime.activeTools.has("admin_console"));
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("initial persona tool restrictions are not widened by optimizer helpers or searchable tools", async () => {
+	const runtime = createRuntime({
+		initialTools: [
+			{ name: "read", description: "Read files.", exposure: "direct" },
+			{ name: "admin_console", description: "Manage administrator accounts.", exposure: "direct" },
+			{ name: "mcp__issues__find", description: "Find issue tracker tickets.", exposure: "deferred" },
+		],
+		initialActive: ["read", "admin_console"],
+	});
+	try {
+		// Simulate pi-persona's explicit tool allowlist before the optimizer's first planning pass.
+		runtime.activeTools.clear();
+		runtime.activeTools.add("read");
+		await beforePrompt(runtime, "Find issue tracker tickets and inspect admin accounts.");
+		assert.deepEqual([...runtime.activeTools], ["read"]);
+
+		const searched = await executeTool(runtime, "optimizer_tool_search", { query: "issue tracker tickets" });
+		const page = JSON.parse((searched as { content: Array<{ text: string }> }).content[0]!.text) as {
+			results: Array<{ name: string }>;
+			activated: string[];
+		};
+		assert.deepEqual(page.activated, []);
+		assert.ok(!page.results.some(({ name }) => name === "mcp__issues__find"));
+		assert.ok(!runtime.activeTools.has("optimizer_tool_search"));
+		assert.ok(!runtime.activeTools.has("skill_search"));
+		assert.ok(!runtime.activeTools.has("retrieve_output"));
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("external persona narrowing after optimizer planning resets its permission baseline", async () => {
+	const runtime = createRuntime({
+		config: { toolPrefetchMax: 1 },
+		initialTools: [
+			{ name: "read", description: "Read files.", exposure: "direct" },
+			{ name: "database_query", description: "Query PostgreSQL database migrations.", exposure: "direct" },
+			{ name: "browser_accessibility", description: "Run Playwright browser accessibility tests.", exposure: "direct" },
+			{ name: "mcp__issues__find", description: "Find issue tracker tickets.", exposure: "deferred" },
+		],
+		initialActive: ["read", "database_query", "browser_accessibility"],
+	});
+	try {
+		await beforePrompt(runtime, "Run Playwright browser accessibility tests.");
+		assert.ok(runtime.activeTools.has("browser_accessibility"));
+		assert.ok(!runtime.activeTools.has("database_query"));
+
+		// A persona transition is authoritative even though the optimizer narrowed tools on its prior turn.
+		runtime.activeTools.clear();
+		runtime.activeTools.add("read");
+		await beforePrompt(runtime, "Find issue tracker tickets.");
+		assert.deepEqual([...runtime.activeTools], ["read"]);
+		const searched = await executeTool(runtime, "optimizer_tool_search", { query: "issue tracker tickets" });
+		const page = JSON.parse((searched as { content: Array<{ text: string }> }).content[0]!.text) as {
+			activated: string[];
+		};
+		assert.deepEqual(page.activated, []);
+		assert.ok(!runtime.activeTools.has("mcp__issues__find"));
+		assert.ok(!runtime.activeTools.has("browser_accessibility"));
+		assert.ok(!runtime.activeTools.has("optimizer_tool_search"));
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("history artifact handles stay retrievable across repeated contexts at the admission cap", async () => {
+	const runtime = createRuntime();
+	try {
+		const firstMessages = Array.from({ length: 128 }, (_, index) => {
+			const text = `ordinary result ${index} `.repeat(350);
+			return [
+				{ role: "toolResult", toolCallId: `first-${index}`, content: [{ type: "text", text }] },
+				{ role: "toolResult", toolCallId: `duplicate-${index}`, content: [{ type: "text", text }] },
+			];
+		}).flat();
+		const firstOutput = await runtime.fire("context", { messages: firstMessages });
+		const firstView = (firstOutput[0] as { messages: Array<{ content: unknown }> }).messages;
+		const firstText = (firstMessages[0] as { content: Array<{ text: string }> }).content[0]!.text;
+		const reference = (firstView[1]?.content as Array<{ text: string }>)[0]?.text ?? "";
+		const handle = reference.match(/same-as=(htr:[A-Za-z0-9_-]{43})/)?.[1];
+		assert.ok(handle, "first admitted duplicate should receive a recovery handle");
+
+		const overflowText = "ordinary result number 129 ".repeat(350);
+		const overflowPair = [
+			{ role: "toolResult", toolCallId: "overflow-first", content: [{ type: "text", text: overflowText }] },
+			{ role: "toolResult", toolCallId: "overflow-duplicate", content: [{ type: "text", text: overflowText }] },
+		];
+		const repeatedOutput = await runtime.fire("context", { messages: [...firstView, ...overflowPair] });
+		assert.deepEqual(repeatedOutput, [undefined], "a 129th artifact must remain literal at the session cap");
+
+		const recovered = await executeTool(runtime, "retrieve_output", { id: handle });
+		assert.equal((recovered as { content: Array<{ text: string }> }).content[0]?.text, firstText);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("nested Pi codemode tool results remain exact and do not accrue output savings", async () => {
+	const runtime = createRuntime({
+		config: {
+			outputMode: "smart",
+			outputMaxLines: 1,
+			outputMaxBytes: 128,
+			outputMinSavingsBytes: 1,
+			outputMinSavingsRatio: 0,
+		},
+	});
+	try {
+		await beforePrompt(runtime, "Inspect the JSON data without changing its structure.");
+		const text = JSON.stringify(Array.from({ length: 1_000 }, (_, id) => ({ id, value: "ordinary payload ".repeat(6) })));
+		const statusBefore = runtime.statuses.at(-1);
+		const results = await runtime.fire("tool_result", {
+			toolName: "read",
+			toolCallId: "nested-read-call",
+			parentToolCallId: "codemode-parent-call",
+			input: { path: "payload.json" },
+			content: [{ type: "text", text }],
+			details: {},
+			isError: false,
+		});
+		assert.deepEqual(results, [undefined], "nested programmatic result must not be rewritten");
+		assert.equal(runtime.statuses.at(-1), statusBefore, "nested output must not increase reported savings");
 	} finally {
 		runtime.dispose();
 	}
@@ -609,7 +741,7 @@ test("manual and current profiles do not nag; old and partial generated profiles
 	const skill = modelSkill();
 	const cases = [
 		{ profile: { critical: [skill.name] }, expected: "manual profile", notice: false },
-		{ profile: { initVersion: INIT_PROFILE_VERSION, skillHashes: { [skill.name]: hashSkill(skill.name, skill.description) } }, expected: "current", notice: false },
+		{ profile: { initVersion: INIT_PROFILE_VERSION, skillHashes: { [skill.name]: hashSkill(skill.name, skill.description) }, catalog: { version: 1, cards: { [skill.name]: { summary: "Review TypeScript changes.", tags: ["review"], sourceHash: hashSkill(skill.name, skill.description) } } } }, expected: "current", notice: false },
 		{ profile: { initVersion: INIT_PROFILE_VERSION - 1, skillHashes: {} }, expected: "generated profile is outdated", notice: true },
 		{ profile: { initVersion: INIT_PROFILE_VERSION, skillHashes: {} }, expected: "generated profile is incomplete", notice: true },
 	];
@@ -673,4 +805,54 @@ test("status command reports clear init readiness without changing the model pro
 	} finally {
 		runtime.dispose();
 	}
+});
+
+test("tag browsing exposes method skills, exact loads and stale unclassified cards through the real tool", async () => {
+	const skill = modelSkill();
+	const stale = { ...skill, name: "stale-guidance", description: "The source description has changed." };
+	const runtime = createRuntime({ skills: [skill, stale] });
+	try {
+		skill.filePath = join(runtime.root, "SKILL.md");
+		skill.baseDir = runtime.root;
+		writeFileSync(skill.filePath, "# Exact instructions\r\nUse trustworthy assertions.\r\n");
+		writeFileSync(getProfilePaths(runtime.cwd).global, JSON.stringify({
+			critical: [], queries: {}, clusters: {}, negativeHints: {}, catalog: {
+				version: 1, cards: {
+					[skill.name]: { summary: "Design independent modules before implementing changes.", tags: ["architecture"], sourceHash: hashSkill(skill.name, skill.description) },
+					[stale.name]: { summary: "Outdated generated guidance.", tags: ["architecture"], sourceHash: hashSkill(stale.name, "old description") },
+				},
+			},
+		}));
+		await runtime.fire("before_agent_start", { prompt: "Separiamo dominio e storage", systemPromptOptions: { skills: [skill, stale] } });
+		const searched = await executeTool(runtime, "skill_search", { action: "search", tags: ["architecture"] }) as { content: Array<{ text: string }> };
+		const page = JSON.parse(searched.content[0].text);
+		assert.deepEqual(page.items.map((item: { name: string }) => item.name), [skill.name]);
+		for (const query of ["نراجع حدود النظام", "設計を見直してください"]) {
+			const multilingual = await executeTool(runtime, "skill_search", { action: "search", tags: ["architecture"], query }) as { content: Array<{ text: string }> };
+			assert.deepEqual(JSON.parse(multilingual.content[0].text).items.map((item: { name: string }) => item.name), [skill.name], "query may order but must not veto an explicitly selected semantic tag");
+			const noTags = await executeTool(runtime, "skill_search", { action: "search", query }) as { content: Array<{ text: string }> };
+			assert.deepEqual(JSON.parse(noTags.content[0].text).items, [], "query-only search still abstains without lexical signal");
+		}
+		const unclassified = await executeTool(runtime, "skill_search", { action: "search", tags: ["unclassified"] }) as { content: Array<{ text: string }> };
+		assert.deepEqual(JSON.parse(unclassified.content[0].text).items.map((item: { name: string }) => item.name), [stale.name]);
+		const loaded = await executeTool(runtime, "skill_search", { action: "load", name: skill.name }) as { content: Array<{ text: string }> };
+		assert.equal(loaded.content[0].text, "# Exact instructions\r\nUse trustworthy assertions.\r\n");
+		await assert.rejects(executeTool(runtime, "skill_search", { action: "search", tags: ["invented-tag"] }), /unknown.*tag/i);
+	} finally { runtime.dispose(); }
+});
+
+test("a failed registry rebuild after session reset keeps native discovery instead of stale resolver metadata", async () => {
+	const skill = { ...modelSkill(), description: "Review independently testable application boundaries. ".repeat(100) };
+	const runtime = createRuntime({ skills: [skill] });
+	try {
+		writeFileSync(getProfilePaths(runtime.cwd).global, JSON.stringify({ catalog: { version: 1, cards: {
+			[skill.name]: { summary: "Review independently testable application boundaries.", tags: ["architecture"], sourceHash: hashSkill(skill.name, skill.description) },
+		} } }));
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("session_start", {});
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [{ ...skill, name: " " }] } });
+		const messages = [{ role: "system", sections: { skills: `<available_skills><skill><name>${skill.name}</name><description>${skill.description}</description><location>${skill.filePath}</location></skill></available_skills>` } }];
+		assert.deepEqual(await runtime.fire("context_with_system", { messages }), [undefined]);
+		assert.ok(runtime.notifications.some((message) => message.includes("failed open")));
+	} finally { runtime.dispose(); }
 });

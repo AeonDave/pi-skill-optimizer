@@ -4,15 +4,16 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { hashSkill } from "../src/profile.ts";
 import {
 	createToolSearchExtension, DefaultResourceLoader, ExtensionRunner, discoverAndLoadExtensions, SessionManager, wrapRegisteredTools,
 	type ExtensionActions, type ModelRegistry, type Skill,
 } from "@earendil-works/pi-coding-agent";
 
-test("Pi 1.0 loader keeps built-in tool_search alongside optimizer_tool_search", async () => {
+test("Pi host loader keeps built-in tool_search alongside optimizer_tool_search", async () => {
 	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
 	const packageRoot = packagedRoot ? resolve(packagedRoot) : resolve(fileURLToPath(new URL("..", import.meta.url)));
-	const root = mkdtempSync(join(tmpdir(), "sko-pi-1-loader-"));
+	const root = mkdtempSync(join(tmpdir(), "sko-pi-host-loader-"));
 	const agentDir = join(root, "agent");
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -111,7 +112,10 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		process.env.PI_SKILL_OPTIMIZER_ALWAYS_SKILLS = "repo-guidance";
 		process.env.PI_SKILL_OPTIMIZER_PROVIDERS = "test-provider";
 		// No session_start/shutdown: their shared archive cleanup is outside this isolated probe.
-		await runner.emitBeforeAgentStart("Review repository module boundaries", undefined, { cwd: root, skills });
+		await runner.emitBeforeAgentStart(
+			{ messageType: "user", prompt: "Review repository module boundaries" },
+			{ cwd: root, skills },
+		);
 		assert.deepEqual(errors, []);
 
 		const longGuidance = "Use when reviewing repository module boundaries. Read relevant source and verify concrete behavior. ".repeat(28);
@@ -194,7 +198,10 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 
 		const setupMessage = "Optional setup: run `/skill-optimizer init` to improve skill matching (may incur model costs).";
 		assert.equal(notices.filter((text) => text === setupMessage).length, 1);
-		await runner.emitBeforeAgentStart("Review another module", undefined, { cwd: root, skills });
+		await runner.emitBeforeAgentStart(
+			{ messageType: "user", prompt: "Review another module" },
+			{ cwd: root, skills },
+		);
 		assert.equal(notices.filter((text) => text === setupMessage).length, 1, "do not repeat setup hints each turn");
 		assert.ok(session.getBranch().some((entry) => entry.type === "custom"), "persist notice metadata for reload/resume");
 		assert.ok(session.getBranch().every((entry) => entry.type !== "message"), "setup notices must not become model messages");
@@ -218,7 +225,41 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 			details: full.details, isError: false,
 		});
 		assert.deepEqual(rewritten?.content ?? full.content, full.content);
+		const nestedText = JSON.stringify(Array.from({ length: 1_000 }, (_, id) => ({ id, value: "ordinary payload ".repeat(6) })));
+		const statusBeforeNestedResult = statusCalls.at(-1);
+		const nestedResult = await runner.emitToolResult({
+			type: "tool_result", toolName: "read", toolCallId: "nested-read-call",
+			parentToolCallId: "codemode-parent-call",
+			input: { path: "payload.json" }, content: [{ type: "text", text: nestedText }],
+			details: {}, isError: false,
+		});
+		assert.equal(nestedResult, undefined, "Pi nested results must pass through exactly for programmatic codemode callers");
+		assert.equal(statusCalls.at(-1), statusBeforeNestedResult, "nested results must not accrue output savings");
 		await assert.rejects(search.execute("bad", { action: "load", name: "unknown" }), /Unknown skill/);
+
+		// Exercise the v6 contract through Pi's actual loader, hook runner and wrapped tools,
+		// not merely the pure renderer. This isolated fixture never calls a provider.
+		const taggedSkills = [{ ...skills[0]!, description: longGuidance.repeat(3) }];
+		const profileDir = join(root, "agent", "skill-optimizer");
+		mkdirSync(profileDir, { recursive: true });
+		writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ catalog: { version: 1, cards: {
+			"repo-guidance": { summary: "Review repository module boundaries before changing them.", tags: ["architecture", "review"], sourceHash: hashSkill("repo-guidance", taggedSkills[0]!.description) },
+		} } }));
+		await command.handler("", runner.createCommandContext()); // Explicit profile refresh.
+		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "設計を見直してください" }, { cwd: root, skills: taggedSkills });
+		const taggedMessages = [
+			{ role: "system", content: "base instructions", sections: { skills: `<available_skills><skill><name>repo-guidance</name><description>${taggedSkills[0]!.description}</description><location>${filePath}</location></skill></available_skills>` }, timestamp: 3 },
+			{ role: "user", content: "設計を見直してください" },
+		];
+		const taggedContext = await runner.emitContext(taggedMessages as never) as typeof taggedMessages;
+		assert.match(String(taggedContext[0]!.sections?.skills), /skill-optimizer:tags:v1/);
+		assert.deepEqual(taggedContext[1], taggedMessages[1], "tag mode must not append an acknowledgment-inducing prefetch");
+		const browsed = await search.execute("tag-browse", { action: "search", tags: ["architecture"], query: "設計を見直してください" });
+		assert.ok(JSON.stringify(browsed.content).includes("repo-guidance"));
+		assert.deepEqual((await search.execute("tag-load", { action: "load", name: "repo-guidance" })).content, [{ type: "text", text: instructions }]);
+		active = []; // Simulate an external persona withholding every optimizer helper.
+		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "Review" }, { cwd: root, skills: taggedSkills });
+		assert.deepEqual(await runner.emitContext(taggedMessages as never), taggedMessages, "keep native discovery when the resolver is not callable");
 		assert.deepEqual(errors, []);
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -263,6 +304,9 @@ test("real Pi loader/runner lets optimizer_tool_search activate initially deferr
 		} as unknown as ModelRegistry;
 		const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, modelRegistry);
 		const registered = runner.getAllRegisteredTools();
+		const optimizerSearchDefinition = registered.find(({ definition }) => definition.name === "optimizer_tool_search")?.definition as
+			{ reachesTools?: () => string } | undefined;
+		assert.equal(optimizerSearchDefinition?.reachesTools?.(), "all", "Pi should expose all deferred tools to the resolver");
 		for (const [name, exposure] of [["mcp__issues__find", "deferred"], ["mcp__issues__update", "codemode"]]) {
 			const tool = registered.find(({ definition }) => definition.name === name);
 			assert.equal((tool?.definition as { exposure?: string } | undefined)?.exposure, exposure);
@@ -282,7 +326,7 @@ test("real Pi loader/runner lets optimizer_tool_search activate initially deferr
 			hasPendingMessages: () => false, shutdown() {}, getContextUsage: () => undefined,
 			compact() {}, getSystemPrompt: () => "", getSystemPromptOptions: () => ({ cwd: root, skills: [] }),
 		});
-		await runner.emitBeforeAgentStart("", undefined, { cwd: root, skills: [] });
+		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "" }, { cwd: root, skills: [] });
 		assert.ok(!active.includes("mcp__issues__find"), "deferred tool was activated before search");
 		assert.ok(!active.includes("mcp__issues__update"), "codemode tool was activated before search");
 		const search = wrapRegisteredTools(registered, runner).find((tool) => tool.name === "optimizer_tool_search");

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { test } from "node:test";
 import {
 	ConcurrentFileUpdateError,
@@ -31,6 +32,15 @@ function tempDir(): string {
 	return mkdtempSync(join(tmpdir(), "skill-optimizer-test-"));
 }
 
+function waitUntil(condition: () => boolean, timeoutMs = 10_000): void {
+	const deadline = Date.now() + timeoutMs;
+	const wait = new Int32Array(new SharedArrayBuffer(4));
+	while (!condition()) {
+		if (Date.now() >= deadline) throw new Error("timed out waiting for child-process barrier");
+		Atomics.wait(wait, 0, 0, 10);
+	}
+}
+
 test("a stale timestamp cannot steal a lock from a live owner", () => {
 	const directory = tempDir();
 	try {
@@ -47,18 +57,155 @@ test("a stale timestamp cannot steal a lock from a live owner", () => {
 	}
 });
 
-test("an old lock is recovered only after its owning process has exited", () => {
+test("an old lock is preserved and reports safe manual recovery guidance", () => {
 	const directory = tempDir();
 	try {
 		const owner = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8", windowsHide: true });
 		assert.equal(owner.status, 0);
 		const path = join(directory, "abandoned.json");
-		writeFileSync(`${path}.lock`, `${owner.stdout.trim()}:1:abc123`, "utf8");
+		const record = `${owner.stdout.trim()}:1:abc123`;
+		writeFileSync(`${path}.lock`, record, "utf8");
 		const old = new Date(Date.now() - 60_000);
 		utimesSync(`${path}.lock`, old, old);
-		assert.equal(withFileLocks([path], () => "recovered"), "recovered");
+		assert.throws(
+			() => withFileLocks([path], () => assert.fail("must not steal an abandoned lock")),
+			/confirm no optimizer process is using it.*remove the lock file/i,
+		);
+		assert.equal(readFileSync(`${path}.lock`, "utf8"), record);
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("a stale malformed lock is preserved with actionable recovery guidance", () => {
+	const directory = tempDir();
+	try {
+		const path = join(directory, "corrupt.json");
+		writeFileSync(`${path}.lock`, "", "utf8");
+		const old = new Date(Date.now() - 60_000);
+		utimesSync(`${path}.lock`, old, old);
+		assert.throws(
+			() => withFileLocks([path], () => assert.fail("must fail closed on malformed lock")),
+			/confirm no optimizer process is using it.*remove the lock file/i,
+		);
+		assert.equal(readFileSync(`${path}.lock`, "utf8"), "");
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("a published lock always contains a complete owner record", () => {
+	const directory = tempDir();
+	try {
+		const path = join(directory, "complete.json");
+		withFileLocks([path], () => {
+			assert.match(readFileSync(`${path}.lock`, "utf8"), new RegExp(`^${process.pid}:\\d+:[a-f0-9]{24}$`));
+		});
 		assert.equal(existsSync(`${path}.lock`), false);
 	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("a process crash before writing the owner record never publishes an empty lock", () => {
+	const directory = tempDir();
+	try {
+		const path = join(directory, "crash-before-owner.json");
+		const persistenceUrl = pathToFileURL(join(process.cwd(), "src", "persistence.ts")).href;
+		const childScript = [
+			'import fs from "node:fs";',
+			'import { syncBuiltinESMExports } from "node:module";',
+			`const persistence = await import(${JSON.stringify(persistenceUrl)});`,
+			'fs.writeFileSync = () => process.exit(73);',
+			"syncBuiltinESMExports();",
+			`persistence.withFileLocks([${JSON.stringify(path)}], () => {});`,
+		].join("\n");
+		const child = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", childScript], {
+			cwd: process.cwd(),
+			encoding: "utf8",
+			windowsHide: true,
+		});
+		assert.equal(child.status, 73, child.stderr);
+		assert.equal(existsSync(`${path}.lock`), false, "the incomplete owner record must never be published");
+		saveUsageDelta(path, { afterCrash: { count: 1, lastUsed: 1 } });
+		assert.deepEqual(loadUsageFile(path), { afterCrash: { count: 1, lastUsed: 1 } });
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("cross-process writers preserve every additive usage delta behind a start barrier", async () => {
+	const directory = tempDir();
+	const path = join(directory, "concurrent-usage.json");
+	const gatePath = join(directory, "go");
+	const persistenceUrl = pathToFileURL(join(process.cwd(), "src", "persistence.ts")).href;
+	const workerCount = 3;
+	const iterations = 10;
+	const deadlineAt = Date.now() + 10_000;
+	const children: ReturnType<typeof spawn>[] = [];
+	const exits: Array<Promise<{ code: number | null; stderr: string }>> = [];
+	try {
+		for (let worker = 0; worker < workerCount; worker++) {
+			const readyPath = join(directory, `ready-${worker}`);
+			const script = [
+				'import { existsSync, readFileSync, writeFileSync } from "node:fs";',
+				`const persistence = await import(${JSON.stringify(persistenceUrl)});`,
+				`const path = ${JSON.stringify(path)};`,
+				`const gatePath = ${JSON.stringify(gatePath)};`,
+				`const workerId = ${worker};`,
+				`writeFileSync(${JSON.stringify(readyPath)}, "ready");`,
+				"const wait = new Int32Array(new SharedArrayBuffer(4));",
+				`const readyDeadlineAt = ${deadlineAt};`,
+				"while (!existsSync(gatePath)) {",
+				"if (Date.now() >= readyDeadlineAt) throw new Error(\"writer start barrier exceeded shared deadline\");",
+				"Atomics.wait(wait, 0, 0, 10);",
+				"}",
+				"const deadlineAt = Number(readFileSync(gatePath, \"utf8\"));",
+				"if (!Number.isSafeInteger(deadlineAt)) throw new Error(\"invalid shared deadline in writer barrier\");",
+				`for (let i = 0; i < ${iterations}; i++) {`,
+				"let retries = 0;",
+				"while (true) {",
+				"if (Date.now() >= deadlineAt) throw new Error(\"worker \" + workerId + \" exceeded shared deadline before update \" + i + \" (lock retries: \" + retries + \")\");",
+				"try { persistence.saveUsageDelta(path, { shared: { count: 1, lastUsed: i + 1 } }); break; }",
+				"catch (error) {",
+				"if (!(error instanceof Error) || !error.message.startsWith(\"timed out waiting for file lock:\")) throw error;",
+				"retries++;",
+				"if (Date.now() >= deadlineAt) throw new Error(\"worker \" + workerId + \" exhausted shared deadline after lock retries: \" + error.message);",
+				"Atomics.wait(wait, 0, 0, 5 + workerId * 5);",
+				"}",
+				"}",
+				"}",
+			].join("\n");
+			const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+				cwd: process.cwd(),
+				windowsHide: true,
+				stdio: ["ignore", "ignore", "pipe"],
+			});
+			children.push(child);
+			exits.push(new Promise((resolve, reject) => {
+				let stderr = "";
+				child.stderr?.setEncoding("utf8");
+				child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+				child.once("error", reject);
+				child.once("close", (code) => resolve({ code, stderr }));
+			}));
+		}
+		waitUntil(
+			() => Array.from({ length: workerCount }, (_, worker) => existsSync(join(directory, `ready-${worker}`))).every(Boolean),
+			Math.max(1, deadlineAt - Date.now()),
+		);
+		writeFileSync(gatePath, String(deadlineAt));
+		const outcomes = await Promise.all(exits);
+		for (const [worker, outcome] of outcomes.entries()) {
+			assert.equal(outcome.code, 0, `worker ${worker} exited ${outcome.code}; stderr:\n${outcome.stderr}`);
+		}
+		assert.deepEqual(loadUsageFile(path), { shared: { count: workerCount * iterations, lastUsed: iterations } });
+	} finally {
+		if (!existsSync(gatePath)) writeFileSync(gatePath, String(deadlineAt));
+		for (const child of children) {
+			if (child.exitCode === null && child.signalCode === null) child.kill();
+		}
+		await Promise.allSettled(exits);
 		rmSync(directory, { recursive: true, force: true });
 	}
 });
@@ -86,6 +233,21 @@ test("profile writes reject stale snapshots instead of replacing newer data", ()
 		assert.deepEqual(stored.profile.critical, ["first"]);
 		assert.deepEqual(stored.hashes, { first: "one" });
 		assert.equal(stored.initVersion, 3);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("stored skill hashes preserve an own __proto__ key without mutating the prototype", () => {
+	const dir = tempDir();
+	try {
+		const path = join(dir, "profile.json");
+		writeFileSync(path, '{"skillHashes":{"__proto__":"preserved","constructor":"ordinary"}}', "utf8");
+		const hashes = readStoredProfile(path).hashes;
+		assert.equal(Object.hasOwn(hashes, "__proto__"), true);
+		assert.equal(hashes.__proto__, "preserved");
+		assert.equal(hashes.constructor, "ordinary");
+		assert.equal(Object.getPrototypeOf(hashes), Object.prototype);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

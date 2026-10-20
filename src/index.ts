@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
+import { CATALOG_TAGS, createSkillCatalogBrowser } from "./catalog.ts";
 import {
 	ensureGlobalConfigTemplate,
 	getConfig,
@@ -14,10 +15,14 @@ import {
 } from "./config.ts";
 import {
 	batchSkillsByWeight,
+	DEFAULT_INIT_BATCH_MAX_SKILLS,
+	DEFAULT_INIT_BATCH_MAX_UTF8_BYTES,
+	DEFAULT_INIT_BATCH_MAX_ATTEMPTS,
 	generateProfileInBatches,
 	interpretBatchResponse,
 	isRetryableBatchException,
 	responseText,
+	serializeSkillBatch,
 } from "./generate.ts";
 import { deduplicateToolResultHistory, type HistoryArtifact } from "./history.ts";
 import {
@@ -32,6 +37,8 @@ import {
 } from "./init-readiness.ts";
 import { buildInitProfileWrites, needsProfileScopeRepair } from "./init-profile.ts";
 import { INIT_PROFILE_PROMPT, INIT_PROFILE_VERSION } from "./init-prompt.ts";
+import { createInitProgress, type InitProgress } from "./init-progress.ts";
+import { runInitBatch } from "./init-worker.ts";
 import { optimizePayload } from "./optimize.ts";
 import {
 	buildExtractPrompt,
@@ -72,7 +79,7 @@ import {
 } from "./profile.ts";
 import { sliceOutputLines } from "./output-recovery.ts";
 import { createSkillRegistry, type SkillRegistry } from "./skill-loader.ts";
-import { auditSkillDescriptions } from "./skills.ts";
+import { auditSkillDescriptions, planSkillPrefetch } from "./skills.ts";
 import {
 	addExtractionTelemetry,
 	addProviderCacheTelemetry,
@@ -103,9 +110,6 @@ import {
 
 const STATUS_KEY = "skill-optimizer";
 const INIT_VERSION = INIT_PROFILE_VERSION;
-const INIT_BATCH_MAX_SKILLS = 80;
-const INIT_BATCH_MAX_UTF8_BYTES = 32 * 1024;
-const INIT_BATCH_MAX_ATTEMPTS = 2;
 const FLUSH_INTERVAL_MS = 15_000;
 const LOAD_RETRY_MS = 1_000;
 const MAX_SEEN_EVIDENCE = 4_096;
@@ -170,7 +174,8 @@ function setStatus(ctx: ExtensionContext, text: string | undefined): void {
 }
 
 function profileSummary(profile: SkillOptimizerProfile): string {
-	return `${profile.critical.length} critical, ${Object.keys(profile.queries).length} query sets, ${Object.keys(profile.clusters).length} clusters, ${Object.keys(profile.activation ?? {}).length} activation tags`;
+	const kinds = Object.values(profile.activation ?? {});
+	return `${Object.keys(profile.catalog?.cards ?? {}).length} skill cards; ${profile.critical.length} universal, ${kinds.filter((tag) => tag.kind === "behavioral").length} behavioral, ${kinds.filter((tag) => tag.kind === "workflow").length} workflow, ${kinds.filter((tag) => tag.kind === "specialist").length} specialist`;
 }
 
 function initReadinessSummary(readiness: InitReadiness): string {
@@ -181,6 +186,15 @@ function initReadinessSummary(readiness: InitReadiness): string {
 		case "incomplete": return "generated profile is incomplete";
 		case "current": return "current";
 	}
+}
+
+function rankedSkillNames(registry: SkillRegistry, query: string, state: RuntimeSnapshot): string[] {
+	return planSkillPrefetch(registry.skills, query, {
+		profile: state.profile,
+		usagePrior: buildUsagePrior(state.usage, { halfLifeDays: state.config.usageHalfLifeDays }),
+		never: state.config.excludeSkills,
+		fuzzyCandidateLimit: state.config.fuzzyCandidateLimit,
+	}).ranked.map((entry) => entry.skill.name);
 }
 
 function usagePruneOptions(snapshot: RuntimeSnapshot): UsagePruneOptions {
@@ -290,6 +304,8 @@ const SKILL_SEARCH_PARAMS = Type.Object({
 		Type.Literal("location"),
 	]),
 	query: Type.Optional(Type.String()),
+	tags: Type.Optional(Type.Array(Type.String(), { maxItems: CATALOG_TAGS.length + 1, description: "Shared tag IDs from the directory; unclassified includes missing or stale cards" })),
+	match: Type.Optional(Type.Union([Type.Literal("any"), Type.Literal("all")])),
 	name: Type.Optional(Type.String()),
 	path: Type.Optional(Type.String()),
 	cursor: Type.Optional(Type.String()),
@@ -314,8 +330,12 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	let retryAfter = 0;
 	let retryNoticeAt = 0;
 	let registry: SkillRegistry | undefined;
+	let registryReady = false;
+	let registrySources: readonly { name: string; description: string; location: string }[] | undefined;
+	let catalogBrowserCache: { registry: SkillRegistry; profile: SkillOptimizerProfile; exclusions: string; browser: ReturnType<typeof createSkillCatalogBrowser> } | undefined;
 	let toolCatalog: ToolDiscoveryCatalog | undefined;
 	let permittedToolNames: Set<string> | undefined;
+	let lastOptimizerActiveNames: Set<string> | undefined;
 	const deactivatedToolNames = new Set<string>();
 	const retainedToolNames = new Set<string>();
 	let latestPrompt = "";
@@ -329,8 +349,17 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	const seenEvidence = new Set<string>();
 	const seenProviderMessages = new Set<string>();
 	const historyArtifacts = new Map<string, HistoryArtifact>();
-	const historyOrder: string[] = [];
 	const shownInitNoticeKeys = new Set<string>();
+	const getCatalogBrowser = (state: RuntimeSnapshot): ReturnType<typeof createSkillCatalogBrowser> => {
+		if (!registry) throw new Error("Skill registry is not initialized.");
+		const exclusions = JSON.stringify(state.config.excludeSkills);
+		if (catalogBrowserCache?.registry === registry && catalogBrowserCache.profile === state.profile && catalogBrowserCache.exclusions === exclusions) {
+			return catalogBrowserCache.browser;
+		}
+		const browser = createSkillCatalogBrowser(registry.skills.filter((skill) => !state.config.excludeSkills.includes(skill.name)), state.profile.catalog);
+		catalogBrowserCache = { registry, profile: state.profile, exclusions, browser };
+		return browser;
+	};
 
 	let sessionSaved: SavingsByArea = { ...EMPTY_SAVINGS };
 	let sessionExtraction: ExtractionTelemetry = { ...EMPTY_EXTRACTION_TELEMETRY };
@@ -339,6 +368,16 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	const pendingUsage = new Map<string, SkillUsageStats>();
 	const statsBase = new Map<string, SavedStats>();
 	let lastFlushAt = 0;
+	type InitOperation = { controller: AbortController; ctx: ExtensionContext; progress?: InitProgress };
+	let activeInit: InitOperation | undefined;
+	let initProgress: InitProgress | undefined;
+	const clearInitWork = (): void => {
+		const operation = activeInit;
+		activeInit = undefined;
+		operation?.controller.abort();
+		initProgress?.dispose();
+		initProgress = undefined;
+	};
 
 	const setSessionStatus = (ctx: ExtensionContext, text: string | undefined): void => {
 		if (hasStatus && lastStatusText === text) return;
@@ -355,6 +394,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	): void => {
 		if (notify) ctx.ui.notify(message, type);
 		setSessionStatus(ctx, message);
+		if (activeInit?.ctx === ctx) activeInit.progress?.report(message);
 	};
 
 	const stateFallback = (ctx: ExtensionContext, config: ConfigRecord): RuntimeSnapshot => {
@@ -553,12 +593,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	};
 
 	const storeHistoryArtifact = (artifact: HistoryArtifact): void => {
-		if (!historyArtifacts.has(artifact.id)) historyOrder.push(artifact.id);
+		if (historyArtifacts.has(artifact.id) || historyArtifacts.size >= MAX_HISTORY_ARTIFACTS) return;
 		historyArtifacts.set(artifact.id, artifact);
-		while (historyOrder.length > MAX_HISTORY_ARTIFACTS) {
-			const id = historyOrder.shift();
-			if (id) historyArtifacts.delete(id);
-		}
 	};
 
 	const rtkExtensionPresent = (): boolean => {
@@ -573,16 +609,48 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		return rtkPresence;
 	};
 
+	const setActiveToolsByOptimizer = (names: readonly string[]): void => {
+		pi.setActiveTools([...names]);
+		lastOptimizerActiveNames = new Set(names.map((name) => name.toLowerCase()));
+	};
+
+	const observeExternalToolSelection = (activeNames: ReadonlySet<string>): void => {
+		if (!lastOptimizerActiveNames) return;
+		const unchanged = activeNames.size === lastOptimizerActiveNames.size
+			&& [...activeNames].every((name) => lastOptimizerActiveNames?.has(name));
+		if (unchanged) return;
+
+		const narrowed = [...lastOptimizerActiveNames].some((name) => !activeNames.has(name));
+		if (narrowed) {
+			// An explicit host/persona removal is authoritative. Never widen its new allowlist
+			// from stale optimizer state or helper-tool defaults.
+			permittedToolNames = new Set(activeNames);
+			deactivatedToolNames.clear();
+			for (const name of retainedToolNames) {
+				if (!activeNames.has(name)) retainedToolNames.delete(name);
+			}
+			return;
+		}
+
+		// Additive activation by Pi (for example its built-in tool_search) remains in scope.
+		for (const name of activeNames) {
+			if (lastOptimizerActiveNames.has(name)) continue;
+			permittedToolNames?.add(name);
+			retainedToolNames.add(name);
+		}
+	};
+
+	const canDiscoverSearchableTools = (): boolean =>
+		permittedToolNames?.has("optimizer_tool_search") ?? false;
+
 	const rebuildToolCatalog = (state: RuntimeSnapshot): ToolDiscoveryCatalog => {
 		const allTools = pi.getAllTools();
 		const activeNames = new Set(pi.getActiveTools().map((name) => name.toLowerCase()));
+		observeExternalToolSelection(activeNames);
 		const alwaysToolPrefixes = state.config.alwaysTools
 			.map((pattern) => pattern.trim().toLowerCase())
 			.filter((pattern) => pattern.length > 0);
-		permittedToolNames ??= new Set([
-			...activeNames,
-			...PROTECTED_RUNTIME_TOOLS,
-		]);
+		permittedToolNames ??= new Set(activeNames);
 		for (const tool of allTools) {
 			const name = tool.name.toLowerCase();
 			if (isHostHiddenTool(tool)) {
@@ -596,7 +664,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				const reactivated = deactivatedToolNames.delete(name);
 				if (newlyActive || reactivated) retainedToolNames.add(name);
 				permittedToolNames.add(name);
-			} else if (isHostSearchableTool(tool) && alwaysToolPrefixes.some((pattern) => name.startsWith(pattern))) {
+			} else if (canDiscoverSearchableTools()
+				&& isHostSearchableTool(tool)
+				&& alwaysToolPrefixes.some((pattern) => name.startsWith(pattern))) {
 				permittedToolNames.add(name);
 			}
 		}
@@ -613,7 +683,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		rebuildToolCatalog(state);
 		return buildToolDiscoveryCatalog(pi.getAllTools().filter((tool) =>
 			!isHostHiddenTool(tool)
-				&& (permittedToolNames?.has(tool.name.toLowerCase()) || isHostSearchableTool(tool)),
+				&& (permittedToolNames?.has(tool.name.toLowerCase())
+					|| (canDiscoverSearchableTools() && isHostSearchableTool(tool))),
 		), {
 			protect: [...PROTECTED_RUNTIME_TOOLS, ...state.config.alwaysTools],
 		});
@@ -625,7 +696,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const added: string[] = [];
 		for (const tool of pi.getAllTools()) {
 			if (isHostHiddenTool(tool)) continue;
-			if (!permittedToolNames?.has(tool.name.toLowerCase()) && !isHostSearchableTool(tool)) continue;
+			if (!permittedToolNames?.has(tool.name.toLowerCase())
+				&& !(canDiscoverSearchableTools() && isHostSearchableTool(tool))) continue;
 			if (!requested.has(tool.name.toLowerCase())) continue;
 			permittedToolNames?.add(tool.name.toLowerCase());
 			retainedToolNames.add(tool.name.toLowerCase());
@@ -637,22 +709,22 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const ordered = pi.getAllTools()
 			.filter((tool) => !isHostHiddenTool(tool) && current.has(tool.name.toLowerCase()))
 			.map((tool) => tool.name);
-		pi.setActiveTools(ordered);
+		setActiveToolsByOptimizer(ordered);
 		return added;
 	};
 
 	const restorePermittedTools = (): void => {
+		observeExternalToolSelection(new Set(pi.getActiveTools().map((name) => name.toLowerCase())));
 		if (deactivatedToolNames.size === 0) {
 			toolCatalog = undefined;
 			return;
 		}
 		const active = new Set(pi.getActiveTools().map((name) => name.toLowerCase()));
 		for (const name of deactivatedToolNames) active.add(name);
-		pi.setActiveTools(
-			pi.getAllTools()
-				.filter((tool) => !isHostHiddenTool(tool) && active.has(tool.name.toLowerCase()))
-				.map((tool) => tool.name),
-		);
+		const ordered = pi.getAllTools()
+			.filter((tool) => !isHostHiddenTool(tool) && active.has(tool.name.toLowerCase()))
+			.map((tool) => tool.name);
+		setActiveToolsByOptimizer(ordered);
 		deactivatedToolNames.clear();
 		toolCatalog = undefined;
 	};
@@ -660,14 +732,28 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "skill_search",
 		label: "Skill Search",
-		description: "Search the local skill catalog or load one exact registered skill/resource on demand.",
-		promptSnippet: "Search and load full skill instructions on demand",
+		description: "Browse skill cards by shared tags (search with optional tags, any/all match, cursor); optionally query original descriptions. Load one exact skill/resource in full. Empty search browses all cards. Tags guide your judgment, not an automatic router.",
+		promptSnippet: "Browse skill cards by tag; load full instructions by exact name",
 		parameters: SKILL_SEARCH_PARAMS,
 		async execute(_id, params, _signal, _update, ctx) {
 			if (!registry) throw new Error("Skill registry is not initialized.");
 			const state = ensureSnapshot(ctx);
 			if (params.action === "search") {
-				if (!params.query) throw new TypeError("query is required for search");
+				if (state.profile.catalog || params.tags !== undefined || !params.query?.trim()) {
+					// Text search is an explicit recovery route. Tag selection stays with the LLM.
+					// Rank over full source descriptions, then let catalog pagination enforce its byte-stable order.
+					let orderedNames = params.query?.trim() ? rankedSkillNames(registry, params.query, state) : undefined;
+					if (orderedNames && params.tags?.length) {
+						// Correct semantic tags must not disappear merely because the user's language
+						// shares no tokens with English descriptions. With tags, query orders; it never vetoes.
+						orderedNames = [...new Set([...orderedNames, ...registry.skills.map((skill) => skill.name)])];
+					}
+					const page = getCatalogBrowser(state).browse({
+						tags: params.tags, match: params.match, query: params.query,
+						cursor: params.cursor, pageSize: params.pageSize, orderedNames,
+					});
+					return { content: [{ type: "text", text: JSON.stringify(page) }], details: { action: "search", total: page.total } };
+				}
 				const page = registry.search(params.query, {
 					cursor: params.cursor,
 					pageSize: params.pageSize,
@@ -704,6 +790,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		description: "Search local tool definitions and activate matching inactive tools without disabling current tools.",
 		promptSnippet: "Search and activate additional tools on demand",
 		parameters: TOOL_SEARCH_PARAMS,
+		reachesTools: () => "all",
 		async execute(_id, params, _signal, _update, ctx) {
 			if (!params.query.trim()) throw new TypeError("query must not be empty");
 			const state = ensureSnapshot(ctx);
@@ -760,19 +847,29 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			topK: state.config.toolPrefetchMax,
 			usedNames: retained,
 		});
-		const protectedNames = new Set(PROTECTED_RUNTIME_TOOLS.map((name) => name.toLowerCase()));
 		const active = new Set(plan.activeNames.map((name) => name.toLowerCase()));
-		for (const name of protectedNames) active.add(name);
 		deactivatedToolNames.clear();
 		for (const name of permittedToolNames ?? []) {
 			if (!active.has(name)) deactivatedToolNames.add(name);
 		}
-		pi.setActiveTools(pi.getAllTools().map((tool) => tool.name).filter((name) =>
+		const ordered = pi.getAllTools().map((tool) => tool.name).filter((name) =>
 			permittedToolNames?.has(name.toLowerCase()) && active.has(name.toLowerCase()),
-		));
+		);
+		setActiveToolsByOptimizer(ordered);
 	};
 
-	const initProfile = async (ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1]): Promise<void> => {
+	const initProfile = async (ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1], operation: InitOperation): Promise<void> => {
+		const signal = operation.controller.signal;
+		let savedCount = 0;
+		const cancelled = (): boolean => {
+			if (!signal.aborted && activeInit === operation) return false;
+			if (activeInit === operation) {
+				reportInitProgress(ctx, `skill-optimizer: init cancelled; ${savedCount} skills saved; run /skill-optimizer init to resume`, "warning");
+				operation.progress?.finish("cancelled");
+			}
+			return true;
+		};
+		if (cancelled()) return;
 		if (!ctx.model) {
 			reportInitProgress(ctx, "skill-optimizer: init failed: no model selected", "error");
 			return;
@@ -800,6 +897,17 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			|| (!!projectStored?.exists && projectStored.initVersion !== INIT_VERSION);
 		const refs = skills.map((skill) => ({ name: skill.name, description: skill.description }));
 		const { changed, removed, hashes } = diffSkills(refs, forceFull ? {} : storedHashes);
+		// Hash coverage alone no longer proves init completion: an interrupted or edited
+		// v6 profile can have hashes but no usable semantic cards. Repair only those owners.
+		const changedSet = new Set(changed);
+		for (const skill of refs) {
+			const card = Object.prototype.hasOwnProperty.call(baseProfile.catalog?.cards ?? {}, skill.name)
+				? baseProfile.catalog?.cards[skill.name] : undefined;
+			if (!changedSet.has(skill.name) && card?.sourceHash !== hashes[skill.name]) {
+				changed.push(skill.name);
+				changedSet.add(skill.name);
+			}
+		}
 		const projectNames = new Set(skills
 			.filter((skill) => skill.sourceInfo.scope === "project")
 			.map((skill) => skill.name));
@@ -815,29 +923,41 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 
 		const batchLimits = {
-			maxSkills: INIT_BATCH_MAX_SKILLS,
-			maxUtf8Bytes: INIT_BATCH_MAX_UTF8_BYTES,
-			maxAttempts: INIT_BATCH_MAX_ATTEMPTS,
+			maxSkills: DEFAULT_INIT_BATCH_MAX_SKILLS,
+			maxUtf8Bytes: DEFAULT_INIT_BATCH_MAX_UTF8_BYTES,
+			maxAttempts: DEFAULT_INIT_BATCH_MAX_ATTEMPTS,
 		};
 		const changedNames = new Set(changed);
 		const targetSkills = refs.filter((skill) => changedNames.has(skill.name));
 		const batches = targetSkills.length > 0 ? batchSkillsByWeight(targetSkills, batchLimits) : [];
-		const invalidatedNames = new Set([...removed, ...changed]);
-		const prunedBase = pruneProfileNames(forceFull ? EMPTY_PROFILE : baseProfile, invalidatedNames);
+		if (ctx.hasUI) {
+			initProgress = createInitProgress(ctx.ui, {
+				total: targetSkills.length,
+				alreadyCurrent: skills.length - targetSkills.length,
+				catalogTotal: skills.length,
+				model: `${model.provider}/${model.id}`,
+			});
+			operation.progress = initProgress;
+		}
+		// A schema upgrade is not a source change. Keep still-valid user data until its
+		// replacement batch succeeds; an interrupted init must not erase a working profile.
+		const sourceChanges = diffSkills(refs, storedHashes).changed;
+		const invalidatedNames = new Set([...removed, ...sourceChanges]);
+		const prunedBase = pruneProfileNames(baseProfile, invalidatedNames);
 		let partial = EMPTY_PROFILE;
 		let appliedChanged: string[] = [];
-		let savedCount = 0;
 		let checkpointedProfile: SkillOptimizerProfile | undefined;
 		let checkpointedApplied = new Set<string>();
 
 		const persist = (nextPartial: SkillOptimizerProfile, applied: readonly string[]): SkillOptimizerProfile => {
+			signal.throwIfAborted();
 			const appliedSet = new Set(applied);
 			const profile = mergeIncrementalProfile(prunedBase, nextPartial, applied);
 			const pending = changed.filter((name) => !appliedSet.has(name));
 			writeProfileFiles(buildInitProfileWrites({
 				paths,
 				profile,
-				hashes: computeFinalHashes(hashes, pending),
+				hashes: computeFinalHashes(hashes, pending, storedHashes),
 				skillCount: skills.length,
 				projectNames,
 				globalRevision: stored.revision,
@@ -849,6 +969,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			snapshot = undefined;
 			retryAfter = 0;
 			savedCount = appliedSet.size;
+			operation.progress?.saved(savedCount);
 			checkpointedProfile = profile;
 			checkpointedApplied = appliedSet;
 			return profile;
@@ -860,7 +981,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 
 		reportInitProgress(
 			ctx,
-			`skill-optimizer: init starting (${skills.length} skills, ${batches.length} batch${batches.length === 1 ? "" : "es"}${removed.length > 0 ? `, ${removed.length} removed` : ""})`,
+			`skill-optimizer: init starting (${skills.length} skills, ${targetSkills.length} pending, ${batches.length} batch${batches.length === 1 ? "" : "es"}${removed.length > 0 ? `, ${removed.length} removed` : ""})`,
 		);
 
 		if (!forceFull && removed.length > 0) {
@@ -881,8 +1002,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				result = await generateProfileInBatches(
 					targetSkills,
 					batchLimits,
-					async (batch, index, total, attempt) => {
-						const label = `${index + 1}/${total}`;
+					async (batch, _index, _total, attempt, { label, previousFailure }) => {
+						signal.throwIfAborted();
+						operation.progress?.startAttempt(label, attempt, batch.length);
 						reportInitProgress(
 							ctx,
 							`skill-optimizer: init ${label} starting (${batch.length} skills${attempt > 1 ? `, attempt ${attempt}` : ""})`,
@@ -893,21 +1015,18 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 							role: "user",
 							content: [{
 								type: "text",
-								text: JSON.stringify({
-									skills: batch.map((skill) => ({
-										name: skill.name,
-										description: skill.description,
-									})),
-								}),
+								text: serializeSkillBatch(batch, previousFailure),
 							}],
 							timestamp: Date.now(),
 						};
 						try {
-							const response = await ctx.modelRegistry.complete(
-								model,
-								{ systemPrompt, messages: [message] },
-							);
-							const outcome = interpretBatchResponse(response);
+							const response = await runInitBatch(ctx.modelRegistry, model, { systemPrompt, messages: [message] }, {
+								signal,
+								onActivity: (kind, chars) => operation.progress?.activity(kind, chars),
+							});
+							signal.throwIfAborted();
+							operation.progress?.report(`Validating batch ${label}`);
+							const outcome = interpretBatchResponse(response, batch);
 							if (outcome.status === "failed") {
 								return outcome;
 							}
@@ -924,30 +1043,33 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 						}
 					},
 					async (event) => {
+						signal.throwIfAborted();
 						if (event.type === "rejected") {
-							const willRetry = event.retryable && event.attempt < batchLimits.maxAttempts;
-							lastBatchFailure = `${event.index + 1}/${event.total} attempt ${event.attempt}: ${event.reason}`;
+							const recovering = event.willRetry || event.willSplit;
+							lastBatchFailure = `${event.label} attempt ${event.attempt}: ${event.reason}`;
 							reportInitProgress(
 								ctx,
-								`skill-optimizer: init ${event.index + 1}/${event.total} attempt ${event.attempt} ${event.reason}${willRetry ? "; retrying" : ""}`,
+								`skill-optimizer: init ${event.label} attempt ${event.attempt} ${event.reason}${event.willRetry ? "; retrying" : event.willSplit ? "; splitting into smaller batches" : ""}`,
 								"warning",
-								!willRetry,
+								!recovering,
 							);
 							return;
 						}
 						const applied = changed.filter((name) => event.applied.has(name));
+						operation.progress?.report(`Saving batch ${event.label}`);
 						persist(event.partial, applied);
 						appliedChanged = applied;
 						partial = event.partial;
 						reportInitProgress(
 							ctx,
-							`skill-optimizer: init ${event.index + 1}/${event.total} saved (${event.batchNames.length} skills, ${applied.length} written)`,
+							`skill-optimizer: init ${event.label} saved (${event.batchNames.length} skills, ${applied.length} written)`,
 							"info",
 							false,
 						);
 					},
 				);
 			} catch (error) {
+				if (cancelled()) return;
 				reportInitProgress(
 					ctx,
 					`skill-optimizer: init failed: profile not saved (${persistError(error)})${savedCount > 0 ? `; ${savedCount} skills already written` : ""}`,
@@ -955,6 +1077,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				);
 				return;
 			}
+			if (cancelled()) return;
 			if (!result) {
 				let profile = checkpointedProfile;
 				if (!profile) {
@@ -1001,15 +1124,17 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 		const appliedChangedSet = new Set(appliedChanged);
 		const failedChanged = changed.filter((name) => !appliedChangedSet.has(name));
-		const newCount = appliedChanged.filter((name) => !(name in storedHashes)).length;
+		const newCount = appliedChanged.filter((name) => !Object.prototype.hasOwnProperty.call(storedHashes, name)).length;
 		reportInitProgress(
 			ctx,
-			`skill-optimizer: init done v${INIT_VERSION} +${newCount}, ~${appliedChanged.length - newCount}, -${removed.length}, retry ${failedChanged.length}; ${profileSummary(profile)}`,
+			`skill-optimizer: init ${failedChanged.length > 0 ? "incomplete" : "done"} v${INIT_VERSION} +${newCount}, ~${appliedChanged.length - newCount}, -${removed.length}, retry ${failedChanged.length}; ${profileSummary(profile)}${failedChanged.length > 0 ? "; run /skill-optimizer init to retry remaining skills" : ""}`,
 			failedChanged.length > 0 ? "warning" : "info",
 		);
+		operation.progress?.finish(failedChanged.length > 0 ? "incomplete" : "done");
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		clearInitWork();
 		hasStatus = false;
 		lastStatusText = undefined;
 		shownInitNoticeKeys.clear();
@@ -1023,8 +1148,12 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		cachedConfig = undefined;
 		retryAfter = 0;
 		registry = undefined;
+		registryReady = false;
+		registrySources = undefined;
+		catalogBrowserCache = undefined;
 		toolCatalog = undefined;
 		permittedToolNames = undefined;
+		lastOptimizerActiveNames = undefined;
 		deactivatedToolNames.clear();
 		retainedToolNames.clear();
 		latestPrompt = "";
@@ -1043,7 +1172,6 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		seenEvidence.clear();
 		seenProviderMessages.clear();
 		historyArtifacts.clear();
-		historyOrder.length = 0;
 		sessionSaved = { ...EMPTY_SAVINGS };
 		sessionExtraction = { ...EMPTY_EXTRACTION_TELEMETRY };
 		sessionCache = { ...EMPTY_PROVIDER_CACHE_TELEMETRY };
@@ -1078,13 +1206,22 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		}
 		const state = ensureSnapshot(ctx);
 		try {
+			registry = undefined;
+			registryReady = false;
+			registrySources = undefined;
+			catalogBrowserCache = undefined;
 			const skills = skillInputs(event.systemPromptOptions.skills ?? []);
 			registry = makeSkillRegistry(skills);
+			registrySources = skills.map((skill) => ({ name: skill.name, description: skill.description, location: skill.filePath }));
+			if (state.profile.catalog) getCatalogBrowser(state);
+			registryReady = true;
 			initializeToolSelection(state, prompt ?? "");
 			maybeShowInitNotice(ctx, state, skills);
 			updateStatus(ctx);
 			return;
 		} catch (error) {
+			// An optional UI/diagnostic failure after preparation must not disable a valid
+			// resolver. A failed build never sets registryReady, so context still fails open.
 			ctx.ui.notify(`skill-optimizer: AUTO prefetch failed open (${(error as Error).message})`, "warning");
 			return;
 		}
@@ -1100,6 +1237,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const transformed = optimizePayload(payload, {
 			...state.config,
 			profile: state.profile,
+			resolverAvailable: registryReady && pi.getActiveTools().includes("skill_search"),
+			skillSources: registrySources,
+			catalogSnapshot: registryReady && state.profile.catalog && registry ? getCatalogBrowser(state) : undefined,
 			usagePrior: buildUsagePrior(state.usage, {
 				halfLifeDays: state.config.usageHalfLifeDays,
 			}),
@@ -1151,6 +1291,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		});
 		const deduplicated = deduplicateToolResultHistory(results, {
 			minBytes: state.config.historyDedupMinBytes,
+			retainedIds: new Set(historyArtifacts.keys()),
+			maxArtifacts: MAX_HISTORY_ARTIFACTS,
 		});
 		if (deduplicated.next === results) return;
 		for (const artifact of deduplicated.artifacts) storeHistoryArtifact(artifact);
@@ -1201,6 +1343,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 
 	pi.on("tool_result", async (event, ctx) => {
 		usedTools.add(event.toolName.toLowerCase());
+		if (event.parentToolCallId !== undefined) return;
 		if (RESOLVER_RESULT_TOOLS.has(event.toolName)) return;
 		if (isDisabled(ctx.cwd) || event.isError) return;
 		const config = getRuntimeConfig(ctx);
@@ -1341,24 +1484,49 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		clearInitWork();
 		maybeFlush(ctx, true);
 		cleanupTemporaryOutputs({ ttlMs: getOutputConfig(getRuntimeConfig(ctx)).archiveTtlMs });
 		restorePermittedTools();
 		historyArtifacts.clear();
-		historyOrder.length = 0;
 		setSessionStatus(ctx, undefined);
 	});
 
 	pi.registerCommand("skill-optimizer", {
-		description: "AUTO optimizer status; subcommands: init, audit",
+		description: "AUTO optimizer status; subcommands: init, cancel, audit",
 		handler: async (args, ctx) => {
 			getRuntimeConfig(ctx, true);
 			const command = args.trim().toLowerCase();
+			if (command === "cancel") {
+				if (!activeInit) ctx.ui.notify("skill-optimizer: no init is running", "info");
+				else {
+					activeInit.controller.abort();
+					ctx.ui.notify("skill-optimizer: init cancellation requested", "info");
+				}
+				return;
+			}
 			if (command === "init") {
+				if (activeInit) {
+					ctx.ui.notify("skill-optimizer: init already running; use /skill-optimizer cancel to stop it", "warning");
+					return;
+				}
+				initProgress?.dispose();
+				initProgress = undefined;
+				const operation: InitOperation = { controller: new AbortController(), ctx };
+				activeInit = operation;
+				const parentSignal = ctx.signal;
+				const abortFromParent = (): void => operation.controller.abort();
+				parentSignal?.addEventListener("abort", abortFromParent, { once: true });
+				if (parentSignal?.aborted) operation.controller.abort();
 				try {
-					await initProfile(ctx);
+					await initProfile(ctx, operation);
 				} finally {
-					updateStatus(ctx);
+					parentSignal?.removeEventListener("abort", abortFromParent);
+					if (activeInit === operation) {
+						operation.progress?.finish(operation.controller.signal.aborted ? "cancelled" : "failed");
+						activeInit = undefined;
+						updateStatus(ctx);
+					}
 				}
 				return;
 			}
@@ -1395,7 +1563,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			const lines = [
 				"pi-skill-optimizer",
 				`  enabled:        ${isDisabled(ctx.cwd) ? "no" : "yes"}`,
-				"  skills mode:    AUTO (stable TSV + skill_search resolver)",
+				`  skills mode:    ${state.profile.catalog ? "LLM-led tag directory + paged skill cards" : "compact index (run init for tag cards)"}`,
 				`  catalog budget:${lastBudget.usedChars}/${lastBudget.requestedChars} chars, ${lastBudget.nameOnlyCount} name-only`,
 				`  tools:          ${pi.getActiveTools().length}/${pi.getAllTools().length} active; optimizer_tool_search additive`,
 				`  output:         ${getOutputConfig(state.config).mode}; RTK ${rtkExtensionPresent() ? "detected per result" : "not detected"}`,

@@ -3,6 +3,7 @@ import {
   inspectStableSkillCatalog,
   renderStableSkillCatalog,
   renderSkillPrefetch,
+  parseSkills,
   type Skill,
 } from "./skills.js";
 import {
@@ -10,12 +11,15 @@ import {
   extractRequestQuery,
   normalizeRequest,
 } from "./request.js";
+import { CATALOG_VERSION, renderTagDirectory, type CatalogMetadata, type createSkillCatalogBrowser } from "./catalog.ts";
+import { normalize } from "node:path";
 
 export interface OptimizeProfile {
   critical: string[];
   queries: Record<string, string[]>;
   clusters: Record<string, string[]>;
   negativeHints: Record<string, string[]>;
+  catalog?: CatalogMetadata;
 }
 
 export interface OptimizeConfig {
@@ -30,6 +34,12 @@ export interface OptimizeConfig {
   usagePrior?: Readonly<Record<string, number>> | ReadonlyMap<string, number>;
   alwaysSkills?: string[];
   excludeSkills?: string[];
+  /** Host capability, not a permission grant. Missing resolver keeps native discovery. */
+  resolverAvailable?: boolean;
+  /** Authoritative host descriptions, before XML formatting/trimming. */
+  skillSources?: readonly { name: string; description: string; location?: string }[];
+  /** Private immutable host snapshot prepared outside provider hot hooks. */
+  catalogSnapshot?: ReturnType<typeof createSkillCatalogBrowser>;
 }
 
 export interface OptimizeBudget extends SkillCatalogBudget {
@@ -235,11 +245,19 @@ function uniqueInOrder(values: Iterable<string>): string[] {
   return result;
 }
 
+function sameSourceLocation(left: string, right: string): boolean {
+  const canonicalText = (value: string): string => {
+    const path = normalize(value).replaceAll("\\", "/");
+    return process.platform === "win32" ? path.toLowerCase() : path;
+  };
+  return canonicalText(left) === canonicalText(right);
+}
+
 export function optimizePayload<T>(
   payload: T,
   config: OptimizeConfig,
 ): OptimizeResult<T> {
-  if (!isRecord(payload)) {
+  if (!isRecord(payload) || config.resolverAvailable === false) {
     return {
       next: payload,
       removedChars: 0,
@@ -255,6 +273,8 @@ export function optimizePayload<T>(
   const originalLength = serializedLength(payload);
   const query = extractRequestQuery(normalizeRequest(payload));
   const source = payload as PayloadLike;
+  const tagMetadata = config.profile?.catalog?.version === CATALOG_VERSION ? config.profile.catalog : undefined;
+  const originalSkills = config.skillSources ? new Map(config.skillSources.map((skill) => [skill.name, skill])) : undefined;
   const catalogSkills: Skill[] = [];
   const catalogSkillNames = new Set<string>();
   const catalogNames: string[] = [];
@@ -263,6 +283,7 @@ export function optimizePayload<T>(
   let baseRemovedChars = 0;
   const catalogFloors: number[] = [];
   const inspect = (text: string): string => {
+    if (tagMetadata) return text;
     const preview = inspectStableSkillCatalog(text, {
       never: config.excludeSkills,
       intentMaxChars: config.intentMaxChars,
@@ -286,6 +307,55 @@ export function optimizePayload<T>(
   );
 
   const transform = (text: string): string => {
+    if (tagMetadata) {
+      const excluded = new Set(config.excludeSkills ?? []);
+      return text.replace(/<available_skills\b[^>]*>([\s\S]*?)<\/available_skills>/gi, (block: string, inner: string) => {
+        const parsed = parseSkills(inner).filter((skill) => !excluded.has(skill.name));
+        // Do not replace an extension-supplied catalog with a resolver that cannot load its entries.
+        if (originalSkills && parsed.some((skill) => {
+          const registered = originalSkills.get(skill.name);
+          return !registered || registered.description.trim() !== skill.description
+            || (!!registered.location && (!skill.location || !sameSourceLocation(registered.location, skill.location)));
+        })) return block;
+        const skills = parsed
+          .map((skill) => originalSkills?.get(skill.name) ?? skill);
+        if (skills.length === 0) return block;
+        // A second pass sees a directory, not XML skill entries, and is an identity operation.
+        const limit = Math.min(4_000, config.catalogBudgetChars);
+        const eligibleNames = new Set(skills.map((skill) => skill.name));
+        const priority = uniqueInOrder([...(config.profile?.critical ?? []), ...(config.alwaysSkills ?? [])])
+          .filter((name) => eligibleNames.has(name));
+        const priorityText = priority.length > 0
+          ? `\nConfigured/universal skill names (metadata, not loaded): ${JSON.stringify(priority).replace(/</g, "\\u003c")}\nLoad relevant full instructions by exact name; no catalog acknowledgment is needed.`
+          : "";
+        let directory: ReturnType<typeof renderTagDirectory>;
+        try {
+          const snapshot = config.catalogSnapshot;
+          const sameCatalog = snapshot?.prepared.total === skills.length
+            && snapshot.prepared.skills.every((skill) => eligibleNames.has(skill.name));
+          directory = sameCatalog ? snapshot!.renderDirectory(limit - priorityText.length)
+            : renderTagDirectory(skills, tagMetadata, limit - priorityText.length);
+        }
+        catch (error) {
+          if (error instanceof RangeError) return block; // Preserve native discovery if the complete directory cannot fit.
+          throw error;
+        }
+        const text = directory.text + priorityText;
+        if (text.length >= block.length) return block;
+        baseRemovedChars += block.length - text.length;
+        catalogNames.push(...skills.map((skill) => skill.name));
+        fingerprints.push(directory.fingerprint);
+        mergeBudget(budget, {
+          requestedChars: config.catalogBudgetChars,
+          usedChars: text.length,
+          floorChars: text.length,
+          intentCount: 0,
+          nameOnlyCount: 0,
+          overBudgetChars: 0,
+        });
+        return text;
+      });
+    }
     const floorChars = catalogFloors[catalogIndex] ?? 0;
     const result = renderStableSkillCatalog(text, {
       never: config.excludeSkills,
@@ -362,7 +432,7 @@ export function optimizePayload<T>(
 
   let addedPrefetchChars = 0;
   let injectedSkills: string[] = [];
-  const prefetchPlan = planSkillPrefetch(catalogSkills, query, {
+  const prefetchPlan = tagMetadata ? undefined : planSkillPrefetch(catalogSkills, query, {
     profile: config.profile,
     usagePrior: config.usagePrior,
     always: uniqueInOrder([
@@ -376,8 +446,8 @@ export function optimizePayload<T>(
     fullRenderBudgetChars: config.prefetchBudgetChars,
     fuzzyCandidateLimit: config.fuzzyCandidateLimit,
   });
-  const selectedSkills = prefetchPlan.selected;
-  if (selectedSkills.length > 0) {
+  const selectedSkills = prefetchPlan?.selected ?? [];
+  if (prefetchPlan && selectedSkills.length > 0) {
     const appendix = renderSkillPrefetch(prefetchPlan);
     if (appendix) {
       const withPrefetch = appendToLatestHumanInput(

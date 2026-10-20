@@ -130,15 +130,15 @@ export function normalizeUsageFile(value: unknown): SkillUsageStats {
 		: value && typeof value === "object" && !Array.isArray(value)
 			? value as Record<string, unknown>
 			: {};
-	const out: SkillUsageStats = {};
+	const entries: Array<[string, SkillUsageEntry]> = [];
 	for (const [name, raw] of Object.entries(rawSkills)) {
 		if (!raw || typeof raw !== "object") continue;
 		const entry = raw as { count?: unknown; lastUsed?: unknown };
 		const count = typeof entry.count === "number" && Number.isFinite(entry.count) && entry.count > 0 ? Math.floor(entry.count) : 0;
 		const lastUsed = typeof entry.lastUsed === "number" && Number.isFinite(entry.lastUsed) && entry.lastUsed > 0 ? Math.floor(entry.lastUsed) : 0;
-		if (count > 0) out[name] = { count, lastUsed };
+		if (count > 0) entries.push([name, { count, lastUsed }]);
 	}
-	return out;
+	return Object.fromEntries(entries);
 }
 
 export function toUsageFile(stats: SkillUsageStats, now = Date.now()): SkillUsageFile {
@@ -146,25 +146,25 @@ export function toUsageFile(stats: SkillUsageStats, now = Date.now()): SkillUsag
 }
 
 export function recordSkillUsage(stats: SkillUsageStats, names: readonly string[], now = Date.now()): SkillUsageStats {
-	const next: SkillUsageStats = { ...stats };
+	const next = new Map(Object.entries(stats));
 	for (const name of new Set(names.filter(Boolean))) {
-		const prev = next[name] ?? { count: 0, lastUsed: 0 };
-		next[name] = { count: prev.count + 1, lastUsed: now };
+		const prev = next.get(name) ?? { count: 0, lastUsed: 0 };
+		next.set(name, { count: prev.count + 1, lastUsed: now });
 	}
-	return next;
+	return Object.fromEntries(next);
 }
 
 /** Merge a process-local increment delta into the latest persisted snapshot. */
 export function mergeUsageStats(base: SkillUsageStats, delta: SkillUsageStats): SkillUsageStats {
-	const next: SkillUsageStats = { ...base };
+	const next = new Map(Object.entries(base));
 	for (const [name, entry] of Object.entries(delta)) {
-		const previous = next[name] ?? { count: 0, lastUsed: 0 };
-		next[name] = {
+		const previous = next.get(name) ?? { count: 0, lastUsed: 0 };
+		next.set(name, {
 			count: previous.count + entry.count,
 			lastUsed: Math.max(previous.lastUsed, entry.lastUsed),
-		};
+		});
 	}
-	return next;
+	return Object.fromEntries(next);
 }
 
 /**

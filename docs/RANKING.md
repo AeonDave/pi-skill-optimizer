@@ -2,15 +2,60 @@
 
 [Back to the README](../README.md)
 
-## Why this is still a local lexical router
+## Discovery has two profile modes
 
-The job is to find a few useful entries in a known skill catalog, before the model
-starts work. Ordinary routing must be deterministic, cheap to run, and usable
-without another provider or a generated profile. AUTO's hybrid is a reasonable
-fit for those constraints; it is not a claim that lexical retrieval is universally
-better than embeddings or that these weights are optimal.
+With current v1 `profile.catalog` metadata, discovery is LLM-led from a compact,
+fixed 38-tag directory. Init supplies one source-bound card per skill (a
+distinguishing sentence of at most 200 characters plus canonical tags); the host,
+not the model, binds each card to the exact source-description hash. Missing or
+stale cards remain available under `unclassified`, with a summary derived from
+the current description. This validation proves shape and ownership, not that a
+generated summary or tag is relevant.
 
-The current pipeline is:
+A partially completed init can enter this mode as soon as it has valid catalog
+metadata. The directory covers the whole registered catalog: accepted cards keep
+their generated tags, and the remaining owners stay browsable under
+`unclassified`. Restarting explicit init skips completed, unchanged cards and
+repairs the remaining owners. Smaller retry batches and stricter diagnostics
+improve recovery from invalid responses; they do not independently establish
+classification quality. See the [init and cancellation contract](CONFIGURATION.md#routing-profile-initialization).
+
+The directory gives the main model category descriptions and counts, not a list
+of skill names. The model interprets the current task and may browse cards via
+`skill_search` with tag match `any` or `all`; it must explicitly load a skill.
+There is no automatic skill selection or prefetch in this mode. `critical` and
+configured `alwaysSkills` names are stable hints, not loaded instructions or an
+auto-selection rule. If the resolver is unavailable or the complete directory
+does not fit, AUTO preserves Pi's native catalog rather than force-enabling the
+tool.
+
+The tag vocabulary is deliberately coarse. `discipline` is for evidence-preserving
+reading, persistence, verification, safe judgment and related execution habits;
+`other` is the honest inspection bucket when no supported topic tag fits, not a
+reason to force a superficially similar category. It is distinct from
+`unclassified`, which means the host has no current valid card. The model is expected to interpret
+the task in its language, but multilingual discovery quality has not been
+measured. There are no per-language query keys, embedding calls, or hidden
+per-turn model requests; init is explicit provider work. An explicit free-text
+`skill_search` query with tags only orders the complete tag-filtered bucket; it
+does not lexically exclude candidates, which preserves multilingual results with
+little or no term overlap. Without tags, a query retains local BM25F lexical
+filtering/ranking over original descriptions.
+Directory counts and card contents affect stable prompt bytes. Its size cap is
+`min(4,000, catalogBudgetChars)` characters per catalog, and a browse response
+is capped at 3,000 characters (not UTF-8 bytes), so a page can contain fewer
+entries than requested. A hot tag can therefore require several pages. Browsing
+is an optional extra request: it can cost more bytes than it saves when the
+model pages repeatedly.
+
+Profiles without current v1 catalog metadata—including v5 profiles—retain the
+compatible local lexical router until the user explicitly runs init. In this
+path the job is to find a few useful entries in a known skill catalog before
+the model starts work. AUTO's hybrid is deterministic and provider-free, but
+that does not make lexical retrieval universally better than embeddings or
+prove that its weights are optimal.
+
+The no-card compatibility pipeline is:
 
 1. Normalize the latest genuine human text and expand catalog-supported aliases.
 2. Score names, short intents, full descriptions and optional profile queries with
@@ -22,8 +67,17 @@ The current pipeline is:
    within adaptive count and character budgets. Explicitly protected skills have
    their own guarantee; they can exceed ordinary prefetch budgets.
 
+This scoring pipeline is only the legacy/no-card request prefetch path. In that
+path, exact-name evidence comes from the normalized original query: whole skill
+name (12), all skill-name tokens (8), or an exact profile phrase (7). Alias
+expansion contributes lexical retrieval evidence but is not itself promoted to
+that exact-match channel; this avoids giving short ambiguous aliases the same
+weight as a direct name request.
+
 The stable all-name index is separate from this ranking. A miss in prefetch does
-not remove a skill from the library or its exact resolver.
+not remove a skill from the library or its exact resolver. This all-name floor
+and the prefetch overlay are compatibility behavior, not the v6 directory-mode
+contract.
 
 ## Contextual and behavioral skills
 
@@ -35,11 +89,11 @@ An optional, name-owned `activation` entry in the profile records two tags:
 - `tasks`: a small subset of shared activities such as `software-change`,
   `software-review`, `docs-write`, or `research`.
 
-Explicit `/skill-optimizer init` assigns these from each skill's description.
-The fixed activity vocabulary works across init batches: no full-catalog model
-request or runtime inference call is needed. Old profiles still work; rerun init
-to regenerate them with the new tags. That regeneration uses your selected model
-and can incur cost. This update does not run it automatically.
+Explicit `/skill-optimizer init` may retain or regenerate these from each skill's
+description. They are used by the no-card compatibility router only. The fixed
+activity vocabulary works across init batches; old profile fields are preserved
+when a migration batch fails for an unchanged source. Init uses the selected
+model and can incur cost; it is never run automatically.
 
 The router first selects a positively matched, tagged specialist. It can then
 reserve **one ordinary prefetch slot** for a workflow or behavioral skill sharing
@@ -67,7 +121,7 @@ The typo fallback is deliberately conservative: it runs only when fewer than
 by enough known words can therefore be missed. This is a known quality tradeoff,
 not a promise to repair every misspelling.
 
-## What the algorithm comparison can tell us
+## What the legacy ranking comparison can tell us
 
 Run the diagnostic fixture locally:
 
@@ -93,7 +147,8 @@ not an independent implementation. Results can reveal a tradeoff or regression,
 not establish the best router for all users. Keep the denominators and report
 weaker results as well as improvements.
 
-Local diagnostic run, 2026-09-28 (working tree, Node 26.3.0, Windows x64):
+Historical no-card lexical diagnostic, 2026-09-28 (working tree, Node 26.3.0,
+Windows x64; it does not measure v6 tag discovery):
 
 | Variant | Recall@1 | Recall@5 | MRR | No-signal promotions |
 | --- | --- | --- | --- | --- |
@@ -103,7 +158,9 @@ Local diagnostic run, 2026-09-28 (working tree, Node 26.3.0, Windows x64):
 
 The hybrid recovers the final relevant item within five results, but does not win
 top-one accuracy. This is why no new weight set or replacement is justified by
-this fixture alone. Re-run the command for current-tree results.
+this fixture alone. Re-run the command for current-tree results. This fixture
+predates v6 and says nothing about tag/card relevance or whether the main model
+will browse the directory.
 
 | Candidate | Why keep or consider it | What is still missing |
 | --- | --- | --- |
@@ -119,6 +176,19 @@ promotions and missed skills. The [private evaluation protocol](../BENCHMARK.md)
 defines the broader gates; running it is an explicit operation.
 
 ## Performance versus quality
+
+One separate synthetic transport comparison used a 355-skill catalog. The native
+initial catalog serialized to 71,975 bytes; the former compact TSV was 8,523
+bytes, and the new tag directory was 3,254 bytes. For eight work turns with one
+browse and an exact load, the tag-directory scenario emitted 55,290 serialized
+bytes across 10 requests, versus 80,571 bytes across 9 requests for the previous
+path (31.4% fewer bytes, but one additional request). A five-browse scenario
+emitted 164,870 bytes and was worse. These are synthetic transport totals, not
+provider token or cost measurements, and do not measure selection quality. They
+show why browsing frequency matters; they are not a universal savings claim.
+This is the dated 2026-10-19 snapshot, not a new result for release 3.1.3.
+Directory sizes and counts are workload-dependent. Broader scale measurements
+are kept separately in [BENCHMARK.md](../BENCHMARK.md).
 
 ```bash
 npm run bench:perf

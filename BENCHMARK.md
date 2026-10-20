@@ -1,6 +1,89 @@
 # AUTO benchmark
 
-This document defines the benchmark contract and records the current real-corpus evidence for AUTO. Earlier discovery architectures are not comparable and are intentionally excluded.
+This document separates current deterministic transport checks from historical
+real-provider evidence. Results from different discovery contracts are not
+interchangeable.
+
+## Tag-directory qualification (2026-10-19 snapshot)
+
+Run `npm run bench:catalog` for the current result. This local, synthetic check
+compares native catalogs, the compact-index fallback, and initialized tag
+discovery on identical source descriptions. Cards and tags are preassigned: it
+does **not** establish init classification accuracy, multilingual relevance,
+instruction adherence, provider token savings, or model latency.
+
+The replay counts a complete skill load in both paths, one additional browse
+request in tag mode, and eight subsequent work requests. Browse results remain
+in every later request; the fallback's human prefetch remains present too.
+Known-name loading needs no browse. Five-page exploration is also reported,
+including cases where it costs more than the compact index.
+
+The dated results below are retained as observed. Release 3.1.3 adds init
+recovery and live progress; those changes do not turn this synthetic transport
+comparison into evidence of generated-card quality or provider savings.
+
+Local working-tree run, 2026-10-19, Windows x64 / Node 26.3.0:
+
+| Synthetic skills | Native initial bytes | Previous initial bytes | Tag initial bytes | Cumulative saving vs previous, one browse |
+| --- | ---: | ---: | ---: | ---: |
+| 355 | 71,975 | 8,523 | 3,254 | 31.4% (55,290 vs 80,571 bytes) |
+| 2,000 | 406,188 | 30,373 | 3,280 | 79.1% (57,980 vs 277,221 bytes) |
+| 10,000 | 2,034,592 | 150,373 | 3,319 | 95.7% (58,388 vs 1,357,221 bytes) |
+
+Pagination enumerated **355/355, 2,000/2,000 and 10,000/10,000** cards without
+duplicates or loss. With five browse responses, the 355-skill replay instead used
+164,870 bytes across 14 requests, **more** than the previous path. These are
+complete serialized payload bytes, not token conversions or provider savings.
+
+The immutable catalog snapshot took approximately 4 / 15 / 60 ms respectively;
+warm request preparation averaged approximately 1.3 / 5.3 / 27.5 ms in this run.
+Snapshot creation is paid outside provider hot hooks; pagination reuses it.
+Latency depends on hardware and runtime; rerun rather than treating these as SLAs.
+
+Blocking deterministic gates:
+
+- every eligible card is reachable exactly once through pagination, including
+  stale/missing metadata under `unclassified`;
+- the directory is query-independent and at most 4,000 characters; each complete
+  serialized card response is at most 3,000 characters, including cursor/facets;
+- exact loading remains verbatim and path-contained;
+- no automatic skill selection or human-message overlay in tag mode;
+- one browse plus load saves cumulative serialized bytes against the compact
+  fallback for the synthetic 355/2,000/10,000 fixtures;
+- an unavailable resolver, an unregistered external catalog, an undersized
+  directory budget, or no net saving preserves native discovery.
+
+Tags are selected by the main LLM, not inferred by a language-specific router.
+With tags, optional query text orders candidates without vetoing the selected
+bucket; query-only search retains lexical abstention. Arabic/Japanese regression
+cases cover that availability property, **not** general relevance.
+
+Before claiming production quality gains, run a paired, independently labeled
+real-model evaluation of actual init-generated cards and subsequent loads/task
+outcomes. Compare native, fallback and tag discovery, including broad buckets,
+indirect method/behavior needs, multilingual requests, missing metadata and long
+sessions. Record extra calls, cumulative context, time and provider usage. The
+older `bench:real` recall harness below targets compact-index/prefetch exposure;
+it is not a completed semantic evaluation of the new tag contract.
+
+## Init recovery and live progress checks
+
+The local init suites exercise complete card ownership and validation, bounded
+diagnostic feedback, initial groups of at most 20 skills, two attempts per group,
+and at most eight additional recovery calls shared by each original group's
+subdivisions. Complete source descriptions survive retries; invalid partial
+responses never become successful checkpoints. Provider errors do not trigger
+subdivision, and terminal errors or cancellation stop later work.
+Repeated failed schema migrations preserve previously known unchanged source
+identities and routing fields while missing cards remain incomplete; failed new
+or changed sources do not advance their hashes.
+
+UI checks distinguish committed progress from streamed activity. They cover a
+silent request with a one-second heartbeat, bounded redraws across thousands of
+chunks, cumulative saved percentage, cancellation after a partial checkpoint,
+session shutdown, ignored late responses and widget/timer cleanup. No real model
+is needed for these local checks. They establish recovery and lifecycle behavior
+under the fixtures, not the accuracy of actual model-generated summaries or tags.
 
 ## Published v2.0.0 snapshot
 
@@ -58,9 +141,9 @@ Guarded extraction is accepted only when it is an ordered verbatim subsequence, 
 
 The benchmark asks:
 
-1. Does every eligible skill remain visible and exactly loadable?
+1. Does every eligible skill remain discoverable and exactly loadable?
 2. Is the stable base byte-identical across unrelated human requests?
-3. Does bounded prefetch improve first-turn recall without changing that base?
+3. Does tag browsing preserve selection quality while reducing cumulative context and accounting for added calls?
 4. Can `skill_search` recover relevant tail skills through bounded pagination?
 5. Can `optimizer_tool_search` defer schemas without making required tools unavailable?
 6. Do output and history reductions preserve protected evidence and exact recovery?
@@ -102,7 +185,10 @@ Remote evaluation receives only validated, sanitized cases.
 
 ## Discovery protocol
 
-### Stable base
+### Compact-index fallback base
+
+This and the following prefetch protocol apply to profiles without v6 cards;
+initialized tag discovery uses the separate qualification gates above.
 
 Render the AUTO index for every catalog under unrelated requests and supported provider shapes.
 
@@ -127,7 +213,9 @@ path_leak_count
 
 ### Human-input prefetch
 
-Use only labeled human text as the query. Compare expected skills with full verbatim definitions appended to the latest genuine human block.
+Use only labeled human text as the query. Compare expected skills with verbatim
+catalog descriptions appended to the latest genuine human block, not full
+`SKILL.md` instructions.
 
 Blocking invariants:
 
@@ -278,11 +366,18 @@ OpenAI, Anthropic, and Gemini expose different cache semantics. Stable bytes mak
 
 ## Scale boundary
 
-This benchmark covers 332 skills, not an unbounded catalog.
+The historical provider benchmark covers 332 skills. Current synthetic transport
+checks cover 355, 2,000 and 10,000; neither establishes unbounded semantic quality.
 
-AUTO keeps every eligible name in the stable index. Consequently, the minimum base size is the sum of framing plus all rendered names across the request. Intent text shares one request-global budget, but the combined all-name information floors grow linearly and can exceed `catalogBudgetChars`.
+Without v6 cards, AUTO keeps every eligible name in the stable index. Its
+information floor grows linearly and can exceed `catalogBudgetChars`. Initialized
+tag discovery deliberately replaces immediate name visibility with a bounded
+directory and paged access; all cards remain resolvable rather than all names
+remaining in every prompt.
 
-A 100,000-skill catalog is not demonstrated here and may still be too large. Supporting that scale efficiently requires resolver-only discovery, namespaces, sharding, or a server-side paginated index. Those approaches change the current guarantee that every name is visible in the base prompt.
+A 100,000-skill catalog is not demonstrated here. Even with a bounded directory,
+source indexing and init work scale with catalog size. Large buckets and repeated
+browsing can dominate conversation space and latency.
 
 The benchmark also does not establish reduction of arbitrary system prompts or ordinary conversation history. The project targets recognized skill catalogs, dynamic tool definitions, eligible tool results, and exact duplicate history results.
 
@@ -295,6 +390,7 @@ npm run typecheck
 npm test
 npm run bench
 npm run bench:ranking
+npm run bench:catalog
 npm run bench:perf
 npm run bench:output
 ```
@@ -307,6 +403,35 @@ held-out relevance benchmark. [Current rationale and diagnostic results](docs/RA
 `npm run bench:perf` reports runtime/platform, cold latency and 30 warm samples
 (mean, p50, p95) at 284 and 2,000 skills. These are request-preparation timings,
 not model, startup or terminal-redraw timings.
+
+For interactive development, load the checkout with `pi -e ./src/index.ts` and
+exercise status, audit, search and verbatim skill loading. CI defines Windows,
+Linux and macOS jobs on Node 26.3 and the current 26.x; inspect the jobs for the
+commit under review rather than treating a configured matrix as a passing run.
+
+### Packed release qualification
+
+Inspect the package allowlist before testing the distribution:
+
+```bash
+npm pack --dry-run
+npm pack
+```
+
+Unpack the tarball outside the checkout, without package-local Pi host
+dependencies. Use an isolated `PI_CODING_AGENT_DIR`; `PI_AGENT_DIR` alone does not
+relocate Pi's install root. Point the artifact host tests at that absolute package
+root with the test-only `PI_SKILL_OPTIMIZER_TEST_PACKAGE` variable, then run
+`node --import tsx --test test/host-runtime.test.ts`. Leave the variable unset for
+ordinary source-suite runs.
+
+Run `npm run smoke:blackbox -- <absolute-unpacked-package-root>` with the current
+development Pi, and repeat against Pi 1.0.0 by setting `PI_CLI` to that CLI and
+passing its exact version as the second argument:
+`npm run smoke:blackbox -- <absolute-unpacked-package-root> 1.0.0`.
+The black-box fixture model is local and needs no provider key. Packed loader,
+offline command and tool checks qualify the tested artifact and host pair; they
+do not establish live-provider init quality.
 
 ### Private real-model workflow
 

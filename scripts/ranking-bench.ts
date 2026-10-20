@@ -83,6 +83,35 @@ const misleading = rank("digital photography", "AUTO").find((entry) => entry.ski
 assert.equal(misleading?.exactScore ?? 0, 0, "git must not be an exact name match inside digital");
 console.log("Interpretation: component diagnostics only; not a claim of best algorithm or real-user/model recall.");
 
+// Independent exact-channel boundary fixture: a broad alias must not outrank
+// stronger BM25F evidence, while domain-specific lexical retrieval still works.
+const boundaryCatalog: Skill[] = [
+	{ name: "arjun", description: "HTTP parameter discovery through active parameter testing to find hidden query inputs.", location: "/synthetic/web/arjun/SKILL.md" },
+	{ name: "ci-stability", description: "Reliability guidance for flaky automated testing suites under parallel execution when shared mutable state, order dependence, or races cause intermittent failures.", location: "/synthetic/testing/ci-stability/SKILL.md" },
+	{ name: "can-bus-modules", description: "Hardware CAN bus interface over SPI using an MCP2515 to inspect OBD-II frames.", location: "/synthetic/hardware/can-bus-modules/SKILL.md" },
+];
+const boundaryProfile = normalizeProfile({ queries: {
+	"ci-stability": ["Fix flaky suite failures in CI when parallel workers share mutable state"],
+} });
+const boundaryOptions = { profile: boundaryProfile, fuzzyCandidateLimit: 0, minTopK: 1, targetTopK: 1, maxTopK: 1 };
+const ciQuery = "After parallel CI starts, a regression test passes alone but fails intermittently because fixtures share mutable state.";
+const ciPlan = planSkillPrefetch(boundaryCatalog, ciQuery, boundaryOptions);
+const ciTarget = ciPlan.ranked.find((entry) => entry.skill.name === "ci-stability");
+const aliasDistractor = ciPlan.ranked.find((entry) => entry.skill.name === "arjun");
+assert.ok(ciTarget && aliasDistractor);
+assert.ok(ciTarget.lexicalScore > aliasDistractor.lexicalScore);
+assert.equal(aliasDistractor.exactScore, 0);
+assert.equal(ciPlan.ranked[0].skill.name, "ci-stability");
+
+const canPlan = planSkillPrefetch(boundaryCatalog, "Connect an MCP2515 over SPI to inspect CAN bus OBD-II frames", boundaryOptions);
+assert.equal(canPlan.ranked[0]?.skill.name, "can-bus-modules");
+const apiPlan = planSkillPrefetch(boundaryCatalog, "Fuzz HTTP query parameters to discover hidden application inputs", boundaryOptions);
+assert.equal(apiPlan.ranked[0]?.skill.name, "arjun");
+const exactNamePlan = planSkillPrefetch(boundaryCatalog, "Please load can-bus-modules", boundaryOptions);
+assert.ok((exactNamePlan.ranked.find((entry) => entry.skill.name === "can-bus-modules")?.exactScore ?? 0) >= 8);
+assert.equal(planSkillPrefetch(boundaryCatalog, "quokka marmalade", boundaryOptions).hasSignal, false);
+console.log("Exact-channel boundary fixture: CI reliability wins over generic test alias; CAN hardware, HTTP parameters, exact names, and no-signal retain their expected outcomes.");
+
 // Separate support-coverage diagnostic: reviewed tags, not generated-model quality.
 const contextualCatalog: Skill[] = [
 	{ name: "database-migration", description: "PostgreSQL schema migration.", location: "/synthetic/db/SKILL.md" },

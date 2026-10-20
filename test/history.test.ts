@@ -52,6 +52,48 @@ test("deduplication is monotonic and remains able to compact newly appended dupl
 	assert.equal(third.resolve(third.artifacts[0].id)?.text, text);
 });
 
+test("history references stay within the bounded artifact admission budget", () => {
+	const inputs: HistoryToolResult[] = [];
+	for (let index = 0; index < 129; index++) {
+		const text = large(`distinct result ${index} `);
+		inputs.push({ content: text }, { content: text });
+	}
+	const result = deduplicateToolResultHistory(inputs, { minBytes: 0, maxArtifacts: 128 });
+	assert.equal(result.duplicates, 128);
+	assert.equal(result.artifacts.length, 128);
+	assert.equal(result.next[256], inputs[256]);
+	assert.equal(result.next[257], inputs[257]);
+	for (const item of result.next) {
+		if (typeof item.content !== "string" || !item.content.includes("same-as=htr:")) continue;
+		const id = item.content.match(/same-as=(htr:[A-Za-z0-9_-]{43})/)?.[1];
+		assert.ok(id, "reference should contain a valid htr handle");
+		assert.ok(result.resolve(id), `emitted reference ${id} must resolve in this view`);
+	}
+});
+
+test("repeated contexts reuse admitted handles without evicting them or admitting past the cap", () => {
+	const firstText = large("retained result ");
+	const secondText = large("new result ");
+	const first = deduplicateToolResultHistory(
+		[{ content: firstText }, { content: firstText }, { content: firstText }],
+		{ minBytes: 0, maxArtifacts: 1 },
+	);
+	assert.equal(first.duplicates, 2, "one admitted handle can be reused for every duplicate in the same pass");
+	assert.equal(first.artifacts.length, 1);
+	const retainedIds = new Set(first.artifacts.map((artifact) => artifact.id));
+	const repeatedContext = [...first.next, { content: secondText }, { content: secondText }];
+	const second = deduplicateToolResultHistory(repeatedContext, {
+		minBytes: 0,
+		maxArtifacts: 1,
+		retainedIds,
+	});
+	assert.equal(second.duplicates, 0, "a new artifact should remain literal after the cap is full");
+	assert.equal(second.next, repeatedContext);
+	assert.equal(second.next[1]?.content, first.next[1]?.content, "the existing reference remains unchanged");
+	assert.equal(second.next[2]?.content, first.next[2]?.content, "repeated references to the admitted handle remain unchanged");
+	assert.equal(first.resolve(first.artifacts[0]!.id)?.text, firstText, "the admitted handle remains resolvable");
+});
+
 test("never changes errors, protected evidence, images, mixed content, or small results", () => {
 	const error = large("fatal failure ");
 	const explicitError = large("plain but marked ");

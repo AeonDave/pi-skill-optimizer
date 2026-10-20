@@ -19,7 +19,7 @@ const TIMEOUT_MS = 30_000;
 function packageRootFromArgs(): string {
 	const argument = process.argv[2] ?? process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
 	if (!argument) {
-		throw new Error("Usage: node --import tsx scripts/black-box-smoke.ts <absolute-unpacked-package-root>");
+		throw new Error("Usage: node --import tsx scripts/black-box-smoke.ts <absolute-unpacked-package-root> [expected-pi-version]");
 	}
 	if (!isAbsolute(argument)) throw new Error("Package root must be an absolute path.");
 	const root = realpathSync(argument);
@@ -140,7 +140,11 @@ async function main(): Promise<void> {
 	const packageRoot = packageRootFromArgs();
 	const piCommand = resolvePiCommand();
 	const piVersion = execFileSync(piCommand.command, [...piCommand.prefixArgs, "--version"], { encoding: "utf8" }).trim();
-	assert.equal(piVersion, "1.0.0", `black-box smoke requires Pi 1.0.0, found ${piVersion}`);
+	const developmentManifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as Json;
+	const expectedPiVersion = process.argv[3]
+		?? developmentManifest.devDependencies["@earendil-works/pi-coding-agent"].replace(/^\^/, "");
+	assert.match(expectedPiVersion, /^\d+\.\d+\.\d+$/, "expected Pi version must be an exact release");
+	assert.equal(piVersion, expectedPiVersion, `black-box smoke requires Pi ${expectedPiVersion}, found ${piVersion}`);
 	const tempRoot = mkdtempSync(join(tmpdir(), "sko-blackbox-"));
 	const agentDir = join(tempRoot, "agent");
 	const workDir = join(tempRoot, "work");

@@ -2,7 +2,28 @@
 
 All notable changes are documented here.
 
-## Unreleased
+## 3.1.3 - 2026-10-20
+
+### Added
+
+- Add explicit init v6 semantic skill cards from a shared 38-tag vocabulary, including `discipline` for execution habits and `other` for unsupported topics that need inspection. When current catalog metadata exists, the prompt uses a bounded tag directory and lets the main model choose whether to browse paginated cards; tag filters define the bucket and an optional text query only orders within it. Exact loading remains explicit. Existing profiles stay on the compatible name/intent index and lexical prefetch path until the user runs init.
+
+### Fixed
+
+- Preserve nested codemode tool results byte-for-byte instead of replacing programmatic JSON with reduced text; do not count those results as output savings.
+- Honor external tool-set changes, including pi-persona restrictions, rather than restoring old tools or optimizer helpers. Declare the tool resolver's transitive reach for Pi 1.3.
+- Keep all emitted history recovery handles resolvable within the 128-artifact session bound; leave new duplicate payloads unchanged when full.
+- Preserve prototype-colliding skill names such as `constructor`, `toString` and `__proto__` through profile ranking, hashes and usage records.
+- Measure init batches from the exact serialized skill JSON, including escaping and framing.
+- Recover invalid init responses with precise validation feedback, initial batches of at most 20 full skill descriptions, and bounded subdivision after retries fail. Keep strict card validation and checkpoint each valid group. Stop all batches on cancellation or terminal quota errors, and label partial completion as `init incomplete` with an explicit retry command.
+- Keep init visible with a live panel above the editor, including with themes that hide the footer. Show committed percentage, catalog coverage, batch/attempt, model, elapsed time and streamed activity. Add `/skill-optimizer cancel`, prevent overlapping session jobs, and stop timers/provider work on session teardown without late saves.
+- Preserve still-valid profile hints across repeated failed catalog migrations; known unchanged source identities remain retryable until their semantic cards are complete.
+- Publish complete lock owner records atomically. Remove unsafe automatic stale-lock deletion; timeouts now explain manual recovery after confirming no writer is active.
+
+### Changed
+
+- Align development host dependencies and integration checks with Pi 1.3.0 while retaining the Pi 1.0.0 runtime floor.
+- Let packed-artifact smoke checks target an explicit Pi version; default to the development host version.
 
 ## 3.1.2 - 2026-10-13
 
