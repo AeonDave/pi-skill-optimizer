@@ -316,7 +316,10 @@ function rejectedCardReason(name: string, card: Record<string, unknown>): string
 	if (!Array.isArray(card.tags)) return `${owner} tags must be an array of 1-3 distinct canonical IDs`;
 	if (card.tags.length < 1 || card.tags.length > 3) return `${owner} tags must contain 1-3 distinct canonical IDs`;
 	if (!card.tags.every((tag): tag is string => typeof tag === "string")) return `${owner} tags must contain only string canonical IDs`;
-	if (card.tags.some((tag) => !VALIDATION_TAG_IDS.has(tag))) return `${owner} tags contain an unknown ID; use the fixed catalog vocabulary`;
+	if (card.tags.some((tag) => !VALIDATION_TAG_IDS.has(tag))) {
+		const unknown = card.tags.filter((tag) => !VALIDATION_TAG_IDS.has(tag)).join(", ");
+		return `${owner} tags contain unknown IDs (${unknown}); use the fixed catalog vocabulary`;
+	}
 	if (new Set(card.tags).size !== card.tags.length) return `${owner} tags contain duplicate IDs`;
 	return `${owner} violates the semantic catalog schema`;
 }

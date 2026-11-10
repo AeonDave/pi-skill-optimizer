@@ -8,6 +8,9 @@ import { EMPTY_PROFILE } from "../src/profile.ts";
 
 const bytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), "utf8");
 const workTurns = 8;
+/** A bucket of this size must be answerable from one response (cards + names). */
+const NAME_COMPLETE_BUCKET = 73;
+const DEEP_PAGES = 5;
 const instructions = "# Fixture skill\nKeep the public API unchanged. Verify deterministic behavior.\r\n";
 
 function fixture(count: number) {
@@ -59,16 +62,36 @@ for (const count of [355, 2_000, 10_000]) {
   assert.ok(current.removedChars > old.removedChars, "directory must beat the old initial serialized request");
   assert.ok(current.next.system.length <= 4_000);
   assert.equal(current.addedPrefetchChars, 0);
-  const page = browser.browse({ tags: ["architecture"] });
+  // Follow real cursors: a continuation replay measures what a model actually receives.
+  const browsePages = (() => {
+    const pages: ReturnType<typeof browser.browse>[] = [];
+    let cursor: string | undefined;
+    do {
+      const next = browser.browse({ tags: ["architecture"], pageSize: 50, cursor });
+      pages.push(next);
+      cursor = next.nextCursor;
+    } while (cursor && pages.length < DEEP_PAGES);
+    return pages;
+  })();
+  const page = browsePages[0]!;
   assert.ok(page.items.some((item) => item.name === "example-00000"), "crosscutting methods are directly browsable");
   assert.ok(bytes(page) <= 3_000, "ASCII fixture page must fit complete response cap");
+  assert.ok(!("version" in page) && !("fingerprint" in page), "the browse envelope carries no catalog identity");
+  assert.ok(page.facets !== undefined, "facets ship with the first page");
+  assert.ok(browsePages.slice(1).every((next) => next.facets === undefined && next.rest === undefined), "continuations stay minimal");
+  // Names-only remainder gate: a typical bucket names every candidate on its first page,
+  // so one response is enough to choose; larger buckets keep paging (and the cursor).
+  const firstNames = new Set([...page.items.map(({ name }) => name), ...(page.rest ?? [])]);
+  const nameCompleteFirstResponse = page.total <= NAME_COMPLETE_BUCKET && firstNames.size === page.total;
+  assert.ok(page.total > NAME_COMPLETE_BUCKET || nameCompleteFirstResponse, `bucket of ${page.total} cards must be name-complete on its first page`);
+  assert.ok(page.items.length >= 3, "rest only ships beside three complete cards");
   const nativeReplay = replay(payload.system, []);
   // Keep the old prefetch in every historical request, so it isn't silently omitted from accounting.
   const oldOverlay = old.next.messages[0]!.content.slice(payload.messages[0]!.content.length);
   const oldReplay = replay(old.next.system, [], oldOverlay);
   const newReplay = replay(current.next.system, [page]);
   assert.ok(newReplay.bytes < oldReplay.bytes, "one browse plus load must still save across eight work requests");
-  const deepReplay = replay(current.next.system, Array.from({ length: 5 }, () => page));
+  const deepReplay = replay(current.next.system, browsePages);
   const samples: number[] = [];
   for (let index = 0; index < 10; index++) {
     const started = performance.now(); optimizePayload(payload, config); samples.push(performance.now() - started);
@@ -87,5 +110,5 @@ for (const count of [355, 2_000, 10_000]) {
   } while (cursor);
   assert.equal(seen.size, count);
   const mean = samples.reduce((sum, value) => sum + value, 0) / samples.length;
-  console.log(JSON.stringify({ skills: count, initialBytes: { native: bytes(payload), previous: bytes(old.next), tags: bytes(current.next) }, directoryChars: current.next.system.length, pageBytes: bytes(page), completeCoverage: `${seen.size}/${count}`, enumerationPages: pages, preparationMs: { snapshot: +snapshotMs.toFixed(2), cold: +coldMs.toFixed(2), warmMean: +mean.toFixed(2) }, replay: { workRequests: workTurns, native: nativeReplay, previous: oldReplay, oneBrowse: newReplay, fiveBrowses: deepReplay }, cumulativeSavingVsPrevious: `${((1 - newReplay.bytes / oldReplay.bytes) * 100).toFixed(1)}%` }));
+  console.log(JSON.stringify({ skills: count, initialBytes: { native: bytes(payload), previous: bytes(old.next), tags: bytes(current.next) }, directoryChars: current.next.system.length, browsePage: { bytes: bytes(page), items: page.items.length, rest: page.rest?.length ?? 0, nameCompleteFirstResponse, cursorChars: page.nextCursor?.length ?? 0 }, completeCoverage: `${seen.size}/${count}`, enumerationPages: pages, preparationMs: { snapshot: +snapshotMs.toFixed(2), cold: +coldMs.toFixed(2), warmMean: +mean.toFixed(2) }, replay: { workRequests: workTurns, native: nativeReplay, previous: oldReplay, oneBrowse: newReplay, fiveBrowses: deepReplay }, cumulativeSavingVsPrevious: `${((1 - newReplay.bytes / oldReplay.bytes) * 100).toFixed(1)}%` }));
 }

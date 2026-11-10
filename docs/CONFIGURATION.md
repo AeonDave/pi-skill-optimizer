@@ -15,7 +15,7 @@ pi install npm:@aeondave/pi-skill-optimizer
 | Need | Command |
 | --- | --- |
 | Install only in this project | `pi install -l npm:@aeondave/pi-skill-optimizer` |
-| Pin version 3.1.3 | `pi install npm:@aeondave/pi-skill-optimizer@3.1.3` |
+| Pin version 3.2.0 | `pi install npm:@aeondave/pi-skill-optimizer@3.2.0` |
 | Update an unpinned install | `pi update npm:@aeondave/pi-skill-optimizer` |
 
 Restart Pi after installing or updating, then run `/skill-optimizer` to inspect
@@ -219,8 +219,16 @@ in `critical` and configured `alwaysSkills` remain stable hints only. The model 
 choose tags and browse using `skill_search` (`match: "any"` or `"all"`); each full
 JSON page is capped at 3,000 characters, so it may return fewer than the requested
 page size. When tags are supplied, they define the complete result bucket and a
-free-text `query` only orders within it; lexical mismatch must not veto candidates.
-With no tags, `query` retains the existing lexical filtering and BM25F ranking.
+free-text `query` only orders within it, plus the explicit off-bucket rescue tail
+described below; lexical mismatch must not veto candidates.
+With no tags, `query` retains the existing lexical filtering and BM25F ranking,
+and no lexical signal returns `total: 0` rather than a fabricated order. The
+browser itself never matches text: it only consumes the ranker's `orderedNames`,
+so a raw catalog browse (non-empty `query`, no `orderedNames`) returns the
+**complete catalog in canonical order**. That full-browse contract is
+deliberate: without a supplied ranking the browser can neither narrow the
+catalog nor invent a rank. The wired `skill_search` path always supplies that
+BM25F order, so it still abstains on no signal.
 If a persona or host policy withholds `skill_search`, the optimizer preserves
 Pi's native skill catalog instead of force-enabling its tool.
 

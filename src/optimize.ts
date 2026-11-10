@@ -1,4 +1,5 @@
 import {
+  AUTO_MARKER,
   planSkillPrefetch,
   inspectStableSkillCatalog,
   renderStableSkillCatalog,
@@ -40,10 +41,56 @@ export interface OptimizeConfig {
   skillSources?: readonly { name: string; description: string; location?: string }[];
   /** Private immutable host snapshot prepared outside provider hot hooks. */
   catalogSnapshot?: ReturnType<typeof createSkillCatalogBrowser>;
+  /**
+   * Decayed usage names captured once per session by the host. Receipt metadata only:
+   * catalog mode appends them after the directory and drops them before it.
+   */
+  recentSkills?: readonly string[];
 }
 
 export interface OptimizeBudget extends SkillCatalogBudget {
   catalogs: number;
+}
+
+/**
+ * Why the native `<available_skills>` catalog survived a request. Every value
+ * comes from an existing guard in `optimizePayload`; none of them relaxes it.
+ */
+export type CatalogFallbackReason =
+  | "no-catalog-profile"
+  | "no-native-catalog"
+  | "resolver-unavailable"
+  | "extension-catalog-unregistered"
+  | "registry-mismatch"
+  | "directory-overflow"
+  | "render-failed"
+  | "quarantined-source"
+  | "not-smaller";
+
+/** Non-default substitutions: the small-catalog all-name index replaces the tag directory. */
+export type CatalogReplacementReason = "small-catalog-index";
+
+/** What this pass actually did to the request's skill catalog. */
+export interface CatalogOutcome {
+  mode: "replaced" | "native";
+  reason?: CatalogFallbackReason | CatalogReplacementReason;
+}
+
+export const RECENT_SKILL_HINT_LIMIT = 8;
+
+/**
+ * Frozen usage receipt for catalog mode: names already loaded here, never a ranking
+ * signal. Filtered to the eligible catalog so it can never advertise an unloadable name.
+ */
+function recentSkillHint(
+  names: readonly string[] | undefined,
+  eligible: ReadonlySet<string>,
+): string {
+  const picked = uniqueInOrder((names ?? [])
+    .filter((name) => typeof name === "string" && eligible.has(name)))
+    .slice(0, RECENT_SKILL_HINT_LIMIT);
+  if (picked.length === 0) return "";
+  return `\nRecently loaded here (usage metadata, not a recommendation): ${JSON.stringify(picked).replace(/</g, "\\u003c")}`;
 }
 
 export interface OptimizeResult<T> {
@@ -55,6 +102,7 @@ export interface OptimizeResult<T> {
   catalogNames: string[];
   fingerprints: string[];
   budget: OptimizeBudget;
+  catalogOutcome: CatalogOutcome;
 }
 
 type SkillCatalogBudget = ReturnType<typeof renderStableSkillCatalog>["budget"];
@@ -257,7 +305,7 @@ export function optimizePayload<T>(
   payload: T,
   config: OptimizeConfig,
 ): OptimizeResult<T> {
-  if (!isRecord(payload) || config.resolverAvailable === false) {
+  if (!isRecord(payload)) {
     return {
       next: payload,
       removedChars: 0,
@@ -267,6 +315,20 @@ export function optimizePayload<T>(
       catalogNames: [],
       fingerprints: [],
       budget: emptyBudget(config),
+      catalogOutcome: { mode: "native", reason: "no-native-catalog" },
+    };
+  }
+  if (config.resolverAvailable === false) {
+    return {
+      next: payload,
+      removedChars: 0,
+      baseRemovedChars: 0,
+      addedPrefetchChars: 0,
+      selected: [],
+      catalogNames: [],
+      fingerprints: [],
+      budget: emptyBudget(config),
+      catalogOutcome: { mode: "native", reason: "resolver-unavailable" },
     };
   }
 
@@ -282,6 +344,19 @@ export function optimizePayload<T>(
   const budget = emptyBudget(config);
   let baseRemovedChars = 0;
   const catalogFloors: number[] = [];
+  // Honest status contract: report the guard that actually kept the native catalog.
+  let catalogOutcome: CatalogOutcome = tagMetadata
+    ? { mode: "native", reason: "no-native-catalog" }
+    : { mode: "native", reason: "no-catalog-profile" };
+  const noteReplaced = (reason?: CatalogReplacementReason): void => {
+    catalogOutcome = reason ? { mode: "replaced", reason } : { mode: "replaced" };
+  };
+  const noteFallback = (reason: CatalogFallbackReason): void => {
+    // A substitution that did happen stays reported; one guarded block does not
+    // rewrite the whole request's outcome.
+    if (catalogOutcome.mode === "replaced") return;
+    catalogOutcome = { mode: "native", reason };
+  };
   const inspect = (text: string): string => {
     if (tagMetadata) return text;
     const preview = inspectStableSkillCatalog(text, {
@@ -310,17 +385,26 @@ export function optimizePayload<T>(
     if (tagMetadata) {
       const excluded = new Set(config.excludeSkills ?? []);
       return text.replace(/<available_skills\b[^>]*>([\s\S]*?)<\/available_skills>/gi, (block: string, inner: string) => {
+        // This pass already replaced the block (tag directory or stable index): a second
+        // pass is an identity operation, never a registry-mismatch report against our own output.
+        if (inner.includes(AUTO_MARKER)) return block;
         const parsed = parseSkills(inner).filter((skill) => !excluded.has(skill.name));
         // Do not replace an extension-supplied catalog with a resolver that cannot load its entries.
+        if (originalSkills && parsed.some((skill) => !originalSkills.has(skill.name))) {
+          noteFallback("extension-catalog-unregistered");
+          return block;
+        }
         if (originalSkills && parsed.some((skill) => {
-          const registered = originalSkills.get(skill.name);
-          return !registered || registered.description.trim() !== skill.description
+          const registered = originalSkills.get(skill.name)!;
+          return registered.description.trim() !== skill.description
             || (!!registered.location && (!skill.location || !sameSourceLocation(registered.location, skill.location)));
-        })) return block;
+        })) {
+          noteFallback("registry-mismatch");
+          return block;
+        }
         const skills = parsed
           .map((skill) => originalSkills?.get(skill.name) ?? skill);
         if (skills.length === 0) return block;
-        // A second pass sees a directory, not XML skill entries, and is an identity operation.
         const limit = Math.min(4_000, config.catalogBudgetChars);
         const eligibleNames = new Set(skills.map((skill) => skill.name));
         const priority = uniqueInOrder([...(config.profile?.critical ?? []), ...(config.alwaysSkills ?? [])])
@@ -328,20 +412,84 @@ export function optimizePayload<T>(
         const priorityText = priority.length > 0
           ? `\nConfigured/universal skill names (metadata, not loaded): ${JSON.stringify(priority).replace(/</g, "\\u003c")}\nLoad relevant full instructions by exact name; no catalog acknowledgment is needed.`
           : "";
-        let directory: ReturnType<typeof renderTagDirectory>;
-        try {
+        // Session-frozen usage hints are receipt metadata, not discovery: they are the
+        // first thing dropped when the complete directory does not fit beside them.
+        let hintText = recentSkillHint(config.recentSkills, eligibleNames);
+        const renderWithin = (): ReturnType<typeof renderTagDirectory> => {
+          const directoryBudget = limit - priorityText.length - hintText.length;
           const snapshot = config.catalogSnapshot;
           const sameCatalog = snapshot?.prepared.total === skills.length
             && snapshot.prepared.skills.every((skill) => eligibleNames.has(skill.name));
-          directory = sameCatalog ? snapshot!.renderDirectory(limit - priorityText.length)
-            : renderTagDirectory(skills, tagMetadata, limit - priorityText.length);
+          return sameCatalog ? snapshot!.renderDirectory(directoryBudget)
+            : renderTagDirectory(skills, tagMetadata, directoryBudget);
+        };
+        let directory: ReturnType<typeof renderTagDirectory> | undefined;
+        let failure: unknown;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            directory = renderWithin();
+            break;
+          }
+          catch (error) {
+            failure = error;
+            if (attempt === 0 && error instanceof RangeError && hintText.length > 0) {
+              hintText = "";
+              continue;
+            }
+            break;
+          }
         }
-        catch (error) {
-          if (error instanceof RangeError) return block; // Preserve native discovery if the complete directory cannot fit.
-          throw error;
+        if (!directory) {
+          // Preserve native discovery when the complete directory cannot fit or a
+          // catalog invariant rejects it. Defense in depth: a malformed-catalog
+          // TypeError is a rendering failure here, never a reason to break the request.
+          if (failure instanceof RangeError) {
+            noteFallback("directory-overflow");
+            return block;
+          }
+          if (failure instanceof TypeError) {
+            noteFallback("render-failed");
+            return block;
+          }
+          throw failure;
         }
-        const text = directory.text + priorityText;
-        if (text.length >= block.length) return block;
+        // Quarantined sources are not represented in the directory, so replacing the
+        // native block would silently hide them. Keep native discovery in that case.
+        if (directory.quarantined > 0) {
+          noteFallback("quarantined-source");
+          return block;
+        }
+        // Everything the substitution says before any receipt overlay.
+        let text = directory.text + priorityText;
+        let replacedReason: CatalogReplacementReason | undefined;
+        let intentCount = 0;
+        // Small catalogs: when the complete all-name index fits inside the directory's
+        // own length, naming every eligible skill beats a tag-only directory at no extra
+        // cost. The guard reads the directory, never the overlays, so usage evidence
+        // cannot change which substitution a session uses.
+        const stableFloor = inspectStableSkillCatalog(block, {
+          never: config.excludeSkills,
+          intentMaxChars: config.intentMaxChars,
+        }).floorChars;
+        if (stableFloor > 0 && stableFloor <= text.length) {
+          const index = renderStableSkillCatalog(block, {
+            never: config.excludeSkills,
+            intentMaxChars: config.intentMaxChars,
+            budgetChars: text.length - priorityText.length,
+          });
+          const indexed = index.text + priorityText;
+          if (index.skills.length > 0 && indexed.length <= text.length) {
+            text = indexed;
+            replacedReason = "small-catalog-index";
+            intentCount = index.budget.intentCount;
+          }
+        }
+        text += hintText;
+        if (text.length >= block.length) {
+          noteFallback("not-smaller");
+          return block;
+        }
+        noteReplaced(replacedReason);
         baseRemovedChars += block.length - text.length;
         catalogNames.push(...skills.map((skill) => skill.name));
         fingerprints.push(directory.fingerprint);
@@ -349,7 +497,7 @@ export function optimizePayload<T>(
           requestedChars: config.catalogBudgetChars,
           usedChars: text.length,
           floorChars: text.length,
-          intentCount: 0,
+          intentCount,
           nameOnlyCount: 0,
           overBudgetChars: 0,
         });
@@ -363,6 +511,7 @@ export function optimizePayload<T>(
       budgetChars: floorChars + remainingIntentBudget,
     });
     if (result.skills.length === 0) return text;
+    if (result.text !== text) noteReplaced();
 
     catalogIndex += 1;
     remainingIntentBudget = Math.max(
@@ -427,6 +576,7 @@ export function optimizePayload<T>(
       catalogNames: uniqueInOrder(catalogNames),
       fingerprints: uniqueInOrder(fingerprints),
       budget,
+      catalogOutcome,
     };
   }
 
@@ -478,6 +628,11 @@ export function optimizePayload<T>(
       catalogNames: uniqueInOrder(catalogNames),
       fingerprints: uniqueInOrder(fingerprints),
       budget,
+      // The whole payload was rejected as never-worse, so the request keeps the
+      // native catalog even if one section was replaced during the pass.
+      catalogOutcome: catalogOutcome.mode === "replaced"
+        ? { mode: "native", reason: "not-smaller" }
+        : catalogOutcome,
     };
   }
 
@@ -490,5 +645,6 @@ export function optimizePayload<T>(
     catalogNames: uniqueInOrder(catalogNames),
     fingerprints: uniqueInOrder(fingerprints),
     budget,
+    catalogOutcome,
   };
 }

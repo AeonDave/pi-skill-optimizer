@@ -205,3 +205,87 @@ test("buildUsagePrior is deterministic and can discard negligible evidence", () 
 	assert.deepEqual(Object.keys(buildUsagePrior(stats, { now: 1 })), ["alpha", "beta"]);
 	assert.deepEqual(buildUsagePrior(stats, { now: 365 * 86_400_000, minimumScore: 0.01 }), {});
 });
+
+test("usage evidence rejects every shared injected-context prefix, not only context-mode", async () => {
+	const { INJECTED_CONTEXT_PREFIXES } = await import("../src/request.ts");
+	assert.equal(INJECTED_CONTEXT_PREFIXES.length, 5);
+	const messages: Array<Record<string, unknown>> = [];
+	for (const prefix of INJECTED_CONTEXT_PREFIXES) {
+		messages.push({ id: `injected-${prefix}`, role: "user", content: `${prefix} /skill:alpha` });
+	}
+	messages.push({ id: "human", role: "user", content: "use /skill:alpha" });
+
+	const evidence = collectSkillUsageEvidence({ messages }, ["alpha"]);
+	assert.deepEqual(evidence.map((entry) => entry.key), ["user:id:human:alpha"]);
+	assert.deepEqual(evidence.map((entry) => entry.name), ["alpha"]);
+
+	// Each persona/clock block alone must stay invisible to usage evidence.
+	for (const message of messages.slice(0, -1)) {
+		assert.deepEqual(
+			collectSkillUsageEvidence({ messages: [message] }, ["alpha"]),
+			[],
+			`injected block must not become evidence: ${String(message.content)}`,
+		);
+	}
+	// A control proves the fixture is not vacuous.
+	assert.deepEqual(
+		collectSkillUsageEvidence({ messages: [{ id: "human", role: "user", content: "use /skill:alpha" }] }, ["alpha"])
+			.map((entry) => entry.name),
+		["alpha"],
+	);
+});
+
+test("token mention scan is exactly equivalent to the boundary matcher", () => {
+	const boundary = (name: string): RegExp => {
+		const escaped = name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+		return new RegExp(`(^|[^a-z0-9:_-])(?:/skill:|/)?${escaped}($|[^a-z0-9:_-])`);
+	};
+	const skills = ["alpha", "beta", "skill:alpha", "c++", "digital", "a b"];
+	const texts = [
+		"use /skill:alpha",
+		"/skill:alpha",
+		"//skill:alpha",
+		"x/skill:alpha",
+		"x /skill:alpha",
+		"skill:alpha",
+		"x skill:alpha",
+		"fooskill:alpha",
+		"alpha",
+		"alphabeta",
+		"beta alpha",
+		"use alpha.",
+		"alpha_",
+		"beta_alpha",
+		"ALPHA",
+		"digit alpha",
+		"use c++ and stay",
+		"c++",
+		"xc++",
+		"an a b here",
+		"an ab here",
+		"",
+	];
+	for (const text of texts) {
+		const expected = skills.filter((name) => boundary(name).test(text.toLowerCase())).sort();
+		const actual = collectSkillUsageEvidence({ messages: [{ id: "m", role: "user", content: text }] }, skills)
+			.map((entry) => entry.name)
+			.sort();
+		assert.deepEqual(actual, expected, `mention parity failed for ${JSON.stringify(text)}`);
+	}
+});
+
+test("user-message evidence scan is bounded to the most recent window", async () => {
+	const { MAX_USAGE_SCAN_MESSAGES } = await import("../src/usage.ts");
+	assert.ok(MAX_USAGE_SCAN_MESSAGES > 0 && MAX_USAGE_SCAN_MESSAGES < 1_000);
+	const total = MAX_USAGE_SCAN_MESSAGES + 40;
+	const messages = Array.from({ length: total }, (_, index) => ({
+		id: `user-${index}`,
+		role: "user",
+		content: "use /skill:alpha",
+	}));
+	const keys = collectSkillUsageEvidence({ messages }, ["alpha"]).map((entry) => entry.key);
+	assert.equal(keys.length, MAX_USAGE_SCAN_MESSAGES);
+	assert.ok(!keys.includes("user:id:user-0:alpha"), "the oldest turns fall outside the window");
+	assert.ok(keys.includes(`user:id:user-${total - 1}:alpha`), "the newest turns stay visible");
+	assert.equal(new Set(keys).size, keys.length);
+});

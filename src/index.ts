@@ -39,7 +39,7 @@ import { buildInitProfileWrites, needsProfileScopeRepair } from "./init-profile.
 import { INIT_PROFILE_PROMPT, INIT_PROFILE_VERSION } from "./init-prompt.ts";
 import { createInitProgress, type InitProgress } from "./init-progress.ts";
 import { runInitBatch } from "./init-worker.ts";
-import { optimizePayload } from "./optimize.ts";
+import { optimizePayload, RECENT_SKILL_HINT_LIMIT, type CatalogOutcome, type OptimizeConfig } from "./optimize.ts";
 import {
 	buildExtractPrompt,
 	hasMinimumSavings,
@@ -114,6 +114,11 @@ const FLUSH_INTERVAL_MS = 15_000;
 const LOAD_RETRY_MS = 1_000;
 const MAX_SEEN_EVIDENCE = 4_096;
 const MAX_HISTORY_ARTIFACTS = 128;
+// All-name index floor: wrapper lines plus one "name\n" row per eligible skill.
+const INIT_INDEX_FLOOR_BASE_CHARS = 170;
+// Above this floor the init nudge quantifies what the index actually costs.
+const INIT_NOTICE_FLOOR_CHARS = 3_500;
+const INIT_NOTICE = "Optional setup: run `/skill-optimizer init` to improve skill matching (may incur model costs).";
 const PROTECTED_RUNTIME_TOOLS = ["skill_search", "optimizer_tool_search", "retrieve_output"] as const;
 const RESOLVER_RESULT_TOOLS = new Set<string>([...PROTECTED_RUNTIME_TOOLS, "tool_search"]);
 
@@ -342,6 +347,19 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	let lastSelected: string[] = [];
 	let lastRemovedChars = 0;
 	let lastBudget = { usedChars: 0, requestedChars: 0, nameOnlyCount: 0 };
+	let lastCatalogOutcome: CatalogOutcome | undefined;
+	// A pass that saw no native catalog made no decision; it must not overwrite the
+	// decision taken for the same request by the other pass.
+	const catalogOutcomeIsDecisive = (outcome: CatalogOutcome): boolean =>
+		outcome.mode === "replaced" || outcome.reason !== "no-native-catalog";
+	const recordCatalogOutcome = (outcome: CatalogOutcome, newRequest: boolean): void => {
+		if (newRequest || catalogOutcomeIsDecisive(outcome)) lastCatalogOutcome = outcome;
+	};
+	const catalogOutcomeSummary = (outcome: CatalogOutcome | undefined): string => {
+		if (!outcome) return "none yet";
+		if (outcome.mode === "replaced") return outcome.reason ? `replaced (${outcome.reason})` : "replaced";
+		return `native kept (${outcome.reason ?? "unreported"})`;
+	};
 	let rtkPresence: boolean | undefined;
 	let hasStatus = false;
 	let lastStatusText: string | undefined;
@@ -350,6 +368,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	const seenProviderMessages = new Set<string>();
 	const historyArtifacts = new Map<string, HistoryArtifact>();
 	const shownInitNoticeKeys = new Set<string>();
+	// Session-frozen usage names: captured once so an in-session load cannot rewrite the
+	// stable catalog bytes. Undefined means "not captured in this session yet".
+	let frozenUsageHints: string[] | undefined;
 	const getCatalogBrowser = (state: RuntimeSnapshot): ReturnType<typeof createSkillCatalogBrowser> => {
 		if (!registry) throw new Error("Skill registry is not initialized.");
 		const exclusions = JSON.stringify(state.config.excludeSkills);
@@ -360,6 +381,32 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		catalogBrowserCache = { registry, profile: state.profile, exclusions, browser };
 		return browser;
 	};
+	// Decayed usage top names, filtered to loadable catalog entries, frozen on first use.
+	const recentSkillHints = (state: RuntimeSnapshot): string[] => {
+		if (frozenUsageHints) return frozenUsageHints;
+		if (!registryReady || !registry) return [];
+		const eligible = new Set(registry.skills.map((skill) => skill.name));
+		const excluded = new Set(state.config.excludeSkills);
+		frozenUsageHints = Object.keys(buildUsagePrior(state.usage, {
+			halfLifeDays: state.config.usageHalfLifeDays,
+		}))
+			.filter((name) => eligible.has(name) && !excluded.has(name))
+			.slice(0, RECENT_SKILL_HINT_LIMIT);
+		return frozenUsageHints;
+	};
+	// One optimize configuration for the section-level and payload-level passes so both
+	// apply the same capability, source and budget guards.
+	const optimizeConfig = (state: RuntimeSnapshot): OptimizeConfig => ({
+		...state.config,
+		profile: state.profile,
+		resolverAvailable: registryReady && pi.getActiveTools().includes("skill_search"),
+		skillSources: registrySources,
+		catalogSnapshot: registryReady && state.profile.catalog && registry ? getCatalogBrowser(state) : undefined,
+		usagePrior: buildUsagePrior(state.usage, {
+			halfLifeDays: state.config.usageHalfLifeDays,
+		}),
+		recentSkills: recentSkillHints(state),
+	});
 
 	let sessionSaved: SavingsByArea = { ...EMPTY_SAVINGS };
 	let sessionExtraction: ExtractionTelemetry = { ...EMPTY_EXTRACTION_TELEMETRY };
@@ -395,6 +442,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		if (notify) ctx.ui.notify(message, type);
 		setSessionStatus(ctx, message);
 		if (activeInit?.ctx === ctx) activeInit.progress?.report(message);
+		// Headless runs have no UI; this env hook keeps init failures diagnosable in -p / rpc sessions.
+		if (process.env.PI_SKILL_OPTIMIZER_DEBUG_PROGRESS) console.error(`[skill-optimizer:${type}] ${message}`);
 	};
 
 	const stateFallback = (ctx: ExtensionContext, config: ConfigRecord): RuntimeSnapshot => {
@@ -500,13 +549,20 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const key = buildInitNoticeKey(state.profileKey, INIT_VERSION, status);
 		if (shownInitNoticeKeys.has(key)) return;
 		shownInitNoticeKeys.add(key);
+		// Estimate the all-name floor arithmetically: no file reads on this hook.
+		const floorEstimate = skills.reduce(
+			(sum, skill) => sum + skill.name.length + 1,
+			INIT_INDEX_FLOOR_BASE_CHARS,
+		);
 		try {
 			pi.appendEntry(INIT_READINESS_ENTRY_TYPE, { schema: 1, key });
 		} catch {
 			// The notice is useful even when session metadata cannot be persisted.
 		}
 		try {
-			ctx.ui.notify("Optional setup: run `/skill-optimizer init` to improve skill matching (may incur model costs).", "info");
+			ctx.ui.notify(floorEstimate > INIT_NOTICE_FLOOR_CHARS
+				? `Optional setup: run \`/skill-optimizer init\` — the ${skills.length}-name skill index is at least ~${floorEstimate} chars in every request; init replaces it with a ~3k-char tag directory (one-time model cost).`
+				: INIT_NOTICE, "info");
 		} catch {
 			// UI notification is cosmetic only.
 		}
@@ -589,7 +645,10 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const denominator = sessionCache.input + sessionCache.cacheRead + sessionCache.cacheWrite;
 		const cache = denominator > 0 ? `${Math.round(sessionCache.cacheRead * 100 / denominator)}% cache` : "cache n/a";
 		const saved = totalSavings(sessionSaved);
-		setSessionStatus(ctx, `AUTO | -${approxK(saved)} tok | ${cache}`);
+		const catalog = lastCatalogOutcome
+			? ` | catalog ${lastCatalogOutcome.mode === "replaced" ? "replaced" : `native (${lastCatalogOutcome.reason ?? "unreported"})`}`
+			: "";
+		setSessionStatus(ctx, `AUTO | -${approxK(saved)} tok | ${cache}${catalog}`);
 	};
 
 	const storeHistoryArtifact = (artifact: HistoryArtifact): void => {
@@ -742,12 +801,12 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				if (state.profile.catalog || params.tags !== undefined || !params.query?.trim()) {
 					// Text search is an explicit recovery route. Tag selection stays with the LLM.
 					// Rank over full source descriptions, then let catalog pagination enforce its byte-stable order.
-					let orderedNames = params.query?.trim() ? rankedSkillNames(registry, params.query, state) : undefined;
-					if (orderedNames && params.tags?.length) {
-						// Correct semantic tags must not disappear merely because the user's language
-						// shares no tokens with English descriptions. With tags, query orders; it never vetoes.
-						orderedNames = [...new Set([...orderedNames, ...registry.skills.map((skill) => skill.name)])];
-					}
+					// Correct semantic tags must not disappear merely because the user's language
+					// shares no tokens with English descriptions: catalog browse keeps the selected
+					// bucket complete and appends these matches as a rescue tail. Passing the
+					// matched names alone keeps that tail honest; padding it with every catalog
+					// name would turn a bucket browse into a full-catalog browse.
+					const orderedNames = params.query?.trim() ? rankedSkillNames(registry, params.query, state) : undefined;
 					const page = getCatalogBrowser(state).browse({
 						tags: params.tags, match: params.match, query: params.query,
 						cursor: params.cursor, pageSize: params.pageSize, orderedNames,
@@ -1138,6 +1197,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		hasStatus = false;
 		lastStatusText = undefined;
 		shownInitNoticeKeys.clear();
+		frozenUsageHints = undefined;
 		try {
 			for (const key of readInitNoticeKeys(ctx.sessionManager.getBranch())) shownInitNoticeKeys.add(key);
 		} catch {
@@ -1158,6 +1218,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		retainedToolNames.clear();
 		latestPrompt = "";
 		lastSelected = [];
+		lastCatalogOutcome = undefined;
 		rtkPresence = undefined;
 		usedTools.clear();
 		for (const entry of ctx.sessionManager.getBranch()) {
@@ -1184,6 +1245,26 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		} catch {
 			// Convenience only.
 		}
+	});
+
+	pi.on("before_provider_request", (event, ctx) => {
+		// A `before_agent_start` handler that returns `systemPrompt` makes Pi force that text
+		// onto the request after every `context_with_system` handler has run, which discards a
+		// section-level substitution (Pi's forced-prompt projection re-renders the head from
+		// text captured before the request). Rewriting the provider payload is the only place
+		// that survives every such projection; it is an identity operation whenever the
+		// substitution already reached the payload.
+		if (isDisabled(ctx.cwd)) return;
+		const config = getRuntimeConfig(ctx);
+		const providers = config.providers.length > 0 ? config.providers : undefined;
+		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) return;
+		const state = ensureSnapshot(ctx);
+		const transformed = optimizePayload(event.payload, optimizeConfig(state));
+		// The payload pass is the final truth: it may upgrade `native` to `replaced`
+		// when a forced system prompt discarded the section-level substitution.
+		recordCatalogOutcome(transformed.catalogOutcome, false);
+		if (lastCatalogOutcome) updateStatus(ctx);
+		return transformed.next === event.payload ? undefined : transformed.next;
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
@@ -1234,16 +1315,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) return;
 		const state = ensureSnapshot(ctx);
 		const payload = { messages: event.messages };
-		const transformed = optimizePayload(payload, {
-			...state.config,
-			profile: state.profile,
-			resolverAvailable: registryReady && pi.getActiveTools().includes("skill_search"),
-			skillSources: registrySources,
-			catalogSnapshot: registryReady && state.profile.catalog && registry ? getCatalogBrowser(state) : undefined,
-			usagePrior: buildUsagePrior(state.usage, {
-				halfLifeDays: state.config.usageHalfLifeDays,
-			}),
-		});
+		const transformed = optimizePayload(payload, optimizeConfig(state));
 		lastRemovedChars = transformed.removedChars;
 		lastSelected = transformed.selected;
 		lastBudget = {
@@ -1251,6 +1323,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			requestedChars: transformed.budget.requestedChars,
 			nameOnlyCount: transformed.budget.nameOnlyCount,
 		};
+		recordCatalogOutcome(transformed.catalogOutcome, true);
 		if (transformed.removedChars > 0) {
 			sessionSaved.skills += transformed.removedChars;
 			addPending(getStatsFilePath(ctx.cwd), { skills: transformed.removedChars, tools: 0, output: 0 });
@@ -1564,6 +1637,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 				"pi-skill-optimizer",
 				`  enabled:        ${isDisabled(ctx.cwd) ? "no" : "yes"}`,
 				`  skills mode:    ${state.profile.catalog ? "LLM-led tag directory + paged skill cards" : "compact index (run init for tag cards)"}`,
+				`  last catalog:   ${catalogOutcomeSummary(lastCatalogOutcome)} (latest request)`,
 				`  catalog budget:${lastBudget.usedChars}/${lastBudget.requestedChars} chars, ${lastBudget.nameOnlyCount} name-only`,
 				`  tools:          ${pi.getActiveTools().length}/${pi.getAllTools().length} active; optimizer_tool_search additive`,
 				`  output:         ${getOutputConfig(state.config).mode}; RTK ${rtkExtensionPresent() ? "detected per result" : "not detected"}`,

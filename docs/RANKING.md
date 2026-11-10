@@ -37,16 +37,40 @@ reason to force a superficially similar category. It is distinct from
 the task in its language, but multilingual discovery quality has not been
 measured. There are no per-language query keys, embedding calls, or hidden
 per-turn model requests; init is explicit provider work. An explicit free-text
-`skill_search` query with tags only orders the complete tag-filtered bucket; it
-does not lexically exclude candidates, which preserves multilingual results with
-little or no term overlap. Without tags, a query retains local BM25F lexical
-filtering/ranking over original descriptions.
-Directory counts and card contents affect stable prompt bytes. Its size cap is
-`min(4,000, catalogBudgetChars)` characters per catalog, and a browse response
-is capped at 3,000 characters (not UTF-8 bytes), so a page can contain fewer
-entries than requested. A hot tag can therefore require several pages. Browsing
-is an optional extra request: it can cost more bytes than it saves when the
-model pages repeatedly.
+`skill_search` query with tags orders the tag-filtered bucket: matched bucket
+cards first in the ranker's order, then the bucket's remaining cards in canonical
+order, and only then cards from outside the bucket that the ranker matched, as an
+explicit lexical rescue. Promotion is bounded: an outsider inside the ranker's
+overall top 3 moves into that head at its rank position and is marked
+`rescue: true`, at most three are promoted, and every later outsider stays
+behind the complete bucket. The bucket keeps its priority and membership, facets
+and counts stay bucket-only, and cursors still page the complete result. A tag
+choice therefore never hides a card whose source description clearly matches,
+which preserves multilingual results with little or no term overlap. Without tags, a query retains local BM25F lexical
+filtering/ranking over original descriptions. Catalog pagination itself never
+matches text: `orderedNames` is the single lexical source, so a query whose
+supplied ordering contains no eligible card yields `total: 0` instead of a
+fabricated ranking.
+Directory counts and card contents affect stable prompt bytes. Only populated
+tag rows are rendered, plus `unclassified` when it is non-zero, so a vocabulary
+entry no card uses costs no prompt bytes; the header still reports `total` and
+`unclassified`. A malformed source is quarantined with a host-visible reason
+rather than throwing, and a block that contains one keeps native discovery so no
+skill silently disappears. The directory size cap is
+`min(4,000, catalogBudgetChars)` characters per catalog, and a complete browse
+response is capped at 3,000 characters (not UTF-8 bytes), so a page can contain
+fewer entries than requested. The response is a compact record — `total`,
+`items` of `{name, summary, tags}`, `usedChars` — with no `version` or
+`fingerprint`, because the cursor already binds both. `facets` ship with the
+first page only, and `nextCursor` is a short `{o,s}` token whose signature
+covers version, catalog fingerprint, filter hash and offset. Tag and empty
+browses page at the 50-card cap; query-only lexical search keeps 10. A first
+page may also carry `rest`, the names of every candidate not shown, when the
+complete list fits the same 3,000-character cap beside at least three full
+cards — so a typical bucket (up to 73 cards) is answerable from one response,
+and a larger bucket still paginates through its cursor. Browsing is an optional
+extra request: it can cost more bytes than it saves when the model pages
+repeatedly.
 
 Profiles without current v1 catalog metadata—including v5 profiles—retain the
 compatible local lexical router until the user explicitly runs init. In this
@@ -177,16 +201,21 @@ defines the broader gates; running it is an explicit operation.
 
 ## Performance versus quality
 
-One separate synthetic transport comparison used a 355-skill catalog. The native
-initial catalog serialized to 71,975 bytes; the former compact TSV was 8,523
-bytes, and the new tag directory was 3,254 bytes. For eight work turns with one
-browse and an exact load, the tag-directory scenario emitted 55,290 serialized
-bytes across 10 requests, versus 80,571 bytes across 9 requests for the previous
-path (31.4% fewer bytes, but one additional request). A five-browse scenario
-emitted 164,870 bytes and was worse. These are synthetic transport totals, not
-provider token or cost measurements, and do not measure selection quality. They
-show why browsing frequency matters; they are not a universal savings claim.
-This is the dated 2026-10-19 snapshot, not a new result for release 3.1.3.
+One separate synthetic transport comparison used a 355-skill catalog (2026-11-10
+compact-wire snapshot, same run as BENCHMARK.md). The native initial catalog
+serialized to 71,975 bytes; the former compact TSV was 8,523 bytes, and the tag
+directory was 3,318 bytes. For eight work turns with one browse and an exact load,
+the tag-directory scenario emitted 53,329 serialized bytes across 10 requests,
+versus 80,571 bytes across 9 requests for the previous path (33.8% fewer bytes).
+Five cursor-following browses still cost 53,329 bytes at this catalog size, because
+a 10-card bucket completes in its first response (`rest` names the remainder) and
+no continuation pages are retained; at 2,000 and 10,000 skills the same five-browse
+replay cost 141,975 and 236,759 bytes, so very large buckets still pay for depth.
+The earlier 2026-10-19 run (164,254 bytes for a five-page replay at 355 skills)
+predates the compact wire: dropped envelope fields, first-page-only facets, short
+signed cursors, populated-row-only directories and the `rest` remainder. These are
+synthetic transport totals, not provider token or cost measurements, and do not
+measure selection quality. They are not a universal savings claim.
 Directory sizes and counts are workload-dependent. Broader scale measurements
 are kept separately in [BENCHMARK.md](../BENCHMARK.md).
 

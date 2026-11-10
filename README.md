@@ -46,11 +46,11 @@ Run init again to finish missing work or refresh changed skills. Your source ski
 
 Ask Pi to do your work. AUTO manages discovery and result size in the background:
 
-- **Skills stay within reach.** Pi can browse the library or load a known skill directly, including full instructions and associated resources.
+- **Skills stay within reach.** Pi can browse the library or load a known skill directly, including full instructions and associated resources. Skills you use often stay visible by name as a hint, and a strongly matching skill is surfaced even if it was filed under the wrong topic.
 - **Tools arrive as needed.** Less relevant definitions sit behind search, while core tools and tools already used in the session stay active within the host's permissions.
 - **Large results remain recoverable.** Shortened output points back to a complete local original that Pi can retrieve. The first large result stays intact when later exact copies are deduplicated.
 
-Use `/skill-optimizer` to inspect setup readiness, savings, active tools, and provider usage. Use `/skill-optimizer audit` to find description issues in your library without rewriting it.
+Use `/skill-optimizer` to inspect setup readiness, savings, active tools, provider usage, and what actually happened to the last request (including why, if the skill catalog was left untouched). Use `/skill-optimizer audit` to find description issues in your library without rewriting it.
 
 Start with the defaults; [configuration](docs/CONFIGURATION.md) covers project preferences, output modes, RTK coexistence, and persona restrictions.
 

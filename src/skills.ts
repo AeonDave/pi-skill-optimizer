@@ -132,7 +132,8 @@ export interface SkillCatalogOptimizationResult extends StableCatalogResult {
 export const DEFAULT_FULL_RENDER_BUDGET_CHARS = 12_000;
 export const DEFAULT_CATALOG_BUDGET_CHARS = 12_000;
 export const DEFAULT_INTENT_MAX_CHARS = 96;
-const AUTO_MARKER = "<!--skill-optimizer:auto:v2-->";
+/** Stable-base identity marker. A second pass must recognize its own output by it. */
+export const AUTO_MARKER = "<!--skill-optimizer:auto:v2-->";
 const CATALOG_RE = /<available_skills\b[^>]*>([\s\S]*?)<\/available_skills>/gi;
 const XML_SKILL_RE = /<skill\b[^>]*>([\s\S]*?)<\/skill>/gi;
 const INDEX_RE = /<skill_index\b[^>]*>([\s\S]*?)<\/skill_index>/gi;

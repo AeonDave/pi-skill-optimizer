@@ -497,6 +497,69 @@ function hasNonRoundTripJsonNumber(text: string): boolean {
 	return false;
 }
 
+/** JSON structural whitespace, kept allocation-free. */
+function isJsonWhitespaceCode(code: number): boolean {
+	return code === 32 || code === 9 || code === 10 || code === 13; // space, tab, LF, CR
+}
+
+/**
+ * Count every JSON object key token in the source literal. A key is a string
+ * token followed by a colon, which in valid JSON can only be a member name,
+ * whatever the nesting depth. JSON.parse silently drops duplicate keys, so this
+ * count is the only cheap way to prove the source has no key that parsing lost.
+ */
+function countJsonKeyTokens(text: string): number {
+	let inString = false;
+	let escaped = false;
+	let count = 0;
+	for (let index = 0; index < text.length; index++) {
+		const character = text[index];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (character === "\\") escaped = true;
+			else if (character === '"') {
+				inString = false;
+				let lookahead = index + 1;
+				while (lookahead < text.length && isJsonWhitespaceCode(text.charCodeAt(lookahead))) lookahead++;
+				if (text.charCodeAt(lookahead) === 58) count++; // ":"
+			}
+			continue;
+		}
+		if (character === '"') inString = true;
+	}
+	return count;
+}
+
+const MAX_PARSED_KEY_DEPTH = 128;
+
+/**
+ * Count the keys the parsed value actually retained. A mismatch with the source
+ * token count means the literal carried duplicate keys, so the only lossless
+ * result is the untouched original.
+ */
+function countParsedKeys(value: unknown, depth = 0): number {
+	if (depth > MAX_PARSED_KEY_DEPTH) return -1;
+	if (Array.isArray(value)) {
+		let total = 0;
+		for (const item of value) {
+			const counted = countParsedKeys(item, depth + 1);
+			if (counted < 0) return -1;
+			total += counted;
+		}
+		return total;
+	}
+	if (!value || typeof value !== "object") return 0;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	let total = keys.length;
+	for (const key of keys) {
+		const counted = countParsedKeys(record[key], depth + 1);
+		if (counted < 0) return -1;
+		total += counted;
+	}
+	return total;
+}
+
 function matchesOutputPattern(text: string, pattern: RegExp): boolean {
 	pattern.lastIndex = 0;
 	const matched = pattern.test(text);
@@ -569,6 +632,10 @@ export function reduceJsonArrayColumnar(text: string, options: ColumnarJsonOptio
 		const rowKeys = Object.keys(records[i]);
 		if (rowKeys.length !== keys.length || rowKeys.some((key, index) => key !== keys[index])) return original();
 	}
+	// Object.keys is already deduplicated, so a repeated key in the source literal
+	// would be encoded lossily. Compare source key tokens against retained keys.
+	const parsedKeys = countParsedKeys(parsed);
+	if (parsedKeys < 0 || countJsonKeyTokens(text) !== parsedKeys) return original();
 	const encoded: ColumnarJsonV1 = {
 		$format: "columnar-json-v1",
 		rows: records.length,

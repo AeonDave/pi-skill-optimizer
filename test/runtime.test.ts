@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -854,5 +854,153 @@ test("a failed registry rebuild after session reset keeps native discovery inste
 		const messages = [{ role: "system", sections: { skills: `<available_skills><skill><name>${skill.name}</name><description>${skill.description}</description><location>${skill.filePath}</location></skill></available_skills>` } }];
 		assert.deepEqual(await runtime.fire("context_with_system", { messages }), [undefined]);
 		assert.ok(runtime.notifications.some((message) => message.includes("failed open")));
+	} finally { runtime.dispose(); }
+});
+
+function nativeCatalogBlock(skill: Skill): string {
+	return `<available_skills><skill><name>${skill.name}</name><description>${skill.description}</description><location>${skill.filePath ?? ""}</location></skill></available_skills>`;
+}
+
+function writeTagCatalogProfile(runtime: ReturnType<typeof createRuntime>, skill: Skill): void {
+	writeFileSync(getProfilePaths(runtime.cwd).global, JSON.stringify({ catalog: { version: 1, cards: {
+		[skill.name]: { summary: "Review independently testable application boundaries.", tags: ["architecture"], sourceHash: hashSkill(skill.name, skill.description) },
+	} } }));
+}
+
+function lastStatus(runtime: ReturnType<typeof createRuntime>): string {
+	return runtime.notifications.at(-1) ?? "";
+}
+
+test("status reports the catalog substitution that actually reached the latest request", async () => {
+	const skill = { ...modelSkill(), description: "Review independently testable application boundaries. ".repeat(100) };
+	const runtime = createRuntime({ skills: [skill] });
+	try {
+		writeTagCatalogProfile(runtime, skill);
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [skill] } });
+		const messages = [{ role: "system", sections: { skills: nativeCatalogBlock(skill) } }];
+		const outcome = await runtime.fire("context_with_system", { messages });
+		assert.notDeepEqual(outcome, [undefined], "the tag directory must actually replace the native block");
+		await runtime.command();
+		assert.ok(lastStatus(runtime).includes("last catalog:   replaced"), lastStatus(runtime));
+		assert.ok(runtime.statuses.at(-1)?.includes("catalog replaced"), String(runtime.statuses.at(-1)));
+	} finally { runtime.dispose(); }
+});
+
+test("status reports the guard reason when the native catalog is kept", async () => {
+	const skill = { ...modelSkill(), description: "Review TypeScript." };
+	const runtime = createRuntime({ skills: [skill] });
+	try {
+		writeTagCatalogProfile(runtime, skill);
+		await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { skills: [skill] } });
+		const messages = [{ role: "system", sections: { skills: nativeCatalogBlock(skill) } }];
+		assert.deepEqual(await runtime.fire("context_with_system", { messages }), [undefined], "a directory larger than the native block must not be used");
+		await runtime.command();
+		assert.ok(lastStatus(runtime).includes("last catalog:   native kept (not-smaller)"), lastStatus(runtime));
+		assert.ok(runtime.statuses.at(-1)?.includes("catalog native (not-smaller)"), String(runtime.statuses.at(-1)));
+	} finally { runtime.dispose(); }
+});
+
+test("the payload pass upgrades a native section pass to replaced when a forced prompt discarded the rewrite", async () => {
+	const skill = { ...modelSkill(), description: "Review independently testable application boundaries. ".repeat(100) };
+	const runtime = createRuntime({ skills: [skill] });
+	try {
+		writeTagCatalogProfile(runtime, skill);
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("context_with_system", { messages: [{ role: "user", content: "Review the change." }] });
+		await runtime.command();
+		assert.ok(lastStatus(runtime).includes("last catalog:   native kept (no-native-catalog)"), lastStatus(runtime));
+		const payload = { system: nativeCatalogBlock(skill), messages: [{ role: "user", content: "Review the change." }] };
+		const results = await runtime.fire("before_provider_request", { payload }) as Array<{ system?: string } | undefined>;
+		// The substitution artifact depends on catalog size (one skill keeps the all-name index),
+		// so the identity marker proves the rewrite; native XML entries never carry it.
+		assert.ok(results[0]?.system?.includes("skill-optimizer:auto:v2"), "the payload pass must re-apply the substitution");
+		assert.ok(runtime.statuses.at(-1)?.includes("catalog replaced"), String(runtime.statuses.at(-1)));
+		await runtime.command();
+		assert.ok(lastStatus(runtime).includes("last catalog:   replaced"), lastStatus(runtime));
+	} finally { runtime.dispose(); }
+});
+
+function nativeCatalogBlocks(skills: readonly Skill[]): string {
+	return `<available_skills>${skills.map((skill) =>
+		`<skill><name>${skill.name}</name><description>${skill.description}</description><location>${(skill as { filePath?: string }).filePath ?? ""}</location></skill>`
+	).join("")}</available_skills>`;
+}
+
+function skillSection(results: unknown[]): string {
+	const first = results[0] as { messages?: Array<{ sections?: Record<string, string> }> } | undefined;
+	return first?.messages?.[0]?.sections?.skills ?? "";
+}
+
+test("init notice quantifies the index a large catalog would replace", async () => {
+	const skills = Array.from({ length: 96 }, (_, index) =>
+		modelSkill(`init-notice-large-catalog-skill-name-${String(index).padStart(2, "0")}`));
+	const floorEstimate = 170 + skills.reduce((sum, skill) => sum + skill.name.length + 1, 0);
+	assert.ok(floorEstimate > 3_500, "premise: this catalog's all-name floor exceeds the quantified threshold");
+	const runtime = createRuntime({ skills });
+	try {
+		const event = { prompt: "Review TypeScript.", systemPromptOptions: { skills } };
+		await runtime.fire("before_agent_start", event);
+		await runtime.fire("before_agent_start", event);
+		const notices = runtime.notifications.filter((message) => message.includes("/skill-optimizer init"));
+		assert.equal(notices.length, 1, "the quantified nudge keeps one notice per readiness state");
+		assert.match(notices[0] ?? "", /the 96-name skill index is at least ~\d+ chars in every request/);
+		assert.match(notices[0] ?? "", /~3k-char tag directory/);
+		assert.match(notices[0] ?? "", /one-time model cost/);
+		assert.ok(!notices.includes(INIT_NOTICE), "a large catalog does not get the unquantified text");
+		assert.equal(runtime.entries.length, 1, "notice key and session dedupe are unchanged");
+	} finally { runtime.dispose(); }
+});
+
+test("recently loaded hints are session-frozen and never outrank the directory", async () => {
+	const names = Array.from({ length: 12 }, (_, index) => `catalog-skill-with-a-descriptive-and-distinct-name-${index}`);
+	const skills = names.map((name) => ({
+		...modelSkill(name),
+		description: "Review independently testable application boundaries and reliable regression tests.",
+	})) as Skill[];
+	const runtime = createRuntime({ skills });
+	try {
+		for (const skill of skills) {
+			const baseDir = join(runtime.root, "skills", skill.name);
+			mkdirSync(baseDir, { recursive: true });
+			(skill as { filePath?: string }).filePath = join(baseDir, "SKILL.md");
+			(skill as { baseDir?: string }).baseDir = baseDir;
+			writeFileSync(join(baseDir, "SKILL.md"), `# ${skill.name}\n`, "utf8");
+		}
+		writeFileSync(getProfilePaths(runtime.cwd).global, JSON.stringify({ catalog: { version: 1, cards: Object.fromEntries(skills.map((skill) => [skill.name, {
+			summary: skill.description,
+			tags: ["architecture"],
+			sourceHash: hashSkill(skill.name, skill.description),
+		}])) } }));
+		const usagePath = getUsageFilePath(runtime.cwd);
+		const usage = { version: 1, updatedAt: new Date().toISOString(), skills: {
+			[names[0]]: { count: 5, lastUsed: Date.now() },
+			[names[1]]: { count: 3, lastUsed: Date.now() },
+		} };
+		writeFileSync(usagePath, JSON.stringify(usage));
+		const block = nativeCatalogBlocks(skills);
+		const messages = (): Array<{ role: string; sections: Record<string, string> }> => [{ role: "system", sections: { skills: block } }];
+
+		await runtime.fire("before_agent_start", { prompt: "Review the change.", systemPromptOptions: { skills } });
+		const first = skillSection(await runtime.fire("context_with_system", { messages: messages() }));
+		assert.match(first, /skill_directory/, "the large-catalog directory must still be used");
+		const hint = first.match(/\nRecently loaded here[^\n]*/)?.[0] ?? "";
+		assert.ok(hint.includes("(usage metadata, not a recommendation)"), "catalog mode appends the frozen usage hint");
+		assert.ok(hint.includes(`"${names[0]}"`) && hint.includes(`"${names[1]}"`), hint);
+		assert.ok(!first.includes(names[4]), "an unloaded name is not a usage hint");
+
+		await executeTool(runtime, "skill_search", { action: "load", name: names[4] });
+		const second = skillSection(await runtime.fire("context_with_system", { messages: messages() }));
+		assert.equal(second, first, "an in-session load cannot rewrite the stable base");
+
+		const persisted = JSON.parse(readFileSync(usagePath, "utf8")) as typeof usage;
+		persisted.skills[names[4]] = { count: 20, lastUsed: Date.now() };
+		writeFileSync(usagePath, JSON.stringify(persisted));
+		await runtime.fire("session_start", {});
+		await runtime.fire("before_agent_start", { prompt: "Review the change.", systemPromptOptions: { skills } });
+		const third = skillSection(await runtime.fire("context_with_system", { messages: messages() }));
+		assert.notEqual(third, first, "a new session captures its own frozen hints");
+		assert.ok(third.includes(`"${names[4]}"`), "the new session's capture follows current usage evidence");
+		assert.equal(third.replace(/\nRecently loaded here[^\n]*/, ""), first.replace(/\nRecently loaded here[^\n]*/, ""),
+			"only the hint line differs: the directory bytes are unchanged");
 	} finally { runtime.dispose(); }
 });

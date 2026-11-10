@@ -129,6 +129,15 @@ test("interpretBatchResponse fails (does not throw) when the body has no JSON ob
 	assert.match((out as { reason: string }).reason, /no valid JSON/);
 });
 
+test("interpretBatchResponse names the unknown tag IDs in its failure reason", () => {
+	const out = interpretBatchResponse(
+		textResponse('{"processedSkills":["a"],"catalogCards":{"a":{"summary":"Guides scoped repository changes.","tags":["software-design"]}}}'),
+		[{ name: "a", description: "Guides scoped repository changes." }],
+	);
+	assert.equal(out.status, "failed");
+	assert.match((out as { reason: string }).reason, /unknown IDs \(software-design\)/);
+});
+
 test("interpretBatchResponse parses valid output and rejects truncation as retryable", () => {
 	const ok = interpretBatchResponse(textResponse('{"critical":["a"],"processedSkills":["a"]}'));
 	assert.equal(ok.status, "ok");

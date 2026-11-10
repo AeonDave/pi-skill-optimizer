@@ -32,7 +32,12 @@ const NON_HUMAN_BLOCK_TYPES = new Set([
 	"context_reference",
 ]);
 
-const INJECTED_CONTEXT_PREFIXES = [
+/**
+ * One authoritative list of synthetic-extension prefixes. Ranking, usage
+ * evidence, and any other consumer must reject exactly these texts; a second
+ * divergent copy silently turns injected context into user intent.
+ */
+export const INJECTED_CONTEXT_PREFIXES = [
 	"context-mode active.",
 	"[pi-persona] identity data",
 	"[pi-persona] first action:",
@@ -41,7 +46,7 @@ const INJECTED_CONTEXT_PREFIXES = [
 ] as const;
 
 /** Synthetic extension messages are transport context, not user intent. */
-function isInjectedContextText(value: string): boolean {
+export function isInjectedContextText(value: string): boolean {
 	const normalized = value.trimStart().toLowerCase();
 	return INJECTED_CONTEXT_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }

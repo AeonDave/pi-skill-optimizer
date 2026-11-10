@@ -204,10 +204,21 @@ async function main(): Promise<void> {
 					assert.ok(names.includes("skill_search"), "skill_search absent from model tools");
 					response = callResponse("skill_search", { action: "search", query: "triage issue severity reproduce defect" }, "skill-search-1");
 					break;
-				case 4:
-					assert.ok((getToolResult(request, "skill_search") ?? "").includes(SKILL_NAME), "skill search result missing from provider history");
+				case 4: {
+					const payload = getToolResult(request, "skill_search") ?? "";
+					assert.ok(payload.includes(SKILL_NAME), "skill search result missing from provider history");
+					// This fixture carries no catalog metadata, so the wired tool takes the native
+					// lexical route (its own page shape, including a lexical filter fingerprint).
+					// Pin that separation so a catalog-directory regression cannot silently take
+					// over native discovery here; the tag-directory wire is covered by
+					// test/catalog.test.ts, test/host-runtime.test.ts and `npm run bench:catalog`.
+					const page = JSON.parse(payload) as Json;
+					assert.ok(Array.isArray(page.items), "skill_search must return an item list");
+					assert.equal("facets" in page, false, "without catalog metadata the tag-directory wire must not appear");
+					assert.equal("rest" in page, false, "no remainder list outside catalog mode");
 					response = callResponse("skill_search", { action: "load", name: SKILL_NAME }, "skill-load-1");
 					break;
+				}
 				case 5:
 					assert.equal(getToolResult(request, "skill_search"), SKILL_CONTENT, "skill_search load did not return exact skill content");
 					response = textResponse("skill loaded verbatim", "skill-finished");

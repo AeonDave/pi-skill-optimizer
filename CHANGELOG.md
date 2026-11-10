@@ -2,6 +2,31 @@
 
 All notable changes are documented here.
 
+## 3.2.0 - 2026-11-10
+
+### Added
+
+- Tagged `skill_search` browsing now appends description-matching cards from outside the selected tag bucket as an explicit lexical rescue tail (listed matches first, then the remaining bucket in canonical order, then off-bucket matches). A card whose generated tags are wrong can still be found by querying its own description text; facets stay bucket-only and `total` counts bucket plus rescue.
+- Browse responses went on an envelope diet and became bucket-complete: pages carry `{name, summary, tags}` items (no redundant version/fingerprint — the cursor binds them), facets appear only on the first page, the cursor shrank from ~250 to ~44 characters with identical binding, default page size is 50 for tag/empty browses, and a first page may include `rest` — the complete list of remaining candidate names — whenever it fits the 3,000-character cap with at least three full cards. Typical buckets up to ~70 cards are now complete in one response.
+- Off-bucket rescue cards inside the ranker's overall top three are promoted into the head of the first page at their rank position (marked `rescue`), so a strongly matching mistagged card no longer hides behind a large bucket.
+- Catalog mode now includes up to eight session-frozen recently-loaded skill names as stable metadata hints (captured once at session start, dropped before the directory on overflow); `/skill-optimizer init` notices are quantified ("the N-name skill index is at least ~X chars in every request") for large catalogs.
+- `/skill-optimizer status` reports the actual catalog substitution outcome of the latest request with a machine-usable fallback reason (resolver-unavailable, registry-mismatch, directory-overflow, quarantined-source, not-smaller, small-catalog-index, …), captured across both the section pass and the request-time pass.
+
+### Fixed
+
+- The tag directory lists only populated tag rows (and omits a zero-count `unclassified` row), cutting roughly 2.3k characters on vocabulary-narrow catalogs and lowering the fail-open floor that previously disabled reduction for tight budgets. The `unclassified` header attribute remains authoritative.
+- Small catalogs (all-name floor fitting inside the directory's own length, roughly below 230 skills) keep the stable all-name index instead of the tag directory: hiding names must save bytes.
+- Usage evidence ignores every shared injected-context prefix (persona identity data, first-action, session/clock markers), not only `context-mode` blocks, so intent can never be derived from injected context; the mention scanner precompiles matchers and bounds the human-message window, with a perf gate at 25 ms per request for 500 skills × 200 messages.
+- Columnar JSON reduction rejects rows with duplicate top-level keys (fail-open to the original text) instead of silently dropping the first value; already-reduced output fed back through the reducer is pinned never to grow.
+- Catalog-mode substitution now reaches the provider payload even when another extension (e.g. `pi-persona`) forces a system prompt from `before_agent_start`: Pi re-projects that pre-rendered head after `context_with_system` section rewrites, which silently discarded the tag directory in real sessions. The same optimized transform is re-applied at `before_provider_request` (an identity pass when the section rewrite already landed, so nothing is counted or reduced twice).
+- Malformed skill sources (missing/untrimmed names, missing descriptions, invalid UTF-16) are quarantined with per-source diagnostics instead of disabling the whole optimizer for the session; a block containing a quarantined source keeps Pi's native skill catalog so that skill stays discoverable, and `optimize` now fails open to the native block on catalog `TypeError` as defense in depth.
+- Removed the dead substring-query branch in catalog browsing; query semantics are single-sourced through the BM25F-ranked name order, and a query with no lexical signal cleanly returns `total: 0`.
+
+### Changed
+
+- Development host packages and integration tests target Pi 1.5.1 (from 1.3.0); no source change was required — every API used by the extension is unchanged through 1.5.1.
+- Refreshed catalog benchmark numbers (2026-11-10 run): tag directory 3,210/3,236/3,275 bytes at 355/2,000/10,000 skills; one-browse cumulative savings 31.9%/79.2%/95.7%.
+
 ## 3.1.3 - 2026-10-20
 
 ### Added

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { renderTagDirectory, type CatalogMetadata } from "../src/catalog.ts";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { optimizePayload } from "../src/optimize.js";
-import { normalizeProfile } from "../src/profile.js";
+import { hashSkill, normalizeProfile } from "../src/profile.js";
+import { inspectStableSkillCatalog } from "../src/skills.ts";
 
 function catalog(count = 24): string {
   const entries = Array.from({ length: count }, (_, index) => {
@@ -321,4 +323,138 @@ test("budget diagnostics account for every transformed catalog", () => {
   assert.equal(result.budget.usedChars <= 2_000, true);
   assert.equal(result.selected.length <= DEFAULT_CONFIG.prefetchMax, true);
   assert.equal(result.fingerprints.length > 0, true);
+});
+
+const LONG_DESCRIPTION = "Review independently testable subsystem boundaries and reliable regression tests with explicit verification evidence.";
+
+/** One shared card tag keeps the directory length independent of the skill count. */
+function tagCatalog(names: readonly string[]): { system: string; profile: {
+  critical: string[];
+  queries: Record<string, string[]>;
+  clusters: Record<string, string[]>;
+  negativeHints: Record<string, string[]>;
+  catalog: CatalogMetadata;
+} } {
+  const system = `<available_skills>\n${names.map((name) =>
+    `<skill><name>${name}</name><description>${LONG_DESCRIPTION}</description><location>/private/skills/${name}/SKILL.md</location></skill>`
+  ).join("\n")}\n</available_skills>`;
+  return {
+    system,
+    profile: {
+      critical: [], queries: {}, clusters: {}, negativeHints: {},
+      catalog: { version: 1, cards: Object.fromEntries(names.map((name) => [name, {
+        summary: LONG_DESCRIPTION,
+        tags: ["architecture"],
+        sourceHash: hashSkill(name, LONG_DESCRIPTION),
+      }])) },
+    },
+  };
+}
+
+function largeNames(count: number): string[] {
+  return Array.from({ length: count }, (_, index) => `catalog-skill-with-a-descriptive-and-distinct-name-${index}`);
+}
+
+function tagText(names: readonly string[], overrides: Record<string, unknown> = {}): {
+  text: string;
+  result: ReturnType<typeof optimizePayload<{ system: string; messages: unknown[] }>>;
+} {
+  const { system, profile } = tagCatalog(names);
+  const result = optimizePayload(
+    { system, messages: [{ role: "user", content: "Review the change" }] },
+    { ...DEFAULT_CONFIG, profile, ...overrides },
+  );
+  return { text: (result.next as { system: string }).system, result };
+}
+
+test("the small-catalog all-name guard flips exactly where its floor stops fitting", () => {
+  const compare = (count: number) => {
+    const names = largeNames(count);
+    const { system, profile } = tagCatalog(names);
+    const floor = inspectStableSkillCatalog(system).floorChars;
+    const directory = renderTagDirectory(
+      names.map((name) => ({ name, description: LONG_DESCRIPTION })),
+      profile.catalog,
+      4_000,
+    ).text;
+    return { names, floor, directory, ...tagText(names) };
+  };
+
+  const small = compare(5);
+  assert.ok(small.floor <= small.directory.length, "the small catalog's floor fits inside its directory");
+  assert.match(small.text, /skill-optimizer:auto:v2/, "the stable all-name index must be emitted");
+  assert.match(small.text, /<skill_index format="tsv" columns="name,intent">/);
+  assert.doesNotMatch(small.text, /skill-optimizer:tags:v1/);
+  for (const name of small.names) {
+    // Name-only rows drop the empty intent column, so such a row ends at the name.
+    assert.match(small.text, new RegExp(`\n${name}(\t|\n)`), "every eligible name stays discoverable");
+  }
+  assert.equal(small.result.catalogOutcome.mode, "replaced");
+  assert.equal(small.result.catalogOutcome.reason, "small-catalog-index");
+  assert.ok(small.text.length < small.directory.length);
+  // The hint line is metadata appended after whichever artifact won; pin it on both branches.
+  assert.match(tagText(small.names, { recentSkills: [small.names[0]!] }).text, /Recently loaded here/, "the frozen-usage hint rides along after the small-catalog index too");
+
+  const large = compare(60);
+  assert.ok(large.floor > large.directory.length, "the large catalog's floor exceeds its directory");
+  assert.match(large.text, /skill-optimizer:tags:v1/);
+  assert.doesNotMatch(large.text, /skill-optimizer:auto:v2/);
+  assert.match(tagText(large.names, { recentSkills: [large.names[0]!] }).text, /Recently loaded here/, "the frozen-usage hint rides along after the directory");
+  assert.equal(large.result.catalogOutcome.mode, "replaced");
+  assert.equal(large.result.catalogOutcome.reason, undefined, "the plain directory substitution has no special reason");
+});
+
+test("a second catalog pass recognizes its own output instead of a registry mismatch", () => {
+  for (const count of [5, 60]) {
+    const names = largeNames(count);
+    const { system, profile } = tagCatalog(names);
+    const config = {
+      ...DEFAULT_CONFIG,
+      profile,
+      skillSources: names.map((name) => ({
+        name,
+        description: LONG_DESCRIPTION,
+        location: `/private/skills/${name}/SKILL.md`,
+      })),
+    };
+    const first = optimizePayload({ system, messages: [{ role: "user", content: "Review" }] }, config);
+    assert.equal(first.catalogOutcome.mode, "replaced");
+    const second = optimizePayload(first.next, config);
+    assert.equal(second.next, first.next, "the substitution must be an identity operation");
+    assert.equal(second.removedChars, 0);
+    assert.equal(second.catalogOutcome.mode, "native");
+    assert.equal(second.catalogOutcome.reason, "no-native-catalog");
+  }
+});
+
+test("session usage hints follow the directory and are dropped before it", () => {
+  const names = largeNames(60);
+  const hints = [names[3], names[1]];
+  const { text, result } = tagText(names, { recentSkills: hints });
+  assert.match(text, /skill-optimizer:tags:v1/);
+  const hint = text.match(/\nRecently loaded here[^\n]*/)?.[0];
+  assert.ok(hint, "catalog mode appends the frozen usage hint");
+  assert.ok(hint.includes("(usage metadata, not a recommendation)"));
+  assert.ok(hint.includes(names[3]) && hint.includes(names[1]));
+  assert.equal(result.catalogOutcome.mode, "replaced");
+
+  // Names that are not in the eligible catalog are never advertised.
+  const foreign = tagText(names, { recentSkills: ["unregistered-skill"] });
+  assert.doesNotMatch(foreign.text, /Recently loaded here/);
+
+  const directoryLength = renderTagDirectory(
+    names.map((name) => ({ name, description: LONG_DESCRIPTION })),
+    tagCatalog(names).profile.catalog,
+    4_000,
+  ).text.length;
+  // One character short of directory + hint: the hint must go, the directory must stay.
+  const tight = tagText(names, {
+    recentSkills: hints,
+    catalogBudgetChars: directoryLength + hint.length - 1,
+  });
+  assert.match(tight.text, /skill-optimizer:tags:v1/);
+  assert.doesNotMatch(tight.text, /Recently loaded here/);
+  assert.equal(tight.text, text.replace(hint, ""), "dropping the hint leaves the directory byte-identical");
+  assert.equal(tight.result.catalogOutcome.mode, "replaced");
+  assert.equal(tight.result.catalogOutcome.reason, undefined);
 });

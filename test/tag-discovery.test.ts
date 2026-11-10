@@ -92,3 +92,31 @@ test("a same-name foreign source is not silently redirected to registered instru
   const foreignLocation = skills.map((skill, index) => ({ ...skill, location: index === 0 ? "/different-package/SKILL.md" : `/private/${skill.name}/SKILL.md` }));
   assert.equal(optimizePayload(payload, { ...DEFAULT_CONFIG, profile, skillSources: foreignLocation }).next, payload);
 });
+
+test("catalog render errors fail open to the native block instead of breaking the request", () => {
+  const payload = { system };
+  const prepared = { total: skills.length, skills: skills.map(({ name }) => ({ name })) };
+  const throwing = (error: unknown) => ({
+    prepared,
+    renderDirectory: () => { throw error; },
+    browse: () => { throw new Error("unused in the render path"); },
+  }) as never;
+  for (const error of [new TypeError("malformed catalog source"), new RangeError("budget")]) {
+    const config = { ...DEFAULT_CONFIG, profile, catalogSnapshot: throwing(error) };
+    const result = optimizePayload(payload, config);
+    assert.equal(result.next, payload, `${(error as Error).constructor.name} must preserve native discovery`);
+  }
+  // An unexpected error is a real defect and still surfaces.
+  assert.throws(() => optimizePayload(payload, { ...DEFAULT_CONFIG, profile, catalogSnapshot: throwing(new Error("unexpected")) }), /unexpected/);
+});
+
+test("a quarantined source keeps native discovery rather than hiding that skill", () => {
+  const brokenSystem = `Before\n<available_skills>\n<skill><name>repo-guidance</name><description>Safe text \uD800 broken.</description><location>/private/repo-guidance/SKILL.md</location></skill>\n</available_skills>\nAfter`;
+  const brokenPayload = { system: brokenSystem };
+  const result = optimizePayload(brokenPayload, { ...DEFAULT_CONFIG, profile });
+  assert.equal(result.next, brokenPayload, "native discovery stays intact when a source cannot be represented");
+  assert.equal(result.removedChars, 0);
+  // The optimizer itself stays usable: valid catalogs still reach tag discovery.
+  const healthy = optimizePayload({ system }, { ...DEFAULT_CONFIG, profile });
+  assert.match(healthy.next.system, /skill-optimizer:tags:v1/);
+});

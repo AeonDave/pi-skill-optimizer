@@ -1,4 +1,4 @@
-import { normalizeRequest } from "./request.ts";
+import { isInjectedContextText, normalizeRequest } from "./request.ts";
 
 export interface SkillUsageEntry {
 	count: number;
@@ -32,17 +32,42 @@ export interface UsagePruneOptions {
 	now?: number;
 }
 
-function isInjectedContextText(text: string): boolean {
-	return text.trimStart().startsWith("context-mode active.");
+/**
+ * Bound the user-message scan so a long transcript cannot make per-request
+ * evidence collection unbounded. Evidence is deduplicated and capped anyway;
+ * the window keeps the most recent human turns.
+ */
+export const MAX_USAGE_SCAN_MESSAGES = 512;
+
+const MENTION_TOKEN_RUN = /[a-z0-9:_-]+/g;
+const MENTION_TOKEN_NAME = /^[a-z0-9:_-]+$/;
+const SKILL_TOKEN_PREFIX = "skill:";
+
+function isMentionTokenCode(code: number): boolean {
+	return (code >= 97 && code <= 122) // a-z
+		|| (code >= 48 && code <= 57) // 0-9
+		|| code === 58 // :
+		|| code === 95 // _
+		|| code === 45; // -
 }
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function isMentioned(text: string, name: string): boolean {
-	const escaped = escapeRegExp(name.toLowerCase());
-	return new RegExp(`(^|[^a-z0-9:_-])(?:/skill:|/)?${escaped}($|[^a-z0-9:_-])`).test(text);
+/**
+ * Full matcher for names that contain characters outside the mention-token
+ * alphabet (for example `c++` or `a b`). Precompiled once per request.
+ */
+function mentionPattern(name: string): RegExp {
+	return new RegExp(`(^|[^a-z0-9:_-])(?:/skill:|/)?${escapeRegExp(name)}($|[^a-z0-9:_-])`);
+}
+
+interface SkillMatcher {
+	lower: string;
+	name: string;
+	/** Present only for names the token scan cannot represent exactly. */
+	pattern?: RegExp;
 }
 
 function stableHash(value: string): string {
@@ -62,23 +87,81 @@ function objectId(value: Record<string, unknown>): string | undefined {
 	return undefined;
 }
 
-/** Stable per-message/tool-call evidence, suitable for bounded session deduplication. */
+/**
+ * One precompiled matcher per selected skill. Names made only of mention-token
+ * characters are resolved by tokenizing each message once; that is exactly
+ * equivalent to the boundary pattern, because any maximal token run is a
+ * mention and a `skill:` run preceded by `/` and a boundary is the `/skill:`
+ * mention form. Names with other characters keep the full regex.
+ */
+function collectMatchers(selectedSkills: readonly string[]): SkillMatcher[] {
+	const matchers: SkillMatcher[] = [];
+	const seen = new Set<string>();
+	for (const name of selectedSkills) {
+		if (!name) continue;
+		const lower = name.toLowerCase();
+		if (seen.has(lower)) continue;
+		seen.add(lower);
+		matchers.push(MENTION_TOKEN_NAME.test(lower)
+			? { lower, name }
+			: { lower, name, pattern: mentionPattern(lower) });
+	}
+	return matchers;
+}
+
 export function collectSkillUsageEvidence(payload: unknown, selectedSkills: readonly string[]): SkillUsageEvidence[] {
-	const normalizedMessages = normalizeRequest(payload).messages;
 	const selected = new Map(selectedSkills.filter(Boolean).map((name) => [name.toLowerCase(), name]));
+	if (selected.size === 0) return [];
+	const normalizedMessages = normalizeRequest(payload).messages;
+
+	const tokenSkills = new Map<string, string>();
+	const patternSkills: SkillMatcher[] = [];
+	for (const matcher of collectMatchers(selectedSkills)) {
+		if (matcher.pattern) patternSkills.push(matcher);
+		else tokenSkills.set(matcher.lower, matcher.name);
+	}
+
+	const userMessageIndices: number[] = [];
+	for (let messageIndex = normalizedMessages.length - 1; messageIndex >= 0; messageIndex--) {
+		if (userMessageIndices.length >= MAX_USAGE_SCAN_MESSAGES) break;
+		if (normalizedMessages[messageIndex].role === "user") userMessageIndices.push(messageIndex);
+	}
+	userMessageIndices.reverse();
+
 	const evidence = new Map<string, SkillUsageEvidence>();
-	for (let messageIndex = 0; messageIndex < normalizedMessages.length; messageIndex++) {
+	for (const messageIndex of userMessageIndices) {
 		const message = normalizedMessages[messageIndex];
-		if (message.role !== "user") continue;
-		const text = isInjectedContextText(message.text) ? "" : message.text.toLowerCase();
+		if (isInjectedContextText(message.text)) continue;
+		const text = message.text.toLowerCase();
 		if (!text) continue;
 		const source = message.sourceId === undefined
 			? `index:${messageIndex}:${stableHash(text)}`
 			: `id:${message.sourceId}`;
-		for (const [lower, name] of selected) {
-			if (!isMentioned(text, lower)) continue;
-			const key = `user:${source}:${lower}`;
-			evidence.set(key, { key, name });
+		if (tokenSkills.size > 0) {
+			MENTION_TOKEN_RUN.lastIndex = 0;
+			let match: RegExpExecArray | null;
+			while ((match = MENTION_TOKEN_RUN.exec(text)) !== null) {
+				const run = match[0];
+				const direct = tokenSkills.get(run);
+				if (direct !== undefined) {
+					const key = `user:${source}:${run}`;
+					evidence.set(key, { key, name: direct });
+				}
+				if (run.length <= SKILL_TOKEN_PREFIX.length || !run.startsWith(SKILL_TOKEN_PREFIX)) continue;
+				const start = match.index;
+				if (text.charCodeAt(start - 1) !== 47) continue; // "/"
+				if (start >= 2 && isMentionTokenCode(text.charCodeAt(start - 2))) continue;
+				const candidate = run.slice(SKILL_TOKEN_PREFIX.length);
+				const prefixed = tokenSkills.get(candidate);
+				if (prefixed === undefined) continue;
+				const key = `user:${source}:${candidate}`;
+				evidence.set(key, { key, name: prefixed });
+			}
+		}
+		for (const matcher of patternSkills) {
+			if (!matcher.pattern!.test(text)) continue;
+			const key = `user:${source}:${matcher.lower}`;
+			evidence.set(key, { key, name: matcher.name });
 		}
 	}
 

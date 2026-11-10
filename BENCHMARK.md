@@ -1,10 +1,19 @@
 # AUTO benchmark
 
+**In plain terms:** after optional setup, the skill list that used to fill the start
+of every request shrinks to a short topic map — about 3.3 kB for a 355-skill
+library, roughly 97% smaller than the native catalog. A topic browse usually
+completes in one response, and exploring further pages at that library size adds
+nothing extra. These are transport measurements on synthetic libraries: they say
+nothing yet about how well generated topic cards match real tasks, or about
+provider token savings. The sections below are the technical protocol and dated
+snapshots behind that summary.
+
 This document separates current deterministic transport checks from historical
 real-provider evidence. Results from different discovery contracts are not
 interchangeable.
 
-## Tag-directory qualification (2026-10-19 snapshot)
+## Tag-directory qualification (2026-11-10 snapshot)
 
 Run `npm run bench:catalog` for the current result. This local, synthetic check
 compares native catalogs, the compact-index fallback, and initialized tag
@@ -18,25 +27,39 @@ in every later request; the fallback's human prefetch remains present too.
 Known-name loading needs no browse. Five-page exploration is also reported,
 including cases where it costs more than the compact index.
 
-The dated results below are retained as observed. Release 3.1.3 adds init
-recovery and live progress; those changes do not turn this synthetic transport
-comparison into evidence of generated-card quality or provider savings.
+The dated results below are retained as observed. Release 3.2.0 compacted the
+browse wire and made the first response carry the remaining names; those changes
+do not turn this synthetic transport comparison into evidence of generated-card
+quality or provider savings.
 
-Local working-tree run, 2026-10-19, Windows x64 / Node 26.3.0:
+Local working-tree run, 2026-11-10 (compact-wire revision), Windows x64 / Node
+26.3.0. Two changes dominate this snapshot. Browse pages no longer repeat the
+`version`/`facets` envelope on continuations, carry no provenance flag per card,
+and use a 32-character signature cursor instead of the ~330-character identity
+cursor; the first page also names its remainder in `rest` when that fits. The
+directory kept only populated tag rows in an earlier revision and, in this one,
+its instruction line grew to describe promoted outsiders and the `rest` route.
 
 | Synthetic skills | Native initial bytes | Previous initial bytes | Tag initial bytes | Cumulative saving vs previous, one browse |
 | --- | ---: | ---: | ---: | ---: |
-| 355 | 71,975 | 8,523 | 3,254 | 31.4% (55,290 vs 80,571 bytes) |
-| 2,000 | 406,188 | 30,373 | 3,280 | 79.1% (57,980 vs 277,221 bytes) |
-| 10,000 | 2,034,592 | 150,373 | 3,319 | 95.7% (58,388 vs 1,357,221 bytes) |
+| 355 | 71,975 | 8,523 | 3,318 | 33.8% (53,329 vs 80,571 bytes) |
+| 2,000 | 406,188 | 30,373 | 3,344 | 75.7% (67,422 vs 277,221 bytes) |
+| 10,000 | 2,034,592 | 150,373 | 3,383 | 95.0% (67,191 vs 1,357,221 bytes) |
 
 Pagination enumerated **355/355, 2,000/2,000 and 10,000/10,000** cards without
-duplicates or loss. With five browse responses, the 355-skill replay instead used
-164,870 bytes across 14 requests, **more** than the previous path. These are
-complete serialized payload bytes, not token conversions or provider savings.
+duplicates or loss in 18 / 98 / 489 pages. The first browse of one hot bucket
+behaved as designed: the 10-card bucket at 355 skills fit entirely in 1,519 bytes
+with no cursor; the 53-card bucket at 2,000 skills returned 15 complete cards
+plus 38 names in `rest` within 2,914 bytes, so one response named every candidate;
+the 264-card bucket at 10,000 skills returned 19 cards with a 42-character cursor
+and correctly omitted `rest` because the remainder cannot fit the cap. Five
+cursor-following browses cost 53,329 / 141,975 / 236,759 bytes across 10 / 12 / 14
+requests, versus 164,254 bytes across 14 requests for the five-page replay of the
+2026-10-19 contract. These are complete serialized payload bytes, not token
+conversions or provider savings.
 
-The immutable catalog snapshot took approximately 4 / 15 / 60 ms respectively;
-warm request preparation averaged approximately 1.3 / 5.3 / 27.5 ms in this run.
+The immutable catalog snapshot took approximately 7 / 24 / 118 ms respectively;
+warm request preparation averaged approximately 2.3 / 9.8 / 40.5 ms in this run.
 Snapshot creation is paid outside provider hot hooks; pagination reuses it.
 Latency depends on hardware and runtime; rerun rather than treating these as SLAs.
 
@@ -44,8 +67,14 @@ Blocking deterministic gates:
 
 - every eligible card is reachable exactly once through pagination, including
   stale/missing metadata under `unclassified`;
-- the directory is query-independent and at most 4,000 characters; each complete
+- the directory is query-independent and at most 4,000 characters, and renders
+  only populated tag rows plus a non-zero `unclassified` row; each complete
   serialized card response is at most 3,000 characters, including cursor/facets;
+- the wire carries no catalog `version`/`fingerprint`, cards are
+  `{name, summary, tags}` (plus `rescue: true` on a promoted outsider), facets and
+  `rest` are first-page-only, and the cursor stays a short `{o,s}` token;
+- a bucket of up to 73 cards names every candidate on the first page (cards plus
+  `rest`), and a larger bucket still pages without loss;
 - exact loading remains verbatim and path-contained;
 - no automatic skill selection or human-message overlay in tag mode;
 - one browse plus load saves cumulative serialized bytes against the compact

@@ -6,9 +6,10 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { hashSkill } from "../src/profile.ts";
 import {
-	createToolSearchExtension, DefaultResourceLoader, ExtensionRunner, discoverAndLoadExtensions, SessionManager, wrapRegisteredTools,
+	createToolSearchExtension, DefaultResourceLoader, ExtensionRunner, discoverAndLoadExtensions, formatSkillsForPrompt, SessionManager, wrapRegisteredTools,
 	type ExtensionActions, type ModelRegistry, type Skill,
 } from "@earendil-works/pi-coding-agent";
+import { getSystemMessageText } from "@earendil-works/pi-ai";
 
 test("Pi host loader keeps built-in tool_search alongside optimizer_tool_search", async () => {
 	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
@@ -252,7 +253,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 			{ role: "user", content: "設計を見直してください" },
 		];
 		const taggedContext = await runner.emitContext(taggedMessages as never) as typeof taggedMessages;
-		assert.match(String(taggedContext[0]!.sections?.skills), /skill-optimizer:tags:v1/);
+		assert.match(String(taggedContext[0]!.sections?.skills), /skill-optimizer:auto:v2/, "small catalog: the stable all-name index replaces the block (Q4-B); substitution reached the section");
 		assert.deepEqual(taggedContext[1], taggedMessages[1], "tag mode must not append an acknowledgment-inducing prefetch");
 		const browsed = await search.execute("tag-browse", { action: "search", tags: ["architecture"], query: "設計を見直してください" });
 		assert.ok(JSON.stringify(browsed.content).includes("repo-guidance"));
@@ -260,6 +261,118 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		active = []; // Simulate an external persona withholding every optimizer helper.
 		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "Review" }, { cwd: root, skills: taggedSkills });
 		assert.deepEqual(await runner.emitContext(taggedMessages as never), taggedMessages, "keep native discovery when the resolver is not callable");
+		assert.deepEqual(errors, []);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		for (const key of Object.keys(process.env)) {
+			if (key.startsWith("PI_SKILL_OPTIMIZER_")) delete process.env[key];
+		}
+		for (const [key, value] of Object.entries(optimizerEnvironment)) process.env[key] = value;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("real Pi loader/runner keeps a positive off-bucket lexical match inside the selected tag bucket browse", async () => {
+	// Tool-level pin of the rescue path: the semantic bucket stays complete, and a
+	// description-matching card from outside it is never vetoed. A ranker-top-3 outsider
+	// is promoted into the head at its rank position marked rescue:true, and the bucket
+	// keeps its remaining members. Pure-browser coverage (including the rank-3 cutoff and
+	// the cap of three) lives in test/catalog.test.ts; this drives the real loader, hook
+	// runner and wrapped skill_search through the wired orderedNames.
+	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
+	const extensionPath = packagedRoot
+		? join(resolve(packagedRoot), "src", "index.ts")
+		: fileURLToPath(new URL("../src/index.ts", import.meta.url));
+	const root = mkdtempSync(join(tmpdir(), "sko-rescue-tail-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const optimizerEnvironment = Object.fromEntries(Object.entries(process.env)
+		.filter(([key]) => key.startsWith("PI_SKILL_OPTIMIZER_")));
+	for (const key of Object.keys(optimizerEnvironment)) delete process.env[key];
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	try {
+		const fixture = [
+			{ name: "bucket-guide", description: "Keep integration tests deterministic, isolated and fast.", tags: ["testing"] },
+			{ name: "outside-guide", description: "An unusual specialist procedure for untangling legacy work. More detail follows.", tags: ["architecture"] },
+		] as const;
+		const skills: Skill[] = fixture.map(({ name, description }) => {
+			const baseDir = join(root, "skills", name);
+			mkdirSync(baseDir, { recursive: true });
+			const skillFile = join(baseDir, "SKILL.md");
+			writeFileSync(skillFile, `# ${name}\n\n${description}\n`, "utf8");
+			return {
+				name, description, filePath: skillFile, baseDir, disableModelInvocation: false,
+				sourceInfo: { path: skillFile, source: "cli", scope: "temporary", origin: "top-level" },
+			} as Skill;
+		});
+		const loaded = await discoverAndLoadExtensions([extensionPath], root, join(root, "agent"));
+		assert.deepEqual(loaded.errors, [], "extension must load with Pi's real jiti loader");
+		const modelRegistry = {
+			complete() { throw new Error("Provider calls are forbidden in this smoke test"); },
+		} as unknown as ModelRegistry;
+		const session = SessionManager.inMemory(root);
+		const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, modelRegistry);
+		const errors: unknown[] = [];
+		runner.onError((error) => errors.push(error));
+		const registered = runner.getAllRegisteredTools();
+		let active = registered.map(({ definition }) => definition.name);
+		runner.bindCore({
+			getAllTools: () => registered.map(({ definition, sourceInfo }) => ({ ...definition, sourceInfo })),
+			getActiveTools: () => [...active],
+			setActiveTools: (names: string[]) => { active = [...names]; },
+			getCommands: () => [],
+			appendEntry: () => {},
+		} as unknown as ExtensionActions, {
+			getModel: () => ({ provider: "test-provider" } as never), getScopedModels: () => [], isIdle: () => true,
+			isProjectTrusted: () => true, getSignal: () => undefined, abort() {},
+			hasPendingMessages: () => false, shutdown() {}, getContextUsage: () => undefined,
+			compact() {}, getSystemPrompt: () => "", getSystemPromptOptions: () => ({ cwd: root, skills }),
+		});
+		const ui = runner.getUIContext();
+		runner.setUIContext({ ...ui, notify: () => {}, setStatus: () => {} });
+		// Catalog metadata so skill_search runs in tag mode with one selectable bucket.
+		const profileDir = join(root, "agent", "skill-optimizer");
+		mkdirSync(profileDir, { recursive: true });
+		writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ catalog: { version: 1, cards: Object.fromEntries(
+			fixture.map(({ name, description, tags }) => [name, {
+				summary: description.split(".")[0]!, tags: [...tags], sourceHash: hashSkill(name, description),
+			}]),
+		) } }));
+		const command = runner.getCommand("skill-optimizer");
+		assert.ok(command);
+		await command.handler("", runner.createCommandContext()); // Explicit profile refresh, as a real session does at startup.
+		await runner.emitBeforeAgentStart(
+			{ messageType: "user", prompt: "Untangle legacy work" },
+			{ cwd: root, skills },
+		);
+		const search = wrapRegisteredTools(registered, runner).find((tool) => tool.name === "skill_search");
+		assert.ok(search);
+		const response = await search.execute("rescue", {
+			action: "search", tags: ["testing"], query: "unusual specialist procedure",
+		});
+		const page = JSON.parse((response.content[0] as { text: string }).text) as {
+			total: number; items: Array<{ name: string; summary: string; tags: string[]; rescue?: true }>;
+			facets?: Array<{ id: string; count: number }>; rest?: string[]; nextCursor?: string;
+		};
+		// The wired ranker puts outside-guide first overall, so it is promoted into the
+		// head at that rank position and the bucket card follows; no card is dropped.
+		assert.deepEqual(page.items.map(({ name }) => name), ["outside-guide", "bucket-guide"]);
+		assert.equal(page.items[0].rescue, true, "a promoted outsider must be marked rescue");
+		assert.equal(page.items[1].rescue, undefined);
+		assert.equal(page.total, 2);
+		// Facets describe the bucket only, never the rescue card.
+		assert.deepEqual(page.facets!.map(({ id }) => id), ["testing"]);
+		// The wire card carries no provenance flag and the envelope no catalog identity.
+		assert.deepEqual(Object.keys(page), ["total", "items", "facets", "usedChars"]);
+		assert.deepEqual(Object.keys(page.items[0]), ["name", "summary", "tags", "rescue"]);
+		// Positive control: the same wired query without tags is pure lexical filtering and
+		// returns only the off-bucket card, so its presence above can only be the rescue
+		// append behind the bucket (not canonical bucket order or a padded name list).
+		const lexicalOnly = JSON.parse(((await search.execute("rescue-control", {
+			action: "search", query: "unusual specialist procedure",
+		})).content[0] as { text: string }).text) as { total: number; items: Array<{ name: string }> };
+		assert.deepEqual(lexicalOnly.items.map(({ name }) => name), ["outside-guide"]);
+		assert.equal(lexicalOnly.total, 1);
 		assert.deepEqual(errors, []);
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -339,6 +452,137 @@ test("real Pi loader/runner lets optimizer_tool_search activate initially deferr
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("catalog substitution reaches the provider payload when another extension forces a system prompt", async () => {
+	// Root cause guard: Pi projects a `before_agent_start` handler's `systemPrompt` onto the
+	// request AFTER every `context_with_system` handler has run (Pi's
+	// `_installAgentForcedPromptProjection`), so a section-level substitution is silently
+	// discarded whenever a companion extension forces the prompt. pi-persona
+	// (src/extension/hooks.ts) and pi-persona-mind (src/index.ts) both return `systemPrompt`
+	// from `before_agent_start`, which is the normal condition in a real user session.
+	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
+	const extensionPath = packagedRoot
+		? join(resolve(packagedRoot), "src", "index.ts")
+		: fileURLToPath(new URL("../src/index.ts", import.meta.url));
+	const root = mkdtempSync(join(tmpdir(), "sko-forced-prompt-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const optimizerEnvironment = Object.fromEntries(Object.entries(process.env)
+		.filter(([key]) => key.startsWith("PI_SKILL_OPTIMIZER_")));
+	for (const key of Object.keys(optimizerEnvironment)) delete process.env[key];
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	try {
+		// Enough skills that the all-name floor exceeds the tag directory (Q4-B small-catalog guard
+		// crosses over near 230 skills), so this test keeps proving TAG DIRECTORY restoration.
+		const skills: Skill[] = Array.from({ length: 240 }, (_, index) => {
+			const name = `catalog-guidance-${index}`;
+			const baseDir = join(root, "skills", name);
+			mkdirSync(baseDir, { recursive: true });
+			const filePath = join(baseDir, "SKILL.md");
+			writeFileSync(filePath, `# ${name}\n\nRead the relevant module.\n`, "utf8");
+			return {
+				name,
+				description: `Use when reviewing repository module boundaries, interface contracts, verification steps and ownership rules for ${name} before editing.`,
+				filePath, baseDir, disableModelInvocation: false,
+				sourceInfo: { path: filePath, source: "cli", scope: "temporary", origin: "top-level" },
+			} as Skill;
+		});
+		// A companion extension that forces the prompt, exactly like pi-persona does.
+		const companionPath = join(root, "forced-prompt.ts");
+		writeFileSync(companionPath, `export default function (pi) {
+			pi.on("before_agent_start", (event) => ({ systemPrompt: \`\${event.systemPrompt}\n\n[companion injection]\` }));
+		}`, "utf8");
+		const loaded = await discoverAndLoadExtensions([extensionPath, companionPath], root, join(root, "agent"));
+		assert.deepEqual(loaded.errors, [], "extension must load with Pi's real jiti loader");
+		assert.equal(loaded.extensions.length, 2);
+		const modelRegistry = {
+			complete() { throw new Error("Provider calls are forbidden in this smoke test"); },
+		} as unknown as ModelRegistry;
+		const session = SessionManager.inMemory(root);
+		const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, modelRegistry);
+		const errors: unknown[] = [];
+		runner.onError((error) => errors.push(error));
+		const registered = runner.getAllRegisteredTools();
+		let active = registered.map(({ definition }) => definition.name);
+		runner.bindCore({
+			getAllTools: () => registered.map(({ definition, sourceInfo }) => ({ ...definition, sourceInfo })),
+			getActiveTools: () => [...active],
+			setActiveTools: (names: string[]) => { active = [...names]; },
+			getCommands: () => [],
+			appendEntry: () => {},
+		} as unknown as ExtensionActions, {
+			getModel: () => ({ provider: "test-provider" } as never), getScopedModels: () => [], isIdle: () => true,
+			isProjectTrusted: () => true, getSignal: () => undefined, abort() {},
+			hasPendingMessages: () => false, shutdown() {}, getContextUsage: () => undefined,
+			compact() {}, getSystemPrompt: () => "", getSystemPromptOptions: () => ({ cwd: root, skills }),
+		});
+		const ui = runner.getUIContext();
+		runner.setUIContext({ ...ui, notify: () => {}, setStatus: () => {} });
+
+		// Catalog metadata so the request runs in catalog (tag directory) mode.
+		const profileDir = join(root, "agent", "skill-optimizer");
+		mkdirSync(profileDir, { recursive: true });
+		writeFileSync(join(profileDir, "profile.json"), JSON.stringify({ catalog: { version: 1, cards: Object.fromEntries(
+			skills.map((skill) => [skill.name, {
+				summary: "Check module boundaries before editing.",
+				tags: ["architecture", "review"],
+				sourceHash: hashSkill(skill.name, skill.description),
+			}]),
+		) } }));
+
+		const started = await runner.emitBeforeAgentStart(
+			{ messageType: "user", prompt: "Review the module boundaries" },
+			{ cwd: root, skills },
+		);
+		const command = runner.getCommand("skill-optimizer");
+		assert.ok(command);
+		await command.handler("", runner.createCommandContext()); // Explicit profile refresh, as a real session does at startup.
+		const forced = (started.systemPromptOptions as { forceSystemPrompt?: string }).forceSystemPrompt;
+		assert.ok(typeof forced === "string" && forced.includes("[companion injection]"), "the companion extension must force the system prompt");
+
+		// Pi's own rendering of the skills section, wrapped by buildSystemPromptSections.
+		const nativeSection = `<skills>\n${formatSkillsForPrompt(skills, "read").trim()}\n</skills>`;
+		const rawMessages = [
+			{ role: "system", content: "", sections: { skills: nativeSection, cwd: `<cwd>${root}</cwd>` }, toolsAdded: [{ name: "read", description: "Read a file", parameters: { type: "object" } }], timestamp: 1 },
+			{ role: "user", content: "Review the module boundaries" },
+		];
+		const transformed = await runner.emitContext(rawMessages as never) as Array<{ role: string; content?: unknown; sections?: Record<string, unknown>; [key: string]: unknown }>;
+		assert.match(String(transformed[0]?.sections?.skills), /skill-optimizer:tags:v1/, "the section-level pass must substitute the directory");
+
+		// Replay Pi's forced-prompt projection (dist/core/agent-session.js `_installAgentForcedPromptProjection`):
+		// one head holding the forced text and the current tool declarations, every system message dropped.
+		const current = transformed[0]!;
+		const projected = [
+			{ role: "system", content: forced, ...(current.toolsAdded ? { toolsAdded: current.toolsAdded } : {}), timestamp: current.timestamp },
+			...transformed.filter((message) => message.role !== "system"),
+		];
+		// Provider-facing payload: a leading system message rendered to text, as every Pi API does.
+		const providerPayload = {
+			model: "fixture",
+			messages: projected.map((message) => message.role === "system"
+				? { role: "system", content: getSystemMessageText(message as never) }
+				: message),
+		};
+		const rewritten = await runner.emitBeforeProviderRequest(providerPayload) as typeof providerPayload;
+		const head = String(rewritten.messages[0]?.content ?? "");
+		assert.match(head, /skill-optimizer:tags:v1/, "the request-time pass must restore the directory in the provider payload");
+		assert.match(head, /<skill_directory/, "the payload must carry the tag directory");
+		assert.doesNotMatch(head, /<available_skills/, "the native skill catalog must not reach the model");
+		assert.match(head, /\[companion injection\]/, "the companion's forced text must be preserved");
+		assert.deepEqual(rewritten.messages.slice(1), providerPayload.messages.slice(1), "only the leading system message may change");
+		assert.deepEqual(errors, []);
+
+		// Replaying the same payload is an identity operation: no double accounting, no growth.
+		assert.deepEqual(await runner.emitBeforeProviderRequest(rewritten), rewritten);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		for (const key of Object.keys(process.env)) {
+			if (key.startsWith("PI_SKILL_OPTIMIZER_")) delete process.env[key];
+		}
+		for (const [key, value] of Object.entries(optimizerEnvironment)) process.env[key] = value;
 		rmSync(root, { recursive: true, force: true });
 	}
 });

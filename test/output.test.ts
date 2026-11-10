@@ -338,3 +338,88 @@ test("RTK coexistence requires per-result ownership evidence", () => {
 	assert.equal(shouldReduceToolResult({ ...base, toolName: "read", text: "[skill-optimizer: reduced]" }), false);
 	assert.equal(isKnownReducedOutput("[rtk: filtered output]"), true);
 });
+
+test("columnar reduction fails open for repeated and interleaved source keys", () => {
+	const options = { minSavingsBytes: 1, minSavingsRatio: 0 };
+	const rows = Array.from({ length: 100 }, (_, index) => ({ id: index, status: "ok", value: index % 7 }));
+	const clean = JSON.stringify(rows, null, 2);
+	const baseline = reduceJsonArrayColumnar(clean, options);
+	assert.equal(baseline.reduced, true, "control fixture must be reducible");
+	assert.deepEqual(decodeColumnarJson(baseline.text), rows);
+
+	// A repeated top-level key: JSON.parse keeps the last value, so encoding rows
+	// silently drops the first one. Fail open instead.
+	const duplicated = clean.replace('"status": "ok",', '"status": "ok",\n      "status": "duplicate",');
+	assert.notEqual(duplicated, clean);
+	assert.equal((JSON.parse(duplicated) as Array<{ status: string }>)[0].status, "duplicate");
+	const repeated = reduceJsonArrayColumnar(duplicated, options);
+	assert.equal(repeated.reduced, false);
+	assert.equal(repeated.strategy, "original");
+	assert.equal(repeated.text, duplicated);
+	assert.equal(repeated.toBytes, repeated.fromBytes);
+
+	// Interleaved key order is heterogeneous even though the key set matches.
+	const interleaved = clean.replace(
+		/"id": 0,(\s*)"status": "ok",(\s*)"value": 0/,
+		(_match, firstGap: string, secondGap: string) => `"status": "ok",${firstGap}"id": 0,${secondGap}"value": 0`,
+	);
+	assert.notEqual(interleaved, clean);
+	const reordered = reduceJsonArrayColumnar(interleaved, options);
+	assert.equal(reordered.reduced, false);
+	assert.equal(reordered.text, interleaved);
+
+	// Nested duplicates are lost by the same parse, so they fail open too.
+	const nestedRows = Array.from({ length: 100 }, (_, index) => ({ id: index, meta: { active: true } }));
+	const nestedClean = JSON.stringify(nestedRows, null, 2);
+	assert.equal(reduceJsonArrayColumnar(nestedClean, options).reduced, true);
+	const nestedDuplicated = nestedClean.replace('"active": true', '"active": true,\n        "active": false');
+	assert.notEqual(nestedDuplicated, nestedClean);
+	const nested = reduceJsonArrayColumnar(nestedDuplicated, options);
+	assert.equal(nested.reduced, false);
+	assert.equal(nested.text, nestedDuplicated);
+});
+
+test("a second pass over reduced output never grows and keeps counters canonical", () => {
+	const options = {
+		maxLines: 200,
+		maxBytes: 16_000,
+		headLines: 40,
+		tailLines: 60,
+		contextLines: 1,
+		minSavingsBytes: 512,
+		minSavingsRatio: 0.1,
+	};
+	const lines = Array.from({ length: 5_000 }, (_, index) => `row ${index} ordinary build output line`);
+	lines[2_500] = "ERROR: mid-file failure at src/app.ts:42";
+	const first = reduceOutput(lines.join("\n"), options);
+	assert.equal(first.reduced, true);
+
+	const second = reduceOutput(first.text, options);
+	assert.ok(second.toBytes <= first.toBytes, "a second pass must not grow the text");
+	assert.ok(second.text.includes("ERROR: mid-file failure at src/app.ts:42"), "evidence stays verbatim");
+	const counter = /^\.\.\. \((\d+) lines omitted\) \.\.\.$/;
+	const markers = (text: string): string[] => text.split("\n").filter((line) => line.includes("lines omitted"));
+	assert.deepEqual(markers(second.text), markers(first.text));
+	assert.equal(markers(first.text).length, 2);
+	for (const marker of markers(first.text)) assert.match(marker, counter);
+	const omitted = markers(first.text)
+		.map((line) => Number(counter.exec(line)![1]))
+		.reduce((total, value) => total + value, 0);
+	const kept = first.text.split("\n").length - markers(first.text).length;
+	assert.equal(omitted + kept, 5_000, "omitted counters describe the original source exactly once");
+
+	// A second pass that must reduce again keeps every marker canonical and
+	// never re-counts an already-omitted block.
+	const dense = Array.from({ length: 5_000 }, (_, index) => `row ${index} ordinary build output line`);
+	for (let index = 0; index < dense.length; index += 50) dense[index] = `ERROR: dense failure at src/app.ts:${index}`;
+	const denseFirst = reduceOutput(dense.join("\n"), options);
+	assert.equal(denseFirst.reduced, true);
+	assert.ok(denseFirst.toLines > options.maxLines, "fixture must still exceed the line budget");
+	const denseSecond = reduceOutput(denseFirst.text, options);
+	assert.ok(denseSecond.toBytes <= denseFirst.toBytes);
+	assert.ok(denseSecond.text.includes("ERROR: dense failure at src/app.ts:450"), "dense evidence survives");
+	for (const marker of markers(denseSecond.text)) {
+		assert.match(marker, counter);
+		assert.ok(Number(counter.exec(marker)![1]) <= 5_000);
+	}
+});
