@@ -17,6 +17,7 @@ function liveRuntime(skillCount = 2, immediateCalls = 0) {
 	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
 	let command!: (args: string, ctx: ExtensionContext) => Promise<void>;
 	const api = {
+		registerToolRenderer() {},
 		registerTool() {},
 		registerCommand(_name: string, options: { handler: typeof command }) { command = options.handler; },
 		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) { handlers.set(event, handler); return () => {}; },

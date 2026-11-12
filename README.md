@@ -10,7 +10,7 @@ Your library can keep growing without every skill description following every re
 
 ## Install
 
-Requires **Pi 1.0.0+** and **Node.js 26.3+**.
+Requires **Pi 1.0.1+** and **Node.js 26.3+**.
 
 ```bash
 pi install npm:@aeondave/pi-skill-optimizer

@@ -4,9 +4,9 @@
 
 ## Installation and updates
 
-Requires Pi 1.0.0 or newer and Node.js 26.3 or newer. Development packages and host
-integration tests target Pi 1.3.0; packaged release checks also cover the supported
-Pi 1.0.0 floor.
+Requires Pi 1.0.1 or newer and Node.js 26.3 or newer. Development packages and host
+integration tests target Pi 1.5.1; packaged release checks also cover the supported
+Pi 1.0.1 floor.
 
 ```bash
 pi install npm:@aeondave/pi-skill-optimizer

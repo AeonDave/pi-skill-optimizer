@@ -2,6 +2,16 @@
 
 All notable changes are documented here.
 
+## Unreleased
+
+### Added
+
+- Render `optimizer_tool_search` and both `skill_search` search response shapes as compact, expandable result cards. The renderer is display-only and uses Pi's `registerToolRenderer`; exact skill loads and other non-search actions keep their full text output.
+
+### Changed
+
+- Require Pi 1.0.1 or newer for the host-owned tool-renderer API. `@earendil-works/pi-tui` is an optional Pi-provided peer and a development-only test dependency; it is not bundled.
+
 ## 3.2.0 - 2026-11-10
 
 ### Added

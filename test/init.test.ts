@@ -18,6 +18,7 @@ type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<void> | v
 function registerExtension(): CommandHandler {
 	let command: CommandHandler | undefined;
 	const api = {
+		registerToolRenderer() {},
 		registerTool() {},
 		registerCommand(name: string, options: { handler: CommandHandler }) {
 			if (name === "skill-optimizer") command = options.handler;

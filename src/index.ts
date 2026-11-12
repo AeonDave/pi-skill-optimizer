@@ -80,6 +80,7 @@ import {
 import { sliceOutputLines } from "./output-recovery.ts";
 import { createSkillRegistry, type SkillRegistry } from "./skill-loader.ts";
 import { auditSkillDescriptions, planSkillPrefetch } from "./skills.ts";
+import { registerSearchToolRenderers } from "./ui/search-renderers.ts";
 import {
 	addExtractionTelemetry,
 	addProviderCacheTelemetry,
@@ -330,6 +331,7 @@ const RETRIEVE_OUTPUT_PARAMS = Type.Object({
 });
 
 export default function skillOptimizer(pi: ExtensionAPI) {
+	registerSearchToolRenderers(pi);
 	let snapshot: RuntimeSnapshot | undefined;
 	let cachedConfig: { cwd: string; value: ConfigRecord } | undefined;
 	let retryAfter = 0;

@@ -4,9 +4,9 @@
 
 Pi extension that reduces repeated request tokens through one AUTO discovery contract, dynamic tool activation, and recoverable tool-output reduction. TypeScript is loaded by Pi through jiti without a build step.
 
-Runtime floor: Pi 1.0.0 and Node.js 26.3. Use current Pi APIs; do not add shims for older runtimes. Reading existing user profiles is a data-preservation requirement, not a promise of support for old Pi versions.
+Runtime floor: Pi 1.0.1 and Node.js 26.3. Use current Pi APIs; do not add shims for older runtimes. Reading existing user profiles is a data-preservation requirement, not a promise of support for old Pi versions.
 
-Development host packages and integration tests currently target Pi 1.5.1; keep both Pi development packages aligned. Wildcard peers remain host-provided.
+Development host packages and integration tests currently target Pi 1.5.1; keep all three Pi development packages aligned. Wildcard peers remain host-provided.
 
 ## Package distribution
 
@@ -146,7 +146,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - Output or history changes require focused tests and `npm run bench:output`.
 - Other pure modules require their corresponding suites.
 - Hook or config changes require `npm run typecheck`, then `pi -e ./src/index.ts` with status, audit, and search/load smoke paths.
-- Release candidates require `smoke:blackbox` against the unpacked npm tarball with the current development Pi and the supported Pi 1.0.0 floor. The default expected version follows the development manifest; select another CLI with `PI_CLI` and pass its exact version as the second argument (for example `<package-root> 1.0.0`). The fixture model is local and needs no provider key.
+- Release candidates require `smoke:blackbox` against the unpacked npm tarball with the current development Pi and the supported Pi 1.0.1 floor. The default expected version follows the development manifest; select another CLI with `PI_CLI` and pass its exact version as the second argument (for example `<package-root> 1.0.1`). The fixture model is local and needs no provider key.
 - Run focused tests after edits, then all local gates before a completion claim.
 - Never invoke `corpus:build` or `bench:real` implicitly.
 

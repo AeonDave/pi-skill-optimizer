@@ -62,6 +62,7 @@ function createRuntime(options: RuntimeOptions = {}) {
 	);
 	const activeTools = new Set(options.initialActive ?? []);
 	const api = {
+		registerToolRenderer() {},
 		registerTool(definition: unknown) {
 			const tool = definition as RuntimeTool;
 			tools.set(tool.name, tool);

@@ -6,10 +6,12 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { hashSkill } from "../src/profile.ts";
 import {
-	createToolSearchExtension, DefaultResourceLoader, ExtensionRunner, discoverAndLoadExtensions, formatSkillsForPrompt, SessionManager, wrapRegisteredTools,
+	createToolSearchExtension, DefaultResourceLoader, ExtensionRunner, ToolExecutionComponent, discoverAndLoadExtensions, formatSkillsForPrompt, SessionManager, wrapRegisteredTools,
 	type ExtensionActions, type ModelRegistry, type Skill,
 } from "@earendil-works/pi-coding-agent";
+import { getKeybindings, KeybindingsManager, replaceControlCharacters, setKeybindings, stripTerminalSequences, type TUI } from "@earendil-works/pi-tui";
 import { getSystemMessageText } from "@earendil-works/pi-ai";
+import { initTheme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 
 test("Pi host loader keeps built-in tool_search alongside optimizer_tool_search", async () => {
 	const packagedRoot = process.env.PI_SKILL_OPTIMIZER_TEST_PACKAGE;
@@ -65,17 +67,21 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 	}
 	const root = mkdtempSync(join(tmpdir(), "sko-host-"));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousKeybindings = getKeybindings();
+	setKeybindings(new KeybindingsManager({ "app.tools.expand": { defaultKeys: "ctrl+o", description: "Expand tool output" } }));
 	const optimizerEnvironment = Object.fromEntries(Object.entries(process.env)
 		.filter(([key]) => key.startsWith("PI_SKILL_OPTIMIZER_")));
 	for (const key of Object.keys(optimizerEnvironment)) delete process.env[key];
 	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 	try {
+		initTheme("dark", false);
 		const baseDir = join(root, "skills", "repo guidance 雪");
 		mkdirSync(baseDir, { recursive: true });
 		const filePath = join(baseDir, "SKILL.md");
 		const instructions = "# Repository guidance\r\n" + "Read the relevant module.\r\n".repeat(900)
 			+ "Consult the appropriate architecture and behavioral skills when needed.\n";
 		writeFileSync(filePath, instructions, "utf8");
+		writeFileSync(join(baseDir, "reference.txt"), "Resource marker\nsecond line", "utf8");
 		const skills: Skill[] = [{
 			name: "repo-guidance", description: "Use when reviewing repository module boundaries.",
 			filePath, baseDir, disableModelInvocation: false,
@@ -216,10 +222,28 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		const tools = wrapRegisteredTools(registered, runner);
 		const search = tools.find((tool) => tool.name === "skill_search");
 		assert.ok(search);
+		const skillDefinition = registered.find(({ definition }) => definition.name === "skill_search")?.definition;
+		const skillRenderers = runner.resolveToolRenderers("skill_search", () => undefined);
+		assert.ok(skillDefinition && skillRenderers?.renderCall && skillRenderers.renderResult);
+		const renderSkill = (args: Record<string, unknown>, result: Awaited<ReturnType<typeof search.execute>>, expanded: boolean) => {
+			const card = new ToolExecutionComponent("skill_search", "skill-render", args, {}, { ...skillDefinition, ...skillRenderers }, { requestRender() {} } as unknown as TUI, root);
+			card.updateResult({ content: result.content as never, isError: false, details: result.details });
+			card.setExpanded(expanded);
+			return card.render(140).map((line) => replaceControlCharacters(stripTerminalSequences(line))).join("\n");
+		};
 		const found = await search.execute("find", { action: "search", query: "repository module boundaries" });
 		assert.ok(JSON.stringify(found.content).includes("repo-guidance"));
+		const foundSource = JSON.stringify(found.content);
+		assert.match(renderSkill({ action: "search", query: "repository module boundaries" }, found, false), /repo-guidance/);
+		assert.match(renderSkill({ action: "search", query: "repository module boundaries" }, found, true), /Search confidence:/);
+		assert.equal(JSON.stringify(found.content), foundSource);
 		const full = await search.execute("load", { action: "load", name: "repo-guidance" });
 		assert.deepEqual(full.content, [{ type: "text", text: instructions }]);
+		assert.match(renderSkill({ action: "load", name: "repo-guidance" }, full, true), /Consult the appropriate architecture/);
+		const resource = await search.execute("resource", { action: "resource", name: "repo-guidance", path: "reference.txt" });
+		assert.match(renderSkill({ action: "resource", name: "repo-guidance", path: "reference.txt" }, resource, true), /Resource marker\s+second line/);
+		const location = await search.execute("location", { action: "location", name: "repo-guidance" });
+		assert.match(renderSkill({ action: "location", name: "repo-guidance" }, location, true), /SKILL\.md/);
 		const rewritten = await runner.emitToolResult({
 			type: "tool_result", toolName: "skill_search", toolCallId: "load",
 			input: { action: "load", name: "repo-guidance" }, content: full.content,
@@ -257,12 +281,34 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		assert.deepEqual(taggedContext[1], taggedMessages[1], "tag mode must not append an acknowledgment-inducing prefetch");
 		const browsed = await search.execute("tag-browse", { action: "search", tags: ["architecture"], query: "設計を見直してください" });
 		assert.ok(JSON.stringify(browsed.content).includes("repo-guidance"));
+		const browseSource = JSON.stringify(browsed.content);
+		assert.match(renderSkill({ action: "search", tags: ["architecture"], query: "設計を見直してください" }, browsed, false), /repo-guidance/);
+		assert.match(renderSkill({ action: "search", tags: ["architecture"], query: "設計を見直してください" }, browsed, true), /Facets:/);
+		assert.equal(JSON.stringify(browsed.content), browseSource);
+		const longQuery = `${"longquery ".repeat(18)}end-marker`;
+		const longArgs = { action: "search", tags: ["architecture"], match: "all", query: longQuery };
+		const longExpanded = renderSkill(longArgs, browsed, true);
+		assert.match(longExpanded, /end-marker/);
+		assert.match(longExpanded, /architecture/);
+		const maliciousPage = JSON.parse((browsed.content[0] as { text: string }).text);
+		maliciousPage.items[0].tags = ["\u001b]0;INJECTED-TAG\u0007safe"];
+		const unsafeResult = { ...browsed, content: [{ type: "text" as const, text: JSON.stringify(maliciousPage) }] };
+		const unsafeArgs = { action: "\u001b]0;INJECTED-ACTION\u0007search", query: "q" };
+		const unsafeCard = new ToolExecutionComponent("skill_search", "unsafe", unsafeArgs, {}, { ...skillDefinition, ...skillRenderers }, { requestRender() {} } as unknown as TUI, root);
+		unsafeCard.updateResult({ content: unsafeResult.content, isError: false, details: browsed.details });
+		unsafeCard.setExpanded(true);
+		assert.doesNotMatch(unsafeCard.render(140).join("\n"), /\u001b\]0;INJECTED/);
+		const tagCard = new ToolExecutionComponent("skill_search", "unsafe-tag", { action: "search" }, {}, { ...skillDefinition, ...skillRenderers }, { requestRender() {} } as unknown as TUI, root);
+		tagCard.updateResult({ content: unsafeResult.content, isError: false, details: browsed.details });
+		tagCard.setExpanded(true);
+		assert.doesNotMatch(tagCard.render(140).join("\n"), /\u001b\]0;INJECTED/);
 		assert.deepEqual((await search.execute("tag-load", { action: "load", name: "repo-guidance" })).content, [{ type: "text", text: instructions }]);
 		active = []; // Simulate an external persona withholding every optimizer helper.
 		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "Review" }, { cwd: root, skills: taggedSkills });
 		assert.deepEqual(await runner.emitContext(taggedMessages as never), taggedMessages, "keep native discovery when the resolver is not callable");
 		assert.deepEqual(errors, []);
 	} finally {
+		setKeybindings(previousKeybindings);
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		for (const key of Object.keys(process.env)) {
@@ -392,8 +438,11 @@ test("real Pi loader/runner lets optimizer_tool_search activate initially deferr
 		: fileURLToPath(new URL("../src/index.ts", import.meta.url));
 	const root = mkdtempSync(join(tmpdir(), "sko-deferred-"));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousKeybindings = getKeybindings();
 	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	setKeybindings(new KeybindingsManager({ "app.tools.expand": { defaultKeys: "ctrl+o", description: "Expand tool output" } }));
 	try {
+		initTheme("dark", false);
 		const deferredPath = join(root, "deferred.ts");
 		writeFileSync(deferredPath, `export default function (pi) {
 			pi.registerTool({
@@ -449,7 +498,52 @@ test("real Pi loader/runner lets optimizer_tool_search activate initially deferr
 		assert.deepEqual(page.activated, ["mcp__issues__find", "mcp__issues__update"]);
 		assert.ok(active.includes("mcp__issues__find"));
 		assert.ok(active.includes("mcp__issues__update"));
+		assert.equal(registered.filter(({ definition }) => definition.name === "optimizer_tool_search").length, 1, "the renderer must not register a duplicate tool");
+		const baseDefinition = registered.find(({ definition }) => definition.name === "optimizer_tool_search")?.definition;
+		assert.ok(baseDefinition);
+		const renderers = runner.resolveToolRenderers("optimizer_tool_search", () => undefined);
+		assert.ok(renderers?.renderCall);
+		assert.ok(renderers?.renderResult);
+		const nativeTool = { ...baseDefinition, ...renderers };
+		const nativeCard = new ToolExecutionComponent(
+			"optimizer_tool_search", "find-deferred", { query: "issue tracker tickets" }, {}, nativeTool,
+			{ requestRender() {} } as unknown as TUI, root,
+		);
+		const modelPayload = JSON.stringify(result.content);
+		nativeCard.updateResult({ content: result.content as never, isError: false, details: result.details });
+		const render = () => nativeCard.render(120).map((line) => replaceControlCharacters(stripTerminalSequences(line))).join("\n");
+		const collapsed = render();
+		assert.match(collapsed, /tool search issue tracker tickets/i);
+		assert.match(collapsed, /results/);
+		assert.match(collapsed, /ctrl\+o to expand details/i, "the card should use the host's configured expansion hint");
+		assert.doesNotMatch(collapsed, /Confidence: high|Matched fields|\{"results"/, "the compact card should not expose the raw JSON payload");
+		const collapsedLines = collapsed.split("\n");
+		const click = nativeCard.handleMouse({
+			type: "click", button: "left", x: 2, y: collapsedLines.length - 2,
+			screenX: 2, screenY: collapsedLines.length - 2, width: 120, height: collapsedLines.length,
+			shift: false, alt: false, ctrl: false,
+		});
+		assert.ok(click, "a left click in the rendered result should be handled by Pi's native card");
+		const expandedByClick = render();
+		assert.match(expandedByClick, /Confidence: high/);
+		assert.match(expandedByClick, /Matched fields: description/);
+		assert.match(expandedByClick, /Activated: mcp__issues__find, mcp__issues__update/);
+		assert.match(expandedByClick, /Next cursor: none/, "Pi's expanded state should reveal the complete page fields");
+		const expandedLines = expandedByClick.split("\n");
+		const collapseClick = nativeCard.handleMouse({
+			type: "click", button: "left", x: 2, y: expandedLines.length - 2,
+			screenX: 2, screenY: expandedLines.length - 2, width: 120, height: expandedLines.length,
+			shift: false, alt: false, ctrl: false,
+		});
+		assert.ok(collapseClick, "a second click should collapse the native card");
+		assert.doesNotMatch(render(), /Matched fields:/);
+		assert.equal(JSON.stringify(result.content), modelPayload, "rendering must leave the model-facing tool payload intact");
+		nativeCard.updateResult({ content: result.content as never, isError: true, details: result.details });
+		const nativeError = render();
+		assert.match(nativeError, /tool error output/);
+		assert.doesNotMatch(nativeError, /Confidence: high|Matched fields:/, "host errors must not be rendered as a successful page");
 	} finally {
+		setKeybindings(previousKeybindings);
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		rmSync(root, { recursive: true, force: true });
