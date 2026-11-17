@@ -37,6 +37,7 @@ test("runtime floors and tested Pi version match installation docs and CI", () =
 	};
 	const readme = readFileSync(new URL("README.md", root), "utf8");
 	const agents = readFileSync(new URL("AGENTS.md", root), "utf8");
+	const configuration = readFileSync(new URL("docs/CONFIGURATION.md", root), "utf8");
 	const ci = readFileSync(new URL(".github/workflows/ci.yml", root), "utf8");
 	const nodeFloor = pkg.engines.node.replace(/^>=/, "");
 	// Host peers are wildcard by Pi's packaging contract. The supported floor can
@@ -45,6 +46,8 @@ test("runtime floors and tested Pi version match installation docs and CI", () =
 	assert.ok(piFloor, "README must state the supported Pi floor");
 	assert.ok(agents.includes(`Runtime floor: Pi ${piFloor}`));
 	const testedPi = pkg.devDependencies["@earendil-works/pi-coding-agent"].replace(/^\^/, "");
+	assert.ok(agents.includes(`currently target Pi ${testedPi}`));
+	assert.ok(configuration.includes(`integration tests target Pi ${testedPi}`));
 	const compareVersions = (left: string, right: string): number => {
 		const a = left.split(".").map(Number);
 		const b = right.split(".").map(Number);
@@ -54,7 +57,7 @@ test("runtime floors and tested Pi version match installation docs and CI", () =
 	assert.ok(compareVersions(testedPi, piFloor) >= 0, "tested Pi version must meet the supported floor");
 	assert.ok(readme.includes(`Node.js ${nodeFloor.replace(/\.0$/, "")}+`));
 	assert.ok(ci.includes(`"${nodeFloor}"`), "CI must validate the exact minimum Node version");
-	for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent"]) {
+	for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"]) {
 		assert.equal(pkg.peerDependencies[name], "*");
 		assert.equal(pkg.devDependencies[name], `^${testedPi}`);
 	}
@@ -90,7 +93,7 @@ test("public Pi gallery metadata uses the shipped banner and host-provided depen
 		"src", "docs/ARCHITECTURE.md", "docs/CONFIGURATION.md", "docs/RANKING.md",
 		"assets/banner.png", "README.md", "BENCHMARK.md", "LICENSE", "CHANGELOG.md",
 	]);
-	for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "typebox"]) {
+	for (const name of ["@earendil-works/pi-ai", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui", "typebox"]) {
 		assert.equal(pkg.dependencies?.[name], undefined, `${name} must come from the Pi host`);
 		assert.equal(pkg.peerDependencies[name], "*");
 		assert.equal(pkg.peerDependenciesMeta?.[name]?.optional, true, "standalone npm must not auto-install another host");

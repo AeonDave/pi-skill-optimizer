@@ -215,13 +215,14 @@ test("profile writes reject stale snapshots instead of replacing newer data", ()
 	try {
 		const path = join(dir, "profile.json");
 		const empty = readStoredProfile(path);
-		writeProfileFiles([{
+		const committed = writeProfileFiles([{
 			path,
 			profile: { ...EMPTY_PROFILE, critical: ["first"] },
 			skillCount: 1,
 			hashes: { first: "one" },
 			expectedRevision: empty.revision,
 		}], 3, 1_700_000_000_000);
+		assert.equal(committed.get(path), readStoredProfile(path).revision);
 		assert.throws(() => writeProfileFiles([{
 			path,
 			profile: { ...EMPTY_PROFILE, critical: ["stale"] },

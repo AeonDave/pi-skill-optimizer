@@ -135,6 +135,7 @@ const MAX_SCHEMA_SEARCH_CHARS = 2_048;
 const MAX_SCHEMA_SEARCH_NODES = 96;
 const MAX_SCHEMA_SEARCH_DEPTH = 4;
 const MAX_SCHEMA_SEARCH_TERMS = 256;
+const MAX_SCHEMA_SEARCH_COLLECTION_ITEMS = 256;
 const DEFAULT_PAGE_SIZE = 8;
 const DEFAULT_DESCRIPTION_CHARS = 240;
 const CURSOR_VERSION = "td1";
@@ -195,12 +196,14 @@ export function replaceToolDescription(value: unknown, description: string): unk
 
 function appendBounded(chunks: string[], value: unknown, state: { chars: number }): void {
 	if ((typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") || state.chars >= MAX_SCHEMA_SEARCH_CHARS) return;
-	const text = String(value)
+	// Bound the input before regex normalization too: clipping the final result
+	// alone still scans an arbitrarily large enum value, name, or description.
+	const remaining = MAX_SCHEMA_SEARCH_CHARS - state.chars;
+	const text = String(value).slice(0, remaining)
 		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
 		.replace(/[_-]+/g, " ")
 		.trim();
 	if (!text) return;
-	const remaining = MAX_SCHEMA_SEARCH_CHARS - state.chars;
 	const bounded = text.slice(0, remaining);
 	chunks.push(bounded);
 	state.chars += bounded.length + 1;
@@ -212,8 +215,20 @@ function schemaFields(tool: Tool): SchemaFields {
 	if (!schema || typeof schema !== "object") return { names: "", text: "" };
 	const names: string[] = [];
 	const text: string[] = [];
-	const state = { chars: 0, nodes: 0 };
+	const state = { chars: 0, nodes: 0, collectionItems: 0 };
 	const seen = new WeakSet<object>();
+	const visitArray = (value: unknown, accept: (item: unknown) => void): void => {
+		if (!Array.isArray(value)) return;
+		// Count slots, including null/empty/invalid ones, across schema collections.
+		// Neither a character cap nor an object-node cap bounds those reads.
+		for (let index = 0; index < value.length
+			&& state.collectionItems < MAX_SCHEMA_SEARCH_COLLECTION_ITEMS
+			&& state.nodes < MAX_SCHEMA_SEARCH_NODES
+			&& state.chars < MAX_SCHEMA_SEARCH_CHARS; index += 1) {
+			state.collectionItems += 1;
+			accept(value[index]);
+		}
+	};
 
 	const visit = (value: unknown, depth: number): void => {
 		if (!value || typeof value !== "object" || depth > MAX_SCHEMA_SEARCH_DEPTH || state.nodes >= MAX_SCHEMA_SEARCH_NODES || state.chars >= MAX_SCHEMA_SEARCH_CHARS) return;
@@ -221,25 +236,30 @@ function schemaFields(tool: Tool): SchemaFields {
 		seen.add(value as object);
 		state.nodes += 1;
 		const record = value as Record<string, unknown>;
-		if (Array.isArray(record.required)) for (const required of record.required) appendBounded(names, required, state);
-		if (Array.isArray(record.enum)) for (const option of record.enum) appendBounded(text, option, state);
+		visitArray(record.required, (required) => appendBounded(names, required, state));
+		visitArray(record.enum, (option) => appendBounded(text, option, state));
 		if (typeof record.description === "string") appendBounded(text, record.description, state);
-		if (record.properties && typeof record.properties === "object" && !Array.isArray(record.properties)) {
+		if (state.collectionItems < MAX_SCHEMA_SEARCH_COLLECTION_ITEMS
+			&& state.nodes < MAX_SCHEMA_SEARCH_NODES && state.chars < MAX_SCHEMA_SEARCH_CHARS
+			&& record.properties && typeof record.properties === "object" && !Array.isArray(record.properties)) {
 			const properties = record.properties as Record<string, unknown>;
-			for (const name of Object.keys(properties).sort()) {
-				appendBounded(names, name, state);
-				visit(properties[name], depth + 1);
-				if (state.nodes >= MAX_SCHEMA_SEARCH_NODES || state.chars >= MAX_SCHEMA_SEARCH_CHARS) break;
+			// Key enumeration is necessarily O(own keys) in JavaScript. Do not also
+			// sort or traverse an oversized collection: skip its property evidence,
+			// retaining ordinary names/descriptions and other bounded schema fields.
+			const keys = Object.keys(properties);
+			if (keys.length <= MAX_SCHEMA_SEARCH_COLLECTION_ITEMS - state.collectionItems) {
+				for (const name of keys.sort()) {
+					if (state.nodes >= MAX_SCHEMA_SEARCH_NODES || state.chars >= MAX_SCHEMA_SEARCH_CHARS
+						|| state.collectionItems >= MAX_SCHEMA_SEARCH_COLLECTION_ITEMS) break;
+					state.collectionItems += 1;
+					appendBounded(names, name, state);
+					visit(properties[name], depth + 1);
+				}
 			}
 		}
 		if (record.items) visit(record.items, depth + 1);
 		for (const keyword of ["allOf", "anyOf", "oneOf"] as const) {
-			const branches = record[keyword];
-			if (!Array.isArray(branches)) continue;
-			for (const branch of branches) {
-				visit(branch, depth + 1);
-				if (state.nodes >= MAX_SCHEMA_SEARCH_NODES || state.chars >= MAX_SCHEMA_SEARCH_CHARS) break;
-			}
+			visitArray(record[keyword], (branch) => visit(branch, depth + 1));
 		}
 	};
 

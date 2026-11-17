@@ -95,18 +95,20 @@ function readJson(path: string): unknown | undefined {
 	return stored ? JSON.parse(stored.text) : undefined;
 }
 
-/** Replace a JSON file atomically. Callers coordinate conflicting writers. */
-export function writeJsonAtomic(path: string, value: unknown): void {
+/** Replace JSON atomically and return its exact written revision. Callers coordinate writers. */
+export function writeJsonAtomic(path: string, value: unknown): string {
+	const text = `${JSON.stringify(value, null, 2)}\n`;
 	mkdirSync(dirname(path), { recursive: true });
 	const temp = join(dirname(path), `.${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`);
 	let fd: number | undefined;
 	try {
 		fd = openSync(temp, "wx", 0o600);
-		writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+		writeFileSync(fd, text, "utf8");
 		fsyncSync(fd);
 		closeSync(fd);
 		fd = undefined;
 		renameSync(temp, path);
+		return revision(text);
 	} finally {
 		if (fd !== undefined) {
 			try { closeSync(fd); } catch { /* best effort */ }
@@ -220,19 +222,20 @@ export function loadMergedProfile(paths: { global: string; project: string }): S
 	return mergeProfiles(globalProfile, readStoredProfile(paths.project).profile);
 }
 
-/** Commit one or more profile files after verifying every source revision. */
-export function writeProfileFiles(writes: readonly ProfileWrite[], initVersion: number, now = Date.now()): void {
-	if (writes.length === 0) return;
+/** Commit profiles and return their own revisions, never a later writer's snapshot. */
+export function writeProfileFiles(writes: readonly ProfileWrite[], initVersion: number, now = Date.now()): ReadonlyMap<string, string> {
+	if (writes.length === 0) return new Map();
 	const paths = writes.map((write) => write.path);
 	if (new Set(paths).size !== paths.length) throw new Error("duplicate path in profile write set");
-	withFileLocks(paths, () => {
+	return withFileLocks(paths, () => {
 		for (const write of writes) {
 			const currentRevision = readText(write.path)?.revision ?? null;
 			if (currentRevision !== write.expectedRevision) throw new ConcurrentFileUpdateError(write.path);
 		}
 		const generatedAt = new Date(now).toISOString();
+		const revisions = new Map<string, string>();
 		for (const write of writes) {
-			writeJsonAtomic(write.path, {
+			const committedRevision = writeJsonAtomic(write.path, {
 				version: 2,
 				initVersion,
 				generatedAt,
@@ -240,7 +243,9 @@ export function writeProfileFiles(writes: readonly ProfileWrite[], initVersion: 
 				...write.profile,
 				skillHashes: write.hashes,
 			});
+			revisions.set(write.path, committedRevision);
 		}
+		return revisions;
 	});
 }
 

@@ -114,6 +114,96 @@ test("schema traversal ignores routing text beyond the depth bound", () => {
 	assert.deepEqual(page.results.map((result) => result.name), ["first_tool", "second_tool"]);
 });
 
+test("schema arrays stop reading at the shared work budget, including empty values and branches", () => {
+	for (const key of ["required", "enum", "allOf", "anyOf", "oneOf"]) {
+		let reads = 0;
+		const values = new Proxy(Array(10_000).fill(null), {
+			get(target, property, receiver) {
+				if (typeof property === "string" && /^\d+$/.test(property)) reads += 1;
+				return Reflect.get(target, property, receiver);
+			},
+		});
+		buildToolDiscoveryCatalog([{ name: "custom_tool", parameters: { [key]: values } }]);
+		assert.ok(reads <= 256, `${key} read ${reads} array entries`);
+	}
+});
+
+test("schema array budget is shared across fields and nested schemas", () => {
+	let reads = 0;
+	const values = new Proxy(Array(200).fill(null), {
+		get(target, property, receiver) {
+			if (typeof property === "string" && /^\d+$/.test(property)) reads += 1;
+			return Reflect.get(target, property, receiver);
+		},
+	});
+	buildToolDiscoveryCatalog([{
+		name: "custom_tool",
+		parameters: { required: values, properties: { nested: { enum: values } }, allOf: values },
+	}]);
+	assert.ok(reads <= 256, `schema read ${reads} total array entries`);
+});
+
+test("nested arrays cannot spend the budget reserved by a parent property loop twice", () => {
+	let reads = 0;
+	const values = new Proxy(Array(256).fill(null), {
+		get(target, property, receiver) {
+			if (typeof property === "string" && /^\d+$/.test(property)) reads += 1;
+			return Reflect.get(target, property, receiver);
+		},
+	});
+	const properties = {
+		get alpha() { reads += 1; return { enum: values }; },
+		get beta() { reads += 1; return {}; },
+	};
+	buildToolDiscoveryCatalog([{ name: "custom_tool", parameters: { properties } }]);
+	assert.equal(reads, 256, "property and nested array reads must share one budget");
+});
+
+test("schema text cap stops array reads and bounds source text before normalization", () => {
+	const values = ["needle ".repeat(1_000)];
+	Object.defineProperty(values, 1, { get() { throw new Error("schema text budget was exhausted"); } });
+	const catalog = buildToolDiscoveryCatalog([{ name: "custom_tool", parameters: { enum: values } }]);
+	assert.ok(catalog.entries[0]?.fields.schemaText.frequencies.has("needle"));
+	const whitespace = buildToolDiscoveryCatalog([{
+		name: "custom_tool",
+		parameters: { description: `${" ".repeat(10_000)}unboundedTailMarker` },
+	}]);
+	assert.equal(searchToolDiscoveryCatalog(whitespace, "unboundedTailMarker").confidence, "none");
+});
+
+test("bounded schema properties retain canonical order independently of insertion order", () => {
+	const properties = { zebraKey: { description: "Zebra evidence" }, alphaKey: { description: "Alpha evidence" } };
+	const first = buildToolDiscoveryCatalog([{ name: "custom_tool", parameters: { properties } }]);
+	const second = buildToolDiscoveryCatalog([{
+		name: "custom_tool",
+		parameters: { properties: Object.fromEntries(Object.entries(properties).reverse()) },
+	}]);
+	assert.equal(first.fingerprint, second.fingerprint);
+	assert.deepEqual([...first.entries[0]!.fields.schemaName.frequencies.keys()], ["alpha", "key", "zebra"]);
+});
+
+test("oversized schema property collections skip property reads and retain ordinary tool discovery", () => {
+	let reads = 0;
+	const properties = Object.create(null) as Record<string, unknown>;
+	for (let index = 0; index < 257; index += 1) {
+		Object.defineProperty(properties, `hiddenNeedle${index}`, {
+			enumerable: true,
+			get() { reads += 1; return { description: "unboundedTailMarker" }; },
+		});
+	}
+	const catalog = buildToolDiscoveryCatalog([{
+		name: "custom_tool",
+		description: "Retrieve a weather forecast",
+		parameters: { properties, description: "Bounded root description" },
+	}]);
+	assert.equal(reads, 0);
+	assert.equal(catalog.entries[0]?.fields.schemaName.length, 0);
+	assert.equal(searchToolDiscoveryCatalog(catalog, "unboundedTailMarker").confidence, "none");
+	assert.equal(searchToolDiscoveryCatalog(catalog, "custom tool").results[0]?.name, "custom_tool");
+	assert.equal(searchToolDiscoveryCatalog(catalog, "weather forecast").results[0]?.name, "custom_tool");
+	assert.ok(catalog.entries[0]?.fields.schemaText.frequencies.has("bounded"));
+});
+
 test("exact name evidence outranks description-only evidence", () => {
 	const catalog = buildToolDiscoveryCatalog([
 		{ name: "invoice_lookup", description: "Fetch billing data." },

@@ -12,6 +12,7 @@ import {
 	getUsageConfig,
 	getUsageFilePath,
 	isDisabled,
+	isProviderEnabled,
 } from "./config.ts";
 import {
 	batchSkillsByWeight,
@@ -39,18 +40,13 @@ import { buildInitProfileWrites, needsProfileScopeRepair } from "./init-profile.
 import { INIT_PROFILE_PROMPT, INIT_PROFILE_VERSION } from "./init-prompt.ts";
 import { createInitProgress, type InitProgress } from "./init-progress.ts";
 import { runInitBatch } from "./init-worker.ts";
+import { awaitModelCall } from "./model-call.ts";
+import { reduceToolOutput, type OutputExtraction } from "./output-pipeline.ts";
 import { optimizePayload, RECENT_SKILL_HINT_LIMIT, type CatalogOutcome, type OptimizeConfig } from "./optimize.ts";
 import {
 	buildExtractPrompt,
-	hasMinimumSavings,
-	isExcludedCommand,
 	isRtkSource,
-	reduceJsonArrayColumnar,
-	reduceOutput,
 	shouldReduceToolResult,
-	utf8ByteLength,
-	validateExtractedOutput,
-	type ExtractRejectionReason,
 } from "./output.ts";
 import {
 	cleanupTemporaryOutputs,
@@ -88,6 +84,7 @@ import {
 	EMPTY_EXTRACTION_TELEMETRY,
 	EMPTY_PROVIDER_CACHE_TELEMETRY,
 	EMPTY_SAVINGS,
+	providerUsageTelemetry,
 	totalSavings,
 	type ExtractionTelemetry,
 	type ProviderCacheTelemetry,
@@ -232,11 +229,10 @@ function makeSkillRegistry(skills: readonly PiSkill[]): SkillRegistry {
 	})));
 }
 
-function resolveOutputModel(ctx: ExtensionContext, spec: string): unknown {
+function resolveOutputModel(ctx: ExtensionContext, spec: string): ExtensionContext["model"] {
 	if (!spec.trim()) return undefined;
 	try {
-		const registry = ctx.modelRegistry as { find?: (provider: string, id: string) => unknown };
-		if (typeof registry.find !== "function") return undefined;
+		const registry = ctx.modelRegistry;
 		if (spec.includes("/")) {
 			const separator = spec.indexOf("/");
 			return registry.find(spec.slice(0, separator), spec.slice(separator + 1));
@@ -254,7 +250,8 @@ async function tryExtractOutput(
 	request: string,
 	command: string,
 	text: string,
-): Promise<{ text: string; telemetry: ProviderCacheTelemetry } | undefined> {
+	signal: AbortSignal,
+): Promise<OutputExtraction | undefined> {
 	try {
 		const model = resolveOutputModel(ctx, spec);
 		if (!model) return undefined;
@@ -264,42 +261,20 @@ async function tryExtractOutput(
 			content: [{ type: "text", text: prompt.user }],
 			timestamp: Date.now(),
 		};
-		const response = await ctx.modelRegistry.complete(
-			model as NonNullable<ExtensionContext["model"]>,
+		const response = await awaitModelCall(signal, () => ctx.modelRegistry.complete(
+			model,
 			{ systemPrompt: prompt.system, messages: [message] },
-		);
+			{ signal },
+		));
 		const extracted = responseText(response).trim();
 		return {
 			text: extracted,
-			telemetry: providerCacheDelta(response.usage),
+			telemetry: providerUsageTelemetry(response.usage),
 		};
 	} catch {
+		signal.throwIfAborted();
 		return undefined;
 	}
-}
-
-function providerCacheDelta(usage: {
-	input?: unknown;
-	output?: unknown;
-	cacheRead?: unknown;
-	cacheWrite?: unknown;
-	cost?: { total?: unknown };
-}): ProviderCacheTelemetry {
-	const nonNegative = (value: unknown): number =>
-		typeof value === "number" && Number.isFinite(value) && value > 0
-			? Math.floor(value)
-			: 0;
-	return {
-		requests: 1,
-		input: nonNegative(usage.input),
-		output: nonNegative(usage.output),
-		cacheRead: nonNegative(usage.cacheRead),
-		cacheWrite: nonNegative(usage.cacheWrite),
-		totalCost:
-			typeof usage.cost?.total === "number" && Number.isFinite(usage.cost.total)
-				? Math.max(0, usage.cost.total)
-				: 0,
-	};
 }
 
 const SKILL_SEARCH_PARAMS = Type.Object({
@@ -332,6 +307,7 @@ const RETRIEVE_OUTPUT_PARAMS = Type.Object({
 
 export default function skillOptimizer(pi: ExtensionAPI) {
 	registerSearchToolRenderers(pi);
+	let outputWorkController = new AbortController();
 	let snapshot: RuntimeSnapshot | undefined;
 	let cachedConfig: { cwd: string; value: ConfigRecord } | undefined;
 	let retryAfter = 0;
@@ -957,6 +933,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			return;
 		}
 		const baseProfile = projectStored?.exists ? mergeProfiles(stored.profile, projectStored.profile) : stored.profile;
+		let globalRevision = stored.revision;
+		let projectRevision = projectStored?.revision ?? null;
 		const storedHashes = projectStored?.exists ? { ...stored.hashes, ...projectStored.hashes } : stored.hashes;
 		const forceFull = !stored.exists
 			|| stored.initVersion !== INIT_VERSION
@@ -1020,18 +998,20 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			const appliedSet = new Set(applied);
 			const profile = mergeIncrementalProfile(prunedBase, nextPartial, applied);
 			const pending = changed.filter((name) => !appliedSet.has(name));
-			writeProfileFiles(buildInitProfileWrites({
+			const revisions = writeProfileFiles(buildInitProfileWrites({
 				paths,
 				profile,
 				hashes: computeFinalHashes(hashes, pending, storedHashes),
 				skillCount: skills.length,
 				projectNames,
-				globalRevision: stored.revision,
-				projectRevision: projectStored?.revision ?? null,
+				globalRevision,
+				projectRevision,
 				projectExists: !!projectStored?.exists,
 			}), INIT_VERSION);
-			stored = readStoredProfile(paths.global);
-			if (projectStored !== undefined) projectStored = readStoredProfile(paths.project);
+			// Carry our own commit receipts forward. Re-reading here could adopt a later
+			// writer's revision while the next checkpoint still uses our original base.
+			globalRevision = revisions.get(paths.global)!;
+			projectRevision = revisions.get(paths.project) ?? projectRevision;
 			snapshot = undefined;
 			retryAfter = 0;
 			savedCount = appliedSet.size;
@@ -1200,6 +1180,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		outputWorkController.abort();
+		outputWorkController = new AbortController();
 		clearInitWork();
 		hasStatus = false;
 		lastStatusText = undefined;
@@ -1226,6 +1208,8 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		retainedToolNames.clear();
 		latestPrompt = "";
 		lastSelected = [];
+		lastRemovedChars = 0;
+		lastBudget = { usedChars: 0, requestedChars: 0, nameOnlyCount: 0 };
 		lastCatalogOutcome = undefined;
 		rtkPresence = undefined;
 		usedTools.clear();
@@ -1264,8 +1248,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		// substitution already reached the payload.
 		if (isDisabled(ctx.cwd)) return;
 		const config = getRuntimeConfig(ctx);
-		const providers = config.providers.length > 0 ? config.providers : undefined;
-		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) return;
+		if (!isProviderEnabled(config, ctx.model?.provider)) return;
 		const state = ensureSnapshot(ctx);
 		const transformed = optimizePayload(event.payload, optimizeConfig(state));
 		// The payload pass is the final truth: it may upgrade `native` to `replaced`
@@ -1289,23 +1272,35 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			return;
 		}
 		const config = getRuntimeConfig(ctx, true);
-		const providers = config.providers.length > 0 ? config.providers : undefined;
-		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) {
+		if (!isProviderEnabled(config, ctx.model?.provider)) {
 			restorePermittedTools();
 			return;
 		}
+		const state = ensureSnapshot(ctx);
+		try {
+			initializeToolSelection(state, prompt ?? "");
+		} catch (error) {
+			ctx.ui.notify(`skill-optimizer: tool selection failed open (${(error as Error).message})`, "warning");
+		}
+	});
+
+	pi.on("agent_start", (_event, ctx) => {
+		// Pi awaits agent_start after every before_agent_start handler has edited the
+		// shared options. Build once from the final run-local skills, never an earlier snapshot.
+		if (!systemPromptOptions || isDisabled(ctx.cwd)) return;
+		const config = getRuntimeConfig(ctx);
+		if (!isProviderEnabled(config, ctx.model?.provider)) return;
 		const state = ensureSnapshot(ctx);
 		try {
 			registry = undefined;
 			registryReady = false;
 			registrySources = undefined;
 			catalogBrowserCache = undefined;
-			const skills = skillInputs(event.systemPromptOptions.skills ?? []);
+			const skills = skillInputs(systemPromptOptions.skills);
 			registry = makeSkillRegistry(skills);
 			registrySources = skills.map((skill) => ({ name: skill.name, description: skill.description, location: skill.filePath }));
 			if (state.profile.catalog) getCatalogBrowser(state);
 			registryReady = true;
-			initializeToolSelection(state, prompt ?? "");
 			maybeShowInitNotice(ctx, state, skills);
 			updateStatus(ctx);
 			return;
@@ -1320,8 +1315,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	pi.on("context_with_system", (event, ctx) => {
 		if (isDisabled(ctx.cwd)) return;
 		const config = getRuntimeConfig(ctx);
-		const providers = config.providers.length > 0 ? config.providers : undefined;
-		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) return;
+		if (!isProviderEnabled(config, ctx.model?.provider)) return;
 		const state = ensureSnapshot(ctx);
 		const payload = { messages: event.messages };
 		const transformed = optimizePayload(payload, optimizeConfig(state));
@@ -1361,8 +1355,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	pi.on("context", (event, ctx) => {
 		if (isDisabled(ctx.cwd)) return;
 		const config = getRuntimeConfig(ctx);
-		const providers = config.providers.length > 0 ? config.providers : undefined;
-		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) return;
+		if (!isProviderEnabled(config, ctx.model?.provider)) return;
 		const state = ensureSnapshot(ctx);
 		const positions: number[] = [];
 		const results: Array<{ content: unknown; isError?: boolean }> = [];
@@ -1403,10 +1396,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		if (message.role !== "assistant" || !message.usage) return;
 		if (isDisabled(ctx.cwd)) return;
 		const config = getRuntimeConfig(ctx);
-		const providers = config.providers.length > 0 ? config.providers : undefined;
 		const provider =
 			typeof message.provider === "string" ? message.provider : ctx.model?.provider;
-		if (providers && (!provider || !providers.includes(provider))) return;
+		if (!isProviderEnabled(config, provider)) return;
 		const signature = typeof message.responseId === "string"
 			? message.responseId
 			: JSON.stringify([message.provider, message.model, message.timestamp, message.usage]);
@@ -1416,7 +1408,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 			const oldest = seenProviderMessages.values().next().value as string | undefined;
 			if (oldest) seenProviderMessages.delete(oldest);
 		}
-		const delta = providerCacheDelta(message.usage);
+		const delta = providerUsageTelemetry(message.usage);
 		sessionCache = addProviderCacheTelemetry(sessionCache, delta);
 		addPending(getStatsFilePath(ctx.cwd), EMPTY_SAVINGS, EMPTY_EXTRACTION_TELEMETRY, delta);
 		maybeFlush(ctx);
@@ -1425,140 +1417,59 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 
 	pi.on("tool_result", async (event, ctx) => {
 		usedTools.add(event.toolName.toLowerCase());
-		if (event.parentToolCallId !== undefined) return;
-		if (RESOLVER_RESULT_TOOLS.has(event.toolName)) return;
+		if (event.parentToolCallId !== undefined || RESOLVER_RESULT_TOOLS.has(event.toolName)) return;
 		if (isDisabled(ctx.cwd) || event.isError) return;
 		const config = getRuntimeConfig(ctx);
-		const providers = config.providers.length > 0 ? config.providers : undefined;
-		if (providers && (!ctx.model || !providers.includes(ctx.model.provider))) return;
+		if (!isProviderEnabled(config, ctx.model?.provider)) return;
 		const output = getOutputConfig(config);
 		if (output.mode === "off") return;
+		const parentSignal = ctx.signal;
+		const signal = parentSignal
+			? AbortSignal.any([parentSignal, outputWorkController.signal])
+			: outputWorkController.signal;
+		const request = latestPrompt;
 		const details = event.details && typeof event.details === "object"
-			? event.details as Record<string, unknown>
-			: {};
+			? event.details as Record<string, unknown> : {};
 		const rtkHandled = details.rtkHandled === true || details.reducedBy === "rtk";
 		const command = typeof event.input.command === "string" ? event.input.command : "";
 		let changed = false;
+		let removedChars = 0;
+		let extraction = { ...EMPTY_EXTRACTION_TELEMETRY };
+		let cache = { ...EMPTY_PROVIDER_CACHE_TELEMETRY };
 		const content = [];
-		for (const block of event.content) {
-			if (block.type !== "text") {
-				content.push(block);
-				continue;
-			}
-			const text = block.text;
-			if (!shouldReduceToolResult({
-				toolName: event.toolName,
-				outputTools: output.tools,
-				rtkHandled,
-				text,
-			})) {
-				content.push(block);
-				continue;
-			}
-			if (text.split(/\r?\n/).length <= output.maxLines && utf8ByteLength(text) <= output.maxBytes) {
-				content.push(block);
-				continue;
-			}
-
-			let body: string | undefined;
-			let strategy = "";
-			let extractionOutcome: Exclude<keyof ExtractionTelemetry, "attempts"> | undefined;
-			const columnar = reduceJsonArrayColumnar(text, {
-				minSavingsBytes: output.minSavingsBytes,
-				minSavingsRatio: output.minSavingsRatio,
-			});
-			if (columnar.reduced) {
-				body = columnar.text;
-				strategy = "columnar";
-			} else if (
-				output.mode === "extract"
-				&& output.model.trim().length > 0
-				&& utf8ByteLength(text) >= output.extractMinBytes
-				&& !isExcludedCommand(command, output.extractExclude)
-			) {
-				const extraction = await tryExtractOutput(ctx, output.model, latestPrompt, command, text);
-				if (extraction) {
-					sessionCache = addProviderCacheTelemetry(sessionCache, extraction.telemetry);
-					addPending(
-						getStatsFilePath(ctx.cwd),
-						EMPTY_SAVINGS,
-						EMPTY_EXTRACTION_TELEMETRY,
-						extraction.telemetry,
-					);
+		try {
+			for (const block of event.content) {
+				if (block.type !== "text" || !shouldReduceToolResult({
+					toolName: event.toolName, outputTools: output.tools, rtkHandled, text: block.text,
+				})) {
+					content.push(block);
+					continue;
 				}
-				if (!extraction?.text) {
-					const smart = reduceOutput(text, {
-						maxLines: output.maxLines,
-						maxBytes: output.maxBytes,
-						minSavingsBytes: output.minSavingsBytes,
-						minSavingsRatio: output.minSavingsRatio,
-					});
-					if (smart.reduced) body = smart.text;
-					strategy = smart.reduced ? "smart" : "original";
-					extractionOutcome = "fallbackError";
-				} else {
-					const validated = validateExtractedOutput(text, extraction.text, {
-						smartOptions: {
-							maxLines: output.maxLines,
-							maxBytes: output.maxBytes,
-							minSavingsBytes: output.minSavingsBytes,
-							minSavingsRatio: output.minSavingsRatio,
-						},
-						minSavingsBytes: output.minSavingsBytes,
-						minSavingsRatio: output.minSavingsRatio,
-					});
-					if (validated.reduced) body = validated.text;
-					strategy = validated.strategy;
-					if (validated.strategy === "extract") extractionOutcome = "accepted";
-					else {
-						const reason: ExtractRejectionReason | undefined = validated.rejectionReason;
-						extractionOutcome = reason === "insufficient-benefit"
-							? "fallbackSavings"
-							: reason === "empty-extraction"
-								? "fallbackError"
-								: "fallbackEvidence";
-					}
-				}
-			} else {
-				const smart = reduceOutput(text, {
-					maxLines: output.maxLines,
-					maxBytes: output.maxBytes,
-					minSavingsBytes: output.minSavingsBytes,
-					minSavingsRatio: output.minSavingsRatio,
+				const reduced = await reduceToolOutput(block.text, output, {
+					command, signal,
+					extract: () => tryExtractOutput(ctx, output.model, request, command, block.text, signal),
+					archive: (text) => saveTemporaryOutput(text, { ttlMs: output.archiveTtlMs }),
 				});
-				if (smart.reduced) body = smart.text;
-				strategy = smart.reduced ? "smart" : "original";
+				if (reduced.providerUsage) cache = addProviderCacheTelemetry(cache, reduced.providerUsage);
+				if (reduced.extractionOutcome) {
+					extraction.attempts++;
+					extraction[reduced.extractionOutcome]++;
+				}
+				removedChars += reduced.removedChars;
+				changed ||= reduced.text !== block.text;
+				content.push(reduced.text === block.text ? block : { ...block, text: reduced.text });
 			}
-
-			if (extractionOutcome) {
-				const telemetry = { ...EMPTY_EXTRACTION_TELEMETRY, attempts: 1 };
-				telemetry[extractionOutcome] = 1;
-				sessionExtraction = addExtractionTelemetry(sessionExtraction, telemetry);
-				addPending(getStatsFilePath(ctx.cwd), EMPTY_SAVINGS, telemetry);
-			}
-			if (!body) {
-				content.push(block);
-				continue;
-			}
-			const placeholder = `sko:${"0".repeat(43)}`;
-			const candidate = `${body}\n[skill-optimizer:${strategy}; full=${placeholder}]`;
-			const fromBytes = utf8ByteLength(text);
-			const toBytes = utf8ByteLength(candidate);
-			if (!hasMinimumSavings(fromBytes, toBytes, output.minSavingsBytes, output.minSavingsRatio)) {
-				content.push(block);
-				continue;
-			}
-			const archive = saveTemporaryOutput(text, { ttlMs: output.archiveTtlMs });
-			if (!archive) {
-				content.push(block);
-				continue;
-			}
-			const rendered = `${body}\n[skill-optimizer:${strategy}; full=${archive}]`;
-			changed = true;
-			const removed = Math.max(0, text.length - rendered.length);
-			sessionSaved.output += removed;
-			addPending(getStatsFilePath(ctx.cwd), { skills: 0, tools: 0, output: removed });
-			content.push({ ...block, text: rendered });
+			signal.throwIfAborted();
+		} catch (error) {
+			if (signal.aborted) return;
+			throw error;
+		}
+		// Commit session effects only after the entire result belongs to this live run.
+		if (removedChars > 0 || extraction.attempts > 0 || cache.requests > 0) {
+			sessionSaved.output += removedChars;
+			sessionExtraction = addExtractionTelemetry(sessionExtraction, extraction);
+			sessionCache = addProviderCacheTelemetry(sessionCache, cache);
+			addPending(getStatsFilePath(ctx.cwd), { skills: 0, tools: 0, output: removedChars }, extraction, cache);
 		}
 		maybeFlush(ctx);
 		updateStatus(ctx);
@@ -1566,6 +1477,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		outputWorkController.abort();
 		clearInitWork();
 		maybeFlush(ctx, true);
 		cleanupTemporaryOutputs({ ttlMs: getOutputConfig(getRuntimeConfig(ctx)).archiveTtlMs });

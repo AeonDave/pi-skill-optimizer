@@ -455,12 +455,19 @@ root with the test-only `PI_SKILL_OPTIMIZER_TEST_PACKAGE` variable, then run
 ordinary source-suite runs.
 
 Run `npm run smoke:blackbox -- <absolute-unpacked-package-root>` with the current
-development Pi, and repeat against Pi 1.0.0 by setting `PI_CLI` to that CLI and
+development Pi, and repeat against Pi 1.0.1 by setting `PI_CLI` to that CLI and
 passing its exact version as the second argument:
-`npm run smoke:blackbox -- <absolute-unpacked-package-root> 1.0.0`.
+`npm run smoke:blackbox -- <absolute-unpacked-package-root> 1.0.1`.
+Keep the historical host's internal Pi packages on that same version too:
+Pi 1.0.1 used caret ranges, so installing its CLI alone can pull incompatible
+newer companion packages. Use an isolated host fixture with aligned versions;
+do not change the optimizer's wildcard host peers to construct this test.
 The black-box fixture model is local and needs no provider key. Packed loader,
 offline command and tool checks qualify the tested artifact and host pair; they
 do not establish live-provider init quality.
+CLI loading does not exercise TUI rendering. Renderer tests must also invoke the
+registered render callbacks with the supported host context, including compact,
+expanded and error results.
 
 ### Private real-model workflow
 

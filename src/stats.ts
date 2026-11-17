@@ -106,6 +106,16 @@ export function normalizeProviderCacheTelemetry(value: unknown): ProviderCacheTe
 	};
 }
 
+/** Adapt one provider response through the same validation used for stored telemetry. */
+export function providerUsageTelemetry(usage: {
+	input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown; cost?: { total?: unknown };
+}): ProviderCacheTelemetry {
+	return normalizeProviderCacheTelemetry({
+		requests: 1, input: usage.input, output: usage.output,
+		cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, totalCost: usage.cost?.total,
+	});
+}
+
 export function addSavings(a: SavingsByArea, b: SavingsByArea): SavingsByArea {
 	return { skills: a.skills + b.skills, tools: a.tools + b.tools, output: a.output + b.output };
 }

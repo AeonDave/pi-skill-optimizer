@@ -12,8 +12,9 @@ test("lone-surrogate history stays unchanged without ambiguous recovery handles"
 	assert.equal(reduced.next, results);
 	assert.equal(reduced.duplicates, 0);
 	assert.equal(reduced.artifacts.length, 0);
+	const valid = "ordinary 🦋 content".repeat(100);
 	assert.equal(deduplicateToolResultHistory([
-		{ content: "ordinary 🦋 content" }, { content: "ordinary 🦋 content" },
+		{ content: valid }, { content: valid },
 	], { minBytes: 0 }).duplicates, 1);
 });
 
@@ -105,6 +106,30 @@ test("never changes errors, protected evidence, images, mixed content, or small 
 		{ content: explicitError, isError: true }, { content: explicitError, isError: true },
 		{ content: imageContent }, { content: imageContent },
 		{ content: mixedContent }, { content: mixedContent },
+	];
+	const result = deduplicateToolResultHistory(input);
+	assert.equal(result.next, input);
+	assert.equal(result.duplicates, 0);
+	assert.deepEqual(result.artifacts, []);
+});
+
+test("a low size threshold never expands a duplicate into a larger reference", () => {
+	for (const content of ["alpha", [{ type: "text", text: "alpha" }]]) {
+		const input = [{ content }, { content }];
+		const result = deduplicateToolResultHistory(input, { minBytes: 0 });
+		assert.equal(result.next, input);
+		assert.equal(result.duplicates, 0);
+		assert.deepEqual(result.artifacts, []);
+	}
+});
+
+test("text-block metadata remains verbatim instead of reusing another result's artifact", () => {
+	const text = large("source content ");
+	const input = [
+		{ content: [{ type: "text", text, annotations: [{ source: "first" }] }] },
+		{ content: [{ type: "text", text, annotations: [{ source: "second" }] }] },
+		{ content: [{ type: "text", text }, { type: "text", text, citations: ["evidence"] }] },
+		{ content: [{ type: "text", text }, { type: "text", text, citations: ["evidence"] }] },
 	];
 	const result = deduplicateToolResultHistory(input);
 	assert.equal(result.next, input);

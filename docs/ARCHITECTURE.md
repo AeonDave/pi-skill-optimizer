@@ -2,6 +2,36 @@
 
 [Back to the README](../README.md)
 
+## Runtime flow and ownership
+
+The extension is a local pipeline with a single Pi integration entry point. It
+does not introduce a second agent runtime. `index.ts` owns session state, hooks,
+tool registration and side effects; the modules below own the decisions those
+hooks execute.
+
+| Boundary | Responsibility | Contract |
+| --- | --- | --- |
+| Skills | `skill-loader.ts`, `catalog.ts`, `skills.ts` | Exact source resolution, immutable browsable cards, and one local lexical ranker. Search metadata never substitutes for loaded instructions. |
+| Requests | `request.ts`, `optimize.ts` | Human-text provenance, stable catalog substitution and minimal cloning. Both Pi request passes use the same transformation. |
+| Tools | `tools.ts` | Bounded schema evidence, ranking and activation plans. The integration layer owns the host's permitted baseline. |
+| Results | `output.ts`, `output-pipeline.ts`, `history.ts` | Reduction algorithms, one strategy/validation/archive sequence, and exact duplicate handling. Originals remain recoverable before a reduced result is returned. |
+| Setup | `profile.ts`, `generate.ts`, `init-profile.ts`, `init-worker.ts`, `init-progress.ts` | Profile rules, bounded generation, scoped checkpoints, provider activity and disposable UI. Each accepted checkpoint advances committed coverage. |
+| Shared effects | `model-call.ts`, `persistence.ts`, `stats.ts` | Cancellation, atomic writes with committed revision receipts, and normalized telemetry. Hooks retain ownership of when effects enter session state. |
+
+Host skill metadata is captured in `agent_start`, after every
+`before_agent_start` handler has finished editing the run's options. Search,
+exact loading and request rewriting therefore use the same final skill set.
+Custom preloaded instructions remain opaque. Config refresh occurs at session
+and agent start and explicit commands; profiles and usage are session snapshots,
+refreshed by explicit commands and after init. Provider and tool hot hooks do not
+reread those files.
+
+This keeps shared rules in their domain modules without a generic utility layer
+or an interface for every function. Initialization remains one checkpointed use
+case; tool planning remains distinct from host authorization. Structural changes
+must preserve these ownership boundaries and the observable request, recovery
+and cancellation contracts.
+
 ## Stable skill base and semantic catalog mode
 
 Without version-1 semantic catalog metadata, AUTO keeps the compatible, query-independent TSV index in the stable prompt prefix:
@@ -51,6 +81,12 @@ accepted, and source changes invalidate their stale hints. An explicit rerun
 repairs the remaining owners.
 Validation establishes schema and source ownership, not semantic relevance.
 
+Each atomic profile write returns the revision of the exact bytes it committed.
+The next checkpoint compares against that receipt, not a fresh read after releasing
+the lock. An intervening writer therefore causes a conflict instead of becoming
+the baseline for overwriting that writer's changes. Scope writes are individually
+atomic; they do not claim a filesystem transaction across multiple files.
+
 The model request streams through Pi's configured model registry. An independent
 widget above the editor shows committed progress and catalog coverage, current
 batch/attempt, elapsed time, and activity counters. Streamed text and thinking are
@@ -97,6 +133,15 @@ These legacy activation hints do not auto-select skills in semantic catalog mode
 
 AUTO keeps protected and predicted tools active and leaves the rest behind `optimizer_tool_search`. Search is bounded and paginated. A returned result is activated through Pi's runtime API without replacing already active tools. Core, configured, and previously used tools remain callable, so an in-progress tool loop cannot be stranded. Pi's built-in `tool_search` remains active when the host enables it. Weak or absent routing signal fails open to every permitted tool; safety wins, but that request may retain the full schema cost.
 
+Schema routing inspects at most 96 object nodes, four nesting levels, 256 collection
+entries shared by arrays and properties, and 2,048 characters of evidence per tool.
+Scalar text is clipped before normalization; empty or invalid array entries still
+consume the work budget. A property collection wider than the remaining entry
+budget contributes no property evidence, avoiding a large sort or value traversal;
+tool names, descriptions and other bounded schema fields remain searchable.
+Enumerating the object's own keys still costs O(number of keys) in JavaScript.
+Property collections within budget keep their canonical key order.
+
 Selection is recalculated before each agent run, not just the first request. Used tools and explicit search results stay active within the current discovery baseline. The optimizer records its own applied selection; an external removal starts a new baseline instead of silently restoring old tools, while additive host activations are retained. This lets pi-persona narrow a session without optimizer helpers reappearing. An identical set is not an observable change; call-time permissions remain the authority.
 
 Inactive `deferred` and `codemode` tools remain discoverable while the optimizer's tool resolver is permitted; inactive direct and hidden tools are not silently added. `optimizer_tool_search` declares its transitive tool reach to Pi 1.3. This is schema routing, not authorization: another extension's call-time permission checks remain authoritative.
@@ -118,13 +163,21 @@ Their content can be parsed by a codemode caller before it reaches the model;
 changing JSON shape or appending a recovery footer would break that caller.
 They contribute no output-reduction savings.
 
+The output hook delegates strategy selection, validation, complete-result savings
+and archive acceptance to `output-pipeline.ts`. Model extraction and init share
+`model-call.ts`: cancellation releases the caller even if a provider never settles.
+The provider receives the same signal. Output work captures the originating
+request and session lifetime, checks cancellation before archiving, and commits
+session telemetry only after the complete result is ready. Session replacement
+and shutdown cancel pending work; late responses cannot alter the new session.
+
 Columnar conversion conservatively leaves unsafe integers, non-finite numbers,
 negative zero and noncanonical numeric spellings untouched. Parsing twice is not
 a losslessness oracle when both parses can round the same value. Invalid Unicode
 strings also fail open. Exact recovery retains the source's original line endings;
 it does not normalize Windows output to LF.
 
-History deduplication keeps the first large successful result intact and replaces only later exact copies. Errors, images, mixed media, small results, and protected evidence are never deduplicated.
+History deduplication keeps the first large successful result intact and replaces only later exact copies. Errors, images, mixed media, small results, text blocks with extra metadata, and protected evidence are never deduplicated. A recovery reference must be strictly smaller than the original even when the configured eligibility threshold is zero.
 
 History admits at most 128 distinct recovery artifacts per session. Existing
 handles remain valid; once capacity is reached, new duplicate payloads stay

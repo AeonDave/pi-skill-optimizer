@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ExtensionAPI, ToolRendererResolver } from "@earendil-works/pi-coding-agent";
 import { formatOptimizerToolSearchResult, formatSkillSearchResult } from "../src/ui/search-projections.ts";
+import { registerSearchToolRenderers } from "../src/ui/search-renderers.ts";
 
 const searchResult = {
 	content: [{
-		type: "text",
+		type: "text" as const,
 		text: JSON.stringify({
 			results: [
 				{ name: "mcp__issues__find", description: "Search issue tracker tickets", score: 2.75, matchedTerms: ["tickets"], matchedFields: ["description", "schemaText"] },
@@ -19,6 +21,48 @@ const searchResult = {
 		}),
 	}],
 };
+
+test("registered renderers support the floor context without keybinding helpers", () => {
+	type Renderers = NonNullable<ReturnType<ToolRendererResolver>>;
+	type RenderContext = Parameters<NonNullable<Renderers["renderResult"]>>[3];
+	let resolve: ToolRendererResolver | undefined;
+	registerSearchToolRenderers({ registerToolRenderer(resolver) { resolve = resolver; } } as ExtensionAPI);
+	assert.ok(resolve);
+	const base = { renderShell: "self" as const };
+	assert.equal(resolve("another_tool", () => base), base, "unrelated renderers keep their original identity");
+	for (const name of ["optimizer_tool_search", "skill_search"]) {
+		const renderers: Renderers = resolve(name, () => base)!;
+		assert.equal(renderers.renderShell, "self", "search projections preserve the next renderer's shell policy");
+		// Pi 1.0.1 supplies these fields; it has no keyHint/keyText or outputPad.
+		const context = {
+			args: { action: "search", query: "tickets" }, toolCallId: "floor-render", invalidate() {},
+			lastComponent: undefined, state: {}, cwd: process.cwd(), executionStarted: true,
+			argsComplete: true, isPartial: false, expanded: false, showImages: false, isError: false,
+		} as RenderContext;
+		assert.equal("keyHint" in context, false);
+		const theme = { fg: (_color: string, text: string) => text } as never;
+		const result = { ...(name === "optimizer_tool_search" ? searchResult : { content: [{ type: "text" as const, text: JSON.stringify({
+			total: 1, items: [{ name: "ticket-guidance", summary: "Review ticket evidence.", tags: ["review"] }], usedChars: 160,
+		}) }] }), details: {} };
+		const render = (expanded: boolean) => {
+			context.expanded = expanded;
+			return renderers.renderResult!(result, { expanded, isPartial: false }, theme, context).render(120).join("\n");
+		};
+		assert.match(renderers.renderCall!(context.args, theme, context).render(120).join("\n"), /search.*tickets/);
+		assert.match(render(false), /expand tool output for details/i);
+		assert.match(render(true), name === "optimizer_tool_search" ? /Matched fields: description, schemaText/ : /Tags: review/);
+		context.isError = true;
+		assert.match(render(false), /tool error output/);
+		assert.match(render(true), /tool error output/);
+		if (name === "skill_search") {
+			context.isError = false;
+			context.args = { action: "load", name: "ticket-guidance" };
+			const loaded = { content: [{ type: "text" as const, text: "# Full instructions\nRead every source.\n" }], details: {} };
+			const output = renderers.renderResult!(loaded, { expanded: true, isPartial: false }, theme, context).render(120).map((line) => line.trimEnd()).join("\n");
+			assert.match(output, /# Full instructions\nRead every source\./);
+		}
+	}
+});
 
 test("optimizer tool search renderer shows a concise preview and a complete expanded page", () => {
 	const compact = formatOptimizerToolSearchResult(searchResult, false, "ctrl+o to expand details").join("\n");

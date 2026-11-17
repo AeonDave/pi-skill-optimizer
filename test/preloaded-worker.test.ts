@@ -82,3 +82,61 @@ for (const installerFirst of [false, true]) for (const resolverAllowed of [false
 		}
 	});
 }
+
+for (const installerFirst of [false, true]) for (const replaceSkills of [false, true]) {
+	test(`resolver follows final host skills; installer ${installerFirst ? "before" : "after"} optimizer, skills ${replaceSkills ? "replaced" : "mutated"}`, async () => {
+		const root = await mkdtemp(join(tmpdir(), "sko-final-host-skills-"));
+		const agentDir = join(root, "agent");
+		const previous = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith("PI_SKILL_OPTIMIZER_") || key === "PI_CODING_AGENT_DIR"));
+		for (const key of Object.keys(process.env)) if (key.startsWith("PI_SKILL_OPTIMIZER_")) delete process.env[key];
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		try {
+			const skills: Skill[] = [];
+			for (const name of ["retained", "removed", "added"]) {
+				const baseDir = join(root, "skills", name), filePath = join(baseDir, "SKILL.md");
+				await mkdir(baseDir, { recursive: true });
+				await writeFile(filePath, `BODY_${name}\n`);
+				skills.push({ name, description: `Instructions for ${name}.`, filePath, baseDir, disableModelInvocation: false,
+					sourceInfo: { path: filePath, source: "cli", scope: "temporary", origin: "top-level" } });
+			}
+			const installer: ExtensionFactory = (pi) => {
+				pi.on("before_agent_start", (event) => {
+					if (replaceSkills) event.systemPromptOptions.skills = [skills[0]!, skills[2]!];
+					else event.systemPromptOptions.skills.splice(1, 1, skills[2]!);
+				});
+			};
+			const settings = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
+			const loader = new DefaultResourceLoader({ cwd: root, agentDir, settingsManager: settings,
+				noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+				skillsOverride: () => ({ skills: skills.slice(0, 2), diagnostics: [] }), extensionFactories: installerFirst ? [installer, optimizer] : [optimizer, installer] });
+			await loader.reload();
+			const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, modelsStorePath: join(agentDir, "models.json"), refreshOnCreate: false, allowModelNetwork: false });
+			const faux = fauxProvider({ provider: "final-host-skills-offline", models: [{ id: "local" }] });
+			runtime.registerNativeProvider(faux.provider);
+			await runtime.setRuntimeApiKey("final-host-skills-offline", "test-key-never-transmitted");
+			faux.setResponses([fauxAssistantMessage("complete")]);
+			const { session } = await createAgentSession({ cwd: root, agentDir, model: faux.models[0], modelRuntime: runtime,
+				settingsManager: settings, resourceLoader: loader, sessionManager: SessionManager.inMemory(root), tools: ["read", "skill_search"] });
+			try {
+				await session.prompt("Review the instructions.");
+				const resolver = session.agent.state.tools.find((tool) => tool.name === "skill_search")!;
+				const execute = (params: unknown) => resolver.execute("final-host-skills", params as never, new AbortController().signal);
+				const result = await execute({ action: "search" });
+				const page = JSON.parse(result.content[0]?.type === "text" ? result.content[0].text : "null");
+				assert.deepEqual(page.items.map((item: { name: string }) => item.name).sort(), ["added", "retained"]);
+				await assert.rejects(() => execute({ action: "load", name: "removed" }), /Unknown skill/);
+				const added = await execute({ action: "load", name: "added" });
+				assert.equal(added.content[0]?.type === "text" ? added.content[0].text : "", "BODY_added\n");
+				assert.equal(faux.state.callCount, 1);
+				assert.deepEqual(loader.getSkills().skills.map(({ name }) => name), ["retained", "removed"], "run-local edits preserve the resource loader's metadata");
+			} finally {
+				await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
+				session.dispose();
+			}
+		} finally {
+			for (const key of Object.keys(process.env)) if (key.startsWith("PI_SKILL_OPTIMIZER_") || key === "PI_CODING_AGENT_DIR") delete process.env[key];
+			for (const [key, value] of Object.entries(previous)) process.env[key] = value;
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+}

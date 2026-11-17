@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import type { ExtensionAPI, ExtensionContext, Skill } from "@earendil-works/pi-coding-agent";
 import skillOptimizer from "../src/index.ts";
-import { getProfilePaths, getUsageFilePath } from "../src/config.ts";
+import { getProfilePaths, getStatsFilePath, getUsageFilePath } from "../src/config.ts";
 import { hashSkill } from "../src/profile.ts";
 import { INIT_PROFILE_VERSION } from "../src/init-prompt.ts";
 
@@ -133,6 +133,9 @@ function createRuntime(options: RuntimeOptions = {}) {
 		async fire(name: string, event: unknown): Promise<unknown[]> {
 			const results: unknown[] = [];
 			for (const handler of handlers.get(name) ?? []) results.push(await handler(event, ctx));
+			if (name === "before_agent_start") {
+				for (const handler of handlers.get("agent_start") ?? []) await handler({ type: "agent_start" }, ctx);
+			}
 			return results;
 		},
 		async command(args = ""): Promise<void> {
@@ -412,6 +415,71 @@ test("native custom wake keeps human intent and fails open without routing from 
 		assert.equal(extractionRequests.length, 1);
 		assert.match(extractionRequests[0] ?? "", /REQUEST:\nReview the PostgreSQL migration rollback\./);
 		assert.doesNotMatch(extractionRequests[0] ?? "", /Run Playwright browser accessibility tests/);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+for (const cancellation of ["abort", "session_start", "session_shutdown"] as const) {
+test(`output extraction releases on ${cancellation} and ignores a late provider response`, async () => {
+	const runtime = createRuntime({ config: {
+		outputMode: "extract", outputModel: "test/extract", outputExtractMinBytes: 1,
+		outputMaxLines: 1, outputMaxBytes: 256, outputMinSavingsBytes: 1, outputMinSavingsRatio: 0,
+	} });
+	const controller = new AbortController();
+	let resolveResponse!: (response: unknown) => void;
+	let receivedSignal: AbortSignal | undefined;
+	const response = new Promise((resolve) => { resolveResponse = resolve; });
+	Object.assign(runtime.ctx, {
+		signal: controller.signal,
+		modelRegistry: {
+			find: () => ({}),
+			complete(_model: unknown, _request: unknown, options?: { signal?: AbortSignal }) {
+				receivedSignal = options?.signal;
+				return response;
+			},
+		},
+	});
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await beforePrompt(runtime, "Review the command output.");
+		const pending = runtime.fire("tool_result", {
+			toolName: "read", toolCallId: "cancelled-extraction", input: {}, isError: false,
+			content: [{ type: "text", text: "ordinary output row\n".repeat(100) }],
+		});
+		if (cancellation === "abort") controller.abort();
+		else await runtime.fire(cancellation, {});
+		const result = await Promise.race([
+			pending,
+			new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("extraction ignored cancellation")), 1000); }),
+		]);
+		assert.deepEqual(result, [undefined], "cancelled work must keep the original result");
+		assert.equal(receivedSignal?.aborted, true, "forward cancellation to the provider as well");
+		const statuses = [...runtime.statuses];
+		resolveResponse({ content: [{ type: "text", text: "ordinary output row" }], usage: { input: 10 } });
+		await new Promise(setImmediate);
+		assert.deepEqual(runtime.statuses, statuses, "late completion cannot refresh session state");
+		await runtime.command("status");
+		assert.match(runtime.notifications.at(-1)!, /saved session:\s+0 chars/);
+		assert.match(runtime.notifications.at(-1)!, /cache lifetime: requests 0/);
+	} finally {
+		if (timer) clearTimeout(timer);
+		resolveResponse({ content: [], usage: {} });
+		runtime.dispose();
+	}
+});
+}
+
+test("unchanged tool results do not create a zero-delta statistics file", async () => {
+	const runtime = createRuntime();
+	try {
+		await beforePrompt(runtime, "Read a small file.");
+		await runtime.fire("tool_result", {
+			toolName: "read", toolCallId: "small-read", input: {}, isError: false,
+			content: [{ type: "text", text: "a small unchanged result" }],
+		});
+		await runtime.fire("session_shutdown", {});
+		assert.equal(existsSync(getStatsFilePath(runtime.cwd)), false);
 	} finally {
 		runtime.dispose();
 	}
@@ -884,6 +952,24 @@ test("status reports the catalog substitution that actually reached the latest r
 		await runtime.command();
 		assert.ok(lastStatus(runtime).includes("last catalog:   replaced"), lastStatus(runtime));
 		assert.ok(runtime.statuses.at(-1)?.includes("catalog replaced"), String(runtime.statuses.at(-1)));
+	} finally { runtime.dispose(); }
+});
+
+test("a new session clears the previous request's catalog budget and savings diagnostics", async () => {
+	const skill = { ...modelSkill(), description: "Review independently testable application boundaries. ".repeat(100) };
+	const runtime = createRuntime({ skills: [skill] });
+	try {
+		writeTagCatalogProfile(runtime, skill);
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { sections: {}, skills: [skill] } });
+		await runtime.fire("context_with_system", { messages: [{ role: "system", sections: { skills: nativeCatalogBlock(skill) } }] });
+		await runtime.command();
+		assert.match(lastStatus(runtime), /last request:   [1-9]\d* chars/);
+		assert.match(lastStatus(runtime), /catalog budget:[1-9]\d*\//);
+		await runtime.fire("session_start", {});
+		await runtime.command();
+		assert.match(lastStatus(runtime), /last request:   0 chars; prefetch none/);
+		assert.match(lastStatus(runtime), /catalog budget:0\/0 chars, 0 name-only/);
+		assert.match(lastStatus(runtime), /last catalog:   none yet/);
 	} finally { runtime.dispose(); }
 });
 

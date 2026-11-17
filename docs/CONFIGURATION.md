@@ -5,7 +5,7 @@
 ## Installation and updates
 
 Requires Pi 1.0.1 or newer and Node.js 26.3 or newer. Development packages and host
-integration tests target Pi 1.5.1; packaged release checks also cover the supported
+integration tests target Pi 1.5.2; packaged release checks also cover the supported
 Pi 1.0.1 floor.
 
 ```bash
@@ -15,7 +15,7 @@ pi install npm:@aeondave/pi-skill-optimizer
 | Need | Command |
 | --- | --- |
 | Install only in this project | `pi install -l npm:@aeondave/pi-skill-optimizer` |
-| Pin version 3.2.0 | `pi install npm:@aeondave/pi-skill-optimizer@3.2.0` |
+| Pin version 3.2.1 | `pi install npm:@aeondave/pi-skill-optimizer@3.2.1` |
 | Update an unpinned install | `pi update npm:@aeondave/pi-skill-optimizer` |
 
 Restart Pi after installing or updating, then run `/skill-optimizer` to inspect

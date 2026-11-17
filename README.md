@@ -4,9 +4,16 @@
 
 ![pi-skill-optimizer: a whole library, just the skills you need](assets/banner.png)
 
-An extension for [Pi](https://github.com/earendil-works/pi) that helps large skill libraries and tool collections take up less room in each request. Discover skills on demand, bring in tool definitions as the task develops, and recover the full text behind shortened results.
+An extension for [Pi](https://github.com/earendil-works/pi) that makes room for your work by reducing repeated skill descriptions, tool definitions, and large results. Keep a growing library available without carrying all of it through every request.
 
-Your library can keep growing without every skill description following every request. After optional setup, Pi explores a compact directory of topics, browses short skill cards, and loads the instructions it chooses in full. The main model makes those choices in the context of your work, including supporting methods such as architecture, testing, and verification.
+Pi chooses what to use in the context of your task. The optimizer makes that choice easier to navigate and keeps the original instructions and results within reach.
+
+## More capability, less repeated context
+
+- **A library Pi can explore.** Optional setup turns skill descriptions into a compact topic directory and browsable cards. Pi can find a specialist, discover a supporting method, or load a known skill's full instructions and resources directly.
+- **Tools that follow the work.** Tool definitions become available through search as the task develops. Core tools and tools already in use remain active within the host's permissions.
+- **Shorter results with a way back.** Large output can be reduced with a link to its complete local original. Later exact duplicates can reuse that original, while the first result stays intact.
+- **Progress you can see.** Search results have compact, expandable cards. Setup shows live progress, and status explains readiness, savings, provider usage, and the outcome of the last request.
 
 ## Install
 
@@ -22,7 +29,7 @@ Restart Pi, then check the optimizer's status:
 /skill-optimizer
 ```
 
-The defaults work immediately. See [installation and updates](docs/CONFIGURATION.md#installation-and-updates) for project-local installs, version pinning, and migration from the old unscoped package.
+The defaults work immediately. See [installation and updates](docs/CONFIGURATION.md#installation-and-updates) for other install options and upgrades.
 
 ## Give Pi a map of your library
 
@@ -40,19 +47,13 @@ Completed batches are saved as they finish. You can stop with:
 /skill-optimizer cancel
 ```
 
-Run init again to finish missing work or refresh changed skills. Your source skills stay unchanged, and discovery needs no embedding service or separate ranking model. Without init, Pi still gets a compact index of the available skills.
+Run init again to finish missing work or refresh changed skills. Your source skills stay unchanged. Everyday discovery runs locally without an embedding service or a separate ranking model; Pi's main model chooses what to load. Without init, Pi still gets a compact index of the available skills.
 
 ## Keep working as usual
 
-Ask Pi to do your work. AUTO manages discovery and result size in the background:
+Ask Pi to do your work. AUTO manages discovery and result size in the background, respects the host's selected skills and tools, and preserves instructions preloaded by pi-persona or another extension.
 
-- **Skills stay within reach.** Pi can browse the library or load a known skill directly, including full instructions and associated resources. Skills you use often stay visible by name as a hint, and a strongly matching skill is surfaced even if it was filed under the wrong topic.
-- **Tools arrive as needed.** Less relevant definitions sit behind search, while core tools and tools already used in the session stay active within the host's permissions.
-- **Large results remain recoverable.** Shortened output points back to a complete local original that Pi can retrieve. The first large result stays intact when later exact copies are deduplicated.
-
-When pi-persona or another extension preloads selected skill instructions, AUTO preserves that section without adding a discovery catalog or prefetch. Additional skills remain available through `skill_search` when the worker has that tool.
-
-Use `/skill-optimizer` to inspect setup readiness, savings, active tools, provider usage, and what actually happened to the last request (including why, if the skill catalog was left untouched). Use `/skill-optimizer audit` to find description issues in your library without rewriting it.
+Use `/skill-optimizer` to see what is happening, or `/skill-optimizer audit` to find description issues in your library without rewriting it.
 
 Start with the defaults; [configuration](docs/CONFIGURATION.md) covers project preferences, output modes, RTK coexistence, and persona restrictions.
 

@@ -62,7 +62,11 @@ function textContent(content: unknown): TextualContent | undefined {
 	for (const value of content) {
 		if (!value || typeof value !== "object") return undefined;
 		const block = value as Record<string, unknown>;
-		if (block.type !== "text" || typeof block.text !== "string") return undefined;
+		// Text equality cannot prove that annotations, citations, or other block
+		// metadata are interchangeable. Keep those results completely verbatim.
+		if (Reflect.ownKeys(block).some((key) => key !== "type" && key !== "text")
+			|| Object.getOwnPropertyDescriptor(block, "type")?.value !== "text"
+			|| typeof Object.getOwnPropertyDescriptor(block, "text")?.value !== "string") return undefined;
 		blocks.push(block as Record<string, unknown> & { type: string; text: string });
 	}
 	const texts = blocks.map((block) => block.text);
@@ -140,10 +144,14 @@ export function deduplicateToolResultHistory<T extends HistoryToolResult>(
 		}
 		// A matching digest is not itself proof of exact string equality.
 		if (first.text !== extracted.text) continue;
+		const reference = referenceText(id);
+		// A configurable low threshold is eligibility, never permission to expand
+		// small results (or recursively replace their already compact references).
+		if (Buffer.byteLength(reference, "utf8") >= bytes) continue;
 		if (!retainedIds.has(id) && !admittedIds.has(id) && retainedIds.size + admittedIds.size >= maxArtifacts) continue;
 
 		if (!next) next = results.slice() as T[];
-		next[index] = { ...result, content: extracted.replace(referenceText(id)) };
+		next[index] = { ...result, content: extracted.replace(reference) };
 		usedArtifacts.set(id, first);
 		if (!retainedIds.has(id)) admittedIds.add(id);
 		duplicates += 1;

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -209,6 +210,70 @@ test("init checkpoints a successful batch, avoids a stale final rewrite, and kee
 		assert.ok(statuses.some((status) => status?.includes("init 1/2 saved")));
 		assert.ok(statuses.some((status) => status?.includes("init 2/2 starting")));
 	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("init rejects a writer arriving between checkpoint commit and revision refresh", async (t) => {
+	const root = mkdtempSync(join(tmpdir(), "sko-init-commit-race-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+	const paths = getProfilePaths(root);
+	let inserted = false;
+	const originalUnlink = fs.unlinkSync;
+	const unlink = t.mock.method(fs, "unlinkSync", (path: fs.PathLike) => {
+		originalUnlink(path);
+		if (String(path) !== `${paths.global}.lock` || inserted) return;
+		inserted = true;
+		// Deterministically schedule another lock-respecting writer immediately after
+		// checkpoint release, before the init caller can read the profile again.
+		const current = readStoredProfile(paths.global);
+		writeProfileFiles([{
+			path: paths.global,
+			profile: { ...current.profile, critical: [...current.profile.critical, "external-writer"] },
+			skillCount: Object.keys(current.hashes).length,
+			hashes: current.hashes,
+			expectedRevision: current.revision,
+		}], INIT_PROFILE_VERSION);
+	});
+	syncBuiltinESMExports();
+	try {
+		const skills = Array.from({ length: DEFAULT_INIT_BATCH_MAX_SKILLS + 1 }, (_, index) => ({
+			name: `skill_${index}`, description: `Routing description ${index}`,
+			filePath: join(root, `skill_${index}`, "SKILL.md"), baseDir: join(root, `skill_${index}`),
+			disableModelInvocation: false, sourceInfo: { scope: "user" },
+		})) as unknown as Skill[];
+		const notices: string[] = [];
+		let calls = 0;
+		const ctx = {
+			cwd: root, model: { provider: "test", id: "test" },
+			modelRegistry: {
+				async complete(_model: unknown, request: { messages: Array<{ content: Array<{ text: string }> }> }) {
+					calls++;
+					const names = (JSON.parse(request.messages[0].content[0].text).skills as Array<{ name: string }>).map(({ name }) => name);
+					return { stopReason: "stop", content: [{ type: "text", text: JSON.stringify({
+						processedSkills: names,
+						catalogCards: Object.fromEntries(names.map((name) => [name, {
+							summary: `Provides ${name} capabilities.`, tags: [CATALOG_TAGS[0]!.id],
+						}])),
+					}) }] };
+				},
+			},
+			getSystemPromptOptions: () => ({ skills }),
+			ui: { notify(message: string) { notices.push(message); }, setStatus() {} },
+		} as unknown as ExtensionContext;
+		await registerExtension()("init", ctx);
+		assert.equal(inserted, true);
+		assert.equal(calls, 2);
+		const stored = readStoredProfile(paths.global);
+		assert.ok(stored.profile.critical.includes("external-writer"));
+		assert.equal(Object.keys(stored.hashes).length, DEFAULT_INIT_BATCH_MAX_SKILLS);
+		assert.ok(notices.some((message) => message.includes("profile changed concurrently")));
+	} finally {
+		unlink.mock.restore();
+		syncBuiltinESMExports();
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		rmSync(root, { recursive: true, force: true });

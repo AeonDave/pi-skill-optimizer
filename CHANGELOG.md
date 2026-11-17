@@ -2,11 +2,17 @@
 
 All notable changes are documented here.
 
-## Unreleased
+## 3.2.1 - 2026-11-18
 
 ### Fixed
 
 - Preserve an explicitly supplied host skills section as opaque instructions, including native-looking catalog examples. Selected worker skills are no longer rewritten or supplemented by discovery prefetch; granted on-demand skill loading remains available regardless of extension registration order.
+- Build skill search and exact-load metadata from the final host skill selection after all start handlers, including later additions and removals.
+- Keep init checkpoints tied to their own committed revisions so concurrent profile edits are detected and preserved.
+- Cancel pending output extraction on turn abort, session replacement and shutdown, and ignore late responses. Fresh sessions clear previous-request diagnostics.
+- Bound schema array entries, raw text normalization and property traversal; large collections retain tool name and description discovery.
+- Keep history duplicates verbatim when they carry extra text metadata or their recovery reference would be larger.
+- Keep expandable search cards compatible with the declared Pi floor by using a version-independent expansion hint; exercise the registered render callbacks as well as their text projections.
 
 ### Added
 
@@ -15,6 +21,8 @@ All notable changes are documented here.
 ### Changed
 
 - Require Pi 1.0.1 or newer for the host-owned tool-renderer API. `@earendil-works/pi-tui` is an optional Pi-provided peer and a development-only test dependency; it is not bundled.
+- Align all three Pi development packages with Pi 1.5.2. Share model-call cancellation, provider telemetry normalization and provider-scope checks; move output reduction orchestration into a dedicated module.
+- Refresh the README around discovery, recoverable output and visible progress; document module ownership and runtime contracts in the architecture reference.
 
 ## 3.2.0 - 2026-11-10
 

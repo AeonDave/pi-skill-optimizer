@@ -123,6 +123,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 			{ messageType: "user", prompt: "Review repository module boundaries" },
 			{ cwd: root, skills },
 		);
+		await runner.emit({ type: "agent_start" });
 		assert.deepEqual(errors, []);
 
 		const longGuidance = "Use when reviewing repository module boundaries. Read relevant source and verify concrete behavior. ".repeat(28);
@@ -209,6 +210,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 			{ messageType: "user", prompt: "Review another module" },
 			{ cwd: root, skills },
 		);
+		await runner.emit({ type: "agent_start" });
 		assert.equal(notices.filter((text) => text === setupMessage).length, 1, "do not repeat setup hints each turn");
 		assert.ok(session.getBranch().some((entry) => entry.type === "custom"), "persist notice metadata for reload/resume");
 		assert.ok(session.getBranch().every((entry) => entry.type !== "message"), "setup notices must not become model messages");
@@ -272,6 +274,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		} } }));
 		await command.handler("", runner.createCommandContext()); // Explicit profile refresh.
 		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "設計を見直してください" }, { cwd: root, skills: taggedSkills });
+		await runner.emit({ type: "agent_start" });
 		const taggedMessages = [
 			{ role: "system", content: "base instructions", sections: { skills: `<available_skills><skill><name>repo-guidance</name><description>${taggedSkills[0]!.description}</description><location>${filePath}</location></skill></available_skills>` }, timestamp: 3 },
 			{ role: "user", content: "設計を見直してください" },
@@ -305,6 +308,7 @@ test("real Pi loader/runner handles offline status, audit, search and verbatim s
 		assert.deepEqual((await search.execute("tag-load", { action: "load", name: "repo-guidance" })).content, [{ type: "text", text: instructions }]);
 		active = []; // Simulate an external persona withholding every optimizer helper.
 		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "Review" }, { cwd: root, skills: taggedSkills });
+		await runner.emit({ type: "agent_start" });
 		assert.deepEqual(await runner.emitContext(taggedMessages as never), taggedMessages, "keep native discovery when the resolver is not callable");
 		assert.deepEqual(errors, []);
 	} finally {
@@ -391,6 +395,7 @@ test("real Pi loader/runner keeps a positive off-bucket lexical match inside the
 			{ messageType: "user", prompt: "Untangle legacy work" },
 			{ cwd: root, skills },
 		);
+		await runner.emit({ type: "agent_start" });
 		const search = wrapRegisteredTools(registered, runner).find((tool) => tool.name === "skill_search");
 		assert.ok(search);
 		const response = await search.execute("rescue", {
@@ -489,6 +494,7 @@ test("real Pi loader/runner lets optimizer_tool_search activate initially deferr
 			compact() {}, getSystemPrompt: () => "", getSystemPromptOptions: () => ({ cwd: root, skills: [] }),
 		});
 		await runner.emitBeforeAgentStart({ messageType: "user", prompt: "" }, { cwd: root, skills: [] });
+		await runner.emit({ type: "agent_start" });
 		assert.ok(!active.includes("mcp__issues__find"), "deferred tool was activated before search");
 		assert.ok(!active.includes("mcp__issues__update"), "codemode tool was activated before search");
 		const search = wrapRegisteredTools(registered, runner).find((tool) => tool.name === "optimizer_tool_search");
@@ -515,7 +521,7 @@ test("real Pi loader/runner lets optimizer_tool_search activate initially deferr
 		const collapsed = render();
 		assert.match(collapsed, /tool search issue tracker tickets/i);
 		assert.match(collapsed, /results/);
-		assert.match(collapsed, /ctrl\+o to expand details/i, "the card should use the host's configured expansion hint");
+		assert.match(collapsed, /expand tool output for details/i);
 		assert.doesNotMatch(collapsed, /Confidence: high|Matched fields|\{"results"/, "the compact card should not expose the raw JSON payload");
 		const collapsedLines = collapsed.split("\n");
 		const click = nativeCard.handleMouse({
@@ -630,6 +636,7 @@ test("catalog substitution reaches the provider payload when another extension f
 			{ messageType: "user", prompt: "Review the module boundaries" },
 			{ cwd: root, skills },
 		);
+		await runner.emit({ type: "agent_start" });
 		const command = runner.getCommand("skill-optimizer");
 		assert.ok(command);
 		await command.handler("", runner.createCommandContext()); // Explicit profile refresh, as a real session does at startup.

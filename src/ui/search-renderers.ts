@@ -49,7 +49,7 @@ export function registerSearchToolRenderers(pi: ExtensionAPI): void {
 				return new Text(`${theme.fg("toolTitle", `skill ${call.action}`)} ${target}`, 0, 0);
 			},
 			renderResult(result, options, theme, context) {
-				const expansionHint = context.keyHint("app.tools.expand", "to expand details");
+				const expansionHint = "expand tool output for details";
 				const skillAction = isRecord(context.args) ? context.args.action : undefined;
 				const lines = isOptimizerSearch
 					? formatOptimizerToolSearchResult(result, options.expanded, expansionHint, context.isError)

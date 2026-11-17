@@ -6,7 +6,7 @@ Pi extension that reduces repeated request tokens through one AUTO discovery con
 
 Runtime floor: Pi 1.0.1 and Node.js 26.3. Use current Pi APIs; do not add shims for older runtimes. Reading existing user profiles is a data-preservation requirement, not a promise of support for old Pi versions.
 
-Development host packages and integration tests currently target Pi 1.5.1; keep all three Pi development packages aligned. Wildcard peers remain host-provided.
+Development host packages and integration tests currently target Pi 1.5.2; keep all three Pi development packages aligned. Wildcard peers remain host-provided.
 
 ## Package distribution
 
@@ -53,6 +53,8 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - `src/usage.ts` - bounded, decayed, deduplicated usage evidence.
 - `src/history.ts` - monotonic exact deduplication with opaque recovery artifacts.
 - `src/output.ts` - UTF-8-safe smart reduction, guarded verbatim extraction, lossless columnar JSON, protected evidence, and per-result RTK ownership.
+- `src/output-pipeline.ts` - output strategy orchestration, extraction validation, complete-result savings, and archive-before-return contract.
+- `src/model-call.ts` - shared abort boundary for model calls, including providers that do not settle after cancellation.
 - `src/stats.ts` - savings and authoritative provider telemetry v3.
 - `src/persistence.ts` - atomic replacement, lock-serialized additive deltas, and content-addressed output archives.
 - `src/corpus.ts` - HMAC identifiers, irreversible sanitization, private corpus schema, and evidence labels.
@@ -122,6 +124,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 
 - Persistent updates use atomic replacement.
 - Shared usage and statistics use a process lock and additive read-modify-write deltas.
+- Init checkpoints use revisions returned by their own committed writes, never a post-unlock reread that could adopt a concurrent writer's revision.
 - Publish only complete, synced owner records atomically. Never auto-delete an abandoned/corrupt lock with a racy compare-and-unlink; fail closed with exact manual-recovery guidance.
 - Archives are immutable, content-addressed, SHA-256 verified, and TTL-cleaned.
 - Archive expiry is per-content metadata under the archive lock; readers/cleaners cannot impose their own shorter TTL. Re-saves only extend expiry; missing legacy metadata uses seven days, while malformed metadata fails closed without deletion.
