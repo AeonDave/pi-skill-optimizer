@@ -159,7 +159,7 @@ function createRuntime(options: RuntimeOptions = {}) {
 async function beforePrompt(runtime: ReturnType<typeof createRuntime>, prompt: string): Promise<void> {
 	await runtime.fire("before_agent_start", {
 		prompt,
-		systemPromptOptions: { skills: [] },
+		systemPromptOptions: { sections: {}, skills: [] },
 	});
 }
 
@@ -393,7 +393,7 @@ test("native custom wake keeps human intent and fails open without routing from 
 				customType: "optimizer-wake",
 				content: [{ type: "text", text: "Run Playwright browser accessibility tests." }],
 			},
-			systemPromptOptions: { skills: [] },
+			systemPromptOptions: { sections: {}, skills: [] },
 		});
 		assert.ok(!runtime.notifications.some((text) => text.includes("AUTO prefetch failed open")));
 		assert.ok(runtime.activeTools.has("read"));
@@ -624,7 +624,7 @@ test("skill search hides configured exclusions while exact explicit loading stil
 		] as unknown as Skill[];
 		await runtime.fire("before_agent_start", {
 			prompt: "Find secret credential recovery guidance.",
-			systemPromptOptions: { skills },
+			systemPromptOptions: { sections: {}, skills },
 		});
 
 		const search = await executeTool(runtime, "skill_search", {
@@ -688,7 +688,7 @@ test("init notice is informational, UI-only, and emitted once per readiness stat
 	const skill = modelSkill();
 	const runtime = createRuntime({ skills: [skill] });
 	try {
-		const event = { prompt: "Review the TypeScript change.", systemPromptOptions: { skills: [skill] } };
+		const event = { prompt: "Review the TypeScript change.", systemPromptOptions: { sections: {}, skills: [skill] } };
 		assert.deepEqual(await runtime.fire("before_agent_start", event), [undefined]);
 		assert.deepEqual(await runtime.fire("before_agent_start", event), [undefined]);
 		assert.deepEqual(runtime.notifications.filter((message) => message === INIT_NOTICE), [INIT_NOTICE]);
@@ -712,7 +712,7 @@ test("init notice is suppressed without UI, with no skills, when disabled, and f
 		try {
 			if (item.disabled) process.env.PI_SKILL_OPTIMIZER_DISABLE = "true";
 			await runtime.fire("before_agent_start", {
-				prompt: "Review the TypeScript change.", systemPromptOptions: { skills: item.options.skills ?? [] },
+				prompt: "Review the TypeScript change.", systemPromptOptions: { sections: {}, skills: item.options.skills ?? [] },
 			});
 			assert.ok(!runtime.notifications.includes(INIT_NOTICE));
 			assert.equal(runtime.entries.length, 0);
@@ -725,7 +725,7 @@ test("init notice is suppressed without UI, with no skills, when disabled, and f
 test("init notice suppression survives extension reload and session resume", async () => {
 	const skill = modelSkill();
 	const runtime = createRuntime({ skills: [skill] });
-	const event = { prompt: "Review TypeScript.", systemPromptOptions: { skills: [skill] } };
+	const event = { prompt: "Review TypeScript.", systemPromptOptions: { sections: {}, skills: [skill] } };
 	try {
 		await runtime.fire("before_agent_start", event);
 		runtime.reload();
@@ -750,7 +750,7 @@ test("manual and current profiles do not nag; old and partial generated profiles
 		const runtime = createRuntime({ skills: [skill] });
 		try {
 			writeFileSync(getProfilePaths(runtime.cwd).global, JSON.stringify(item.profile));
-			await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { skills: [skill] } });
+			await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { sections: {}, skills: [skill] } });
 			assert.equal(runtime.notifications.includes(INIT_NOTICE), item.notice);
 			await runtime.command();
 			assert.ok(runtime.notifications.at(-1)?.includes(`init readiness: ${item.expected}`));
@@ -765,7 +765,7 @@ test("unreadable profiles are reported as unavailable, not as missing init", asy
 	const runtime = createRuntime({ skills: [skill] });
 	try {
 		writeFileSync(getProfilePaths(runtime.cwd).global, "{invalid JSON");
-		await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { sections: {}, skills: [skill] } });
 		assert.ok(!runtime.notifications.includes(INIT_NOTICE));
 		await runtime.command();
 		assert.ok(runtime.notifications.at(-1)?.includes("init readiness: unavailable"));
@@ -781,7 +781,7 @@ test("status refresh preserves pending skill usage when the usage flush is tempo
 		skill.filePath = join(runtime.root, "SKILL.md");
 		skill.baseDir = runtime.root;
 		writeFileSync(skill.filePath, "# TypeScript guidance");
-		await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { sections: {}, skills: [skill] } });
 		await executeTool(runtime, "skill_search", { action: "load", name: skill.name });
 		writeFileSync(`${getUsageFilePath(runtime.cwd)}.lock`, `${process.pid}:${Date.now()}:testlock`);
 		await runtime.command();
@@ -798,7 +798,7 @@ test("status command reports clear init readiness without changing the model pro
 	try {
 		const result = await runtime.fire("before_agent_start", {
 			prompt: "Explain this function.",
-			systemPromptOptions: { skills: [skill] },
+			systemPromptOptions: { sections: {}, skills: [skill] },
 		});
 		assert.deepEqual(result, [undefined]);
 		await runtime.command();
@@ -824,7 +824,7 @@ test("tag browsing exposes method skills, exact loads and stale unclassified car
 				},
 			},
 		}));
-		await runtime.fire("before_agent_start", { prompt: "Separiamo dominio e storage", systemPromptOptions: { skills: [skill, stale] } });
+		await runtime.fire("before_agent_start", { prompt: "Separiamo dominio e storage", systemPromptOptions: { sections: {}, skills: [skill, stale] } });
 		const searched = await executeTool(runtime, "skill_search", { action: "search", tags: ["architecture"] }) as { content: Array<{ text: string }> };
 		const page = JSON.parse(searched.content[0].text);
 		assert.deepEqual(page.items.map((item: { name: string }) => item.name), [skill.name]);
@@ -849,9 +849,9 @@ test("a failed registry rebuild after session reset keeps native discovery inste
 		writeFileSync(getProfilePaths(runtime.cwd).global, JSON.stringify({ catalog: { version: 1, cards: {
 			[skill.name]: { summary: "Review independently testable application boundaries.", tags: ["architecture"], sourceHash: hashSkill(skill.name, skill.description) },
 		} } }));
-		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { sections: {}, skills: [skill] } });
 		await runtime.fire("session_start", {});
-		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [{ ...skill, name: " " }] } });
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { sections: {}, skills: [{ ...skill, name: " " }] } });
 		const messages = [{ role: "system", sections: { skills: `<available_skills><skill><name>${skill.name}</name><description>${skill.description}</description><location>${skill.filePath}</location></skill></available_skills>` } }];
 		assert.deepEqual(await runtime.fire("context_with_system", { messages }), [undefined]);
 		assert.ok(runtime.notifications.some((message) => message.includes("failed open")));
@@ -877,7 +877,7 @@ test("status reports the catalog substitution that actually reached the latest r
 	const runtime = createRuntime({ skills: [skill] });
 	try {
 		writeTagCatalogProfile(runtime, skill);
-		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { sections: {}, skills: [skill] } });
 		const messages = [{ role: "system", sections: { skills: nativeCatalogBlock(skill) } }];
 		const outcome = await runtime.fire("context_with_system", { messages });
 		assert.notDeepEqual(outcome, [undefined], "the tag directory must actually replace the native block");
@@ -892,7 +892,7 @@ test("status reports the guard reason when the native catalog is kept", async ()
 	const runtime = createRuntime({ skills: [skill] });
 	try {
 		writeTagCatalogProfile(runtime, skill);
-		await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("before_agent_start", { prompt: "Review TypeScript.", systemPromptOptions: { sections: {}, skills: [skill] } });
 		const messages = [{ role: "system", sections: { skills: nativeCatalogBlock(skill) } }];
 		assert.deepEqual(await runtime.fire("context_with_system", { messages }), [undefined], "a directory larger than the native block must not be used");
 		await runtime.command();
@@ -906,7 +906,7 @@ test("the payload pass upgrades a native section pass to replaced when a forced 
 	const runtime = createRuntime({ skills: [skill] });
 	try {
 		writeTagCatalogProfile(runtime, skill);
-		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { skills: [skill] } });
+		await runtime.fire("before_agent_start", { prompt: "Review", systemPromptOptions: { sections: {}, skills: [skill] } });
 		await runtime.fire("context_with_system", { messages: [{ role: "user", content: "Review the change." }] });
 		await runtime.command();
 		assert.ok(lastStatus(runtime).includes("last catalog:   native kept (no-native-catalog)"), lastStatus(runtime));
@@ -939,7 +939,7 @@ test("init notice quantifies the index a large catalog would replace", async () 
 	assert.ok(floorEstimate > 3_500, "premise: this catalog's all-name floor exceeds the quantified threshold");
 	const runtime = createRuntime({ skills });
 	try {
-		const event = { prompt: "Review TypeScript.", systemPromptOptions: { skills } };
+		const event = { prompt: "Review TypeScript.", systemPromptOptions: { sections: {}, skills } };
 		await runtime.fire("before_agent_start", event);
 		await runtime.fire("before_agent_start", event);
 		const notices = runtime.notifications.filter((message) => message.includes("/skill-optimizer init"));
@@ -981,7 +981,7 @@ test("recently loaded hints are session-frozen and never outrank the directory",
 		const block = nativeCatalogBlocks(skills);
 		const messages = (): Array<{ role: string; sections: Record<string, string> }> => [{ role: "system", sections: { skills: block } }];
 
-		await runtime.fire("before_agent_start", { prompt: "Review the change.", systemPromptOptions: { skills } });
+		await runtime.fire("before_agent_start", { prompt: "Review the change.", systemPromptOptions: { sections: {}, skills } });
 		const first = skillSection(await runtime.fire("context_with_system", { messages: messages() }));
 		assert.match(first, /skill_directory/, "the large-catalog directory must still be used");
 		const hint = first.match(/\nRecently loaded here[^\n]*/)?.[0] ?? "";
@@ -997,7 +997,7 @@ test("recently loaded hints are session-frozen and never outrank the directory",
 		persisted.skills[names[4]] = { count: 20, lastUsed: Date.now() };
 		writeFileSync(usagePath, JSON.stringify(persisted));
 		await runtime.fire("session_start", {});
-		await runtime.fire("before_agent_start", { prompt: "Review the change.", systemPromptOptions: { skills } });
+		await runtime.fire("before_agent_start", { prompt: "Review the change.", systemPromptOptions: { sections: {}, skills } });
 		const third = skillSection(await runtime.fire("context_with_system", { messages: messages() }));
 		assert.notEqual(third, first, "a new session captures its own frozen hints");
 		assert.ok(third.includes(`"${names[4]}"`), "the new session's capture follows current usage evidence");

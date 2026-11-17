@@ -4,6 +4,10 @@ All notable changes are documented here.
 
 ## Unreleased
 
+### Fixed
+
+- Preserve an explicitly supplied host skills section as opaque instructions, including native-looking catalog examples. Selected worker skills are no longer rewritten or supplemented by discovery prefetch; granted on-demand skill loading remains available regardless of extension registration order.
+
 ### Added
 
 - Render `optimizer_tool_search` and both `skill_search` search response shapes as compact, expandable result cards. The renderer is display-only and uses Pi's `registerToolRenderer`; exact skill loads and other non-search actions keep their full text output.

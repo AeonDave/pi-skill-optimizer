@@ -37,6 +37,8 @@ export interface OptimizeConfig {
   excludeSkills?: string[];
   /** Host capability, not a permission grant. Missing resolver keeps native discovery. */
   resolverAvailable?: boolean;
+  /** Request-local host ownership of sections.skills; never a persisted preference. */
+  customSkillsSection?: boolean;
   /** Authoritative host descriptions, before XML formatting/trimming. */
   skillSources?: readonly { name: string; description: string; location?: string }[];
   /** Private immutable host snapshot prepared outside provider hot hooks. */
@@ -72,7 +74,7 @@ export type CatalogReplacementReason = "small-catalog-index";
 
 /** What this pass actually did to the request's skill catalog. */
 export interface CatalogOutcome {
-  mode: "replaced" | "native";
+  mode: "replaced" | "native" | "custom";
   reason?: CatalogFallbackReason | CatalogReplacementReason;
 }
 
@@ -318,7 +320,7 @@ export function optimizePayload<T>(
       catalogOutcome: { mode: "native", reason: "no-native-catalog" },
     };
   }
-  if (config.resolverAvailable === false) {
+  if (config.customSkillsSection || config.resolverAvailable === false) {
     return {
       next: payload,
       removedChars: 0,
@@ -328,7 +330,7 @@ export function optimizePayload<T>(
       catalogNames: [],
       fingerprints: [],
       budget: emptyBudget(config),
-      catalogOutcome: { mode: "native", reason: "resolver-unavailable" },
+      catalogOutcome: config.customSkillsSection ? { mode: "custom" } : { mode: "native", reason: "resolver-unavailable" },
     };
   }
 

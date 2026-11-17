@@ -75,6 +75,7 @@ Remote corpus and provider runs are explicit and never part of `npm test`.
 - Score full source text. Limit only rendered base, overlay, or search responses.
 - Exact names and profile phrases match whole normalized token sequences, never character substrings (`git` is not an exact match for `digital`). Cache catalog-derived features, not mutable caller objects or query-specific scores.
 - Prefetch is separate from the base and appends only selected skill names and descriptions (catalog metadata, not full `SKILL.md` instructions) to the latest genuine human block.
+- A nonempty host `systemPromptOptions.sections.skills` is opaque ownership by another extension: skip only skill catalog rewriting/prefetch in both request passes, retain metadata/resolver and tool grants, and report the `custom` outcome. Observe the shared section after all start handlers so extension order cannot change this policy.
 - Apply the catalog substitution both as the `context_with_system` section rewrite and again at `before_provider_request`: any extension that returns `systemPrompt` from `before_agent_start` makes Pi re-project a pre-rendered head after `context_with_system`, discarding section-level rewrites. The request-time pass must be an identity operation when the section pass already reached the payload.
 - Never derive intent from tool or function results, assistant text, injected context, or image metadata.
 - Overlay insertion is idempotent, minimally clones the modified provider branch, and preserves identity without a target.

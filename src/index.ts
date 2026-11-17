@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEvent, ExtensionAPI, ExtensionContext, Skill as PiSkill } from "@earendil-works/pi-coding-agent";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { CATALOG_TAGS, createSkillCatalogBrowser } from "./catalog.ts";
@@ -339,6 +339,9 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	let registry: SkillRegistry | undefined;
 	let registryReady = false;
 	let registrySources: readonly { name: string; description: string; location: string }[] | undefined;
+	// Retain the mutable host options: a later before_agent_start handler may own
+	// or replace sections. Read them when requests are shaped, after all start handlers.
+	let systemPromptOptions: BeforeAgentStartEvent["systemPromptOptions"] | undefined;
 	let catalogBrowserCache: { registry: SkillRegistry; profile: SkillOptimizerProfile; exclusions: string; browser: ReturnType<typeof createSkillCatalogBrowser> } | undefined;
 	let toolCatalog: ToolDiscoveryCatalog | undefined;
 	let permittedToolNames: Set<string> | undefined;
@@ -359,6 +362,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	};
 	const catalogOutcomeSummary = (outcome: CatalogOutcome | undefined): string => {
 		if (!outcome) return "none yet";
+		if (outcome.mode === "custom") return "custom section kept";
 		if (outcome.mode === "replaced") return outcome.reason ? `replaced (${outcome.reason})` : "replaced";
 		return `native kept (${outcome.reason ?? "unreported"})`;
 	};
@@ -402,6 +406,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		...state.config,
 		profile: state.profile,
 		resolverAvailable: registryReady && pi.getActiveTools().includes("skill_search"),
+		customSkillsSection: Boolean(systemPromptOptions?.sections.skills),
 		skillSources: registrySources,
 		catalogSnapshot: registryReady && state.profile.catalog && registry ? getCatalogBrowser(state) : undefined,
 		usagePrior: buildUsagePrior(state.usage, {
@@ -648,7 +653,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		const cache = denominator > 0 ? `${Math.round(sessionCache.cacheRead * 100 / denominator)}% cache` : "cache n/a";
 		const saved = totalSavings(sessionSaved);
 		const catalog = lastCatalogOutcome
-			? ` | catalog ${lastCatalogOutcome.mode === "replaced" ? "replaced" : `native (${lastCatalogOutcome.reason ?? "unreported"})`}`
+			? ` | catalog ${lastCatalogOutcome.mode === "custom" ? "custom" : lastCatalogOutcome.mode === "replaced" ? "replaced" : `native (${lastCatalogOutcome.reason ?? "unreported"})`}`
 			: "";
 		setSessionStatus(ctx, `AUTO | -${approxK(saved)} tok | ${cache}${catalog}`);
 	};
@@ -1212,6 +1217,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 		registry = undefined;
 		registryReady = false;
 		registrySources = undefined;
+		systemPromptOptions = undefined;
 		catalogBrowserCache = undefined;
 		toolCatalog = undefined;
 		permittedToolNames = undefined;
@@ -1270,6 +1276,7 @@ export default function skillOptimizer(pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
+		systemPromptOptions = event.systemPromptOptions;
 		// Pi 1.2 also starts runs from custom messages, which have no human prompt.
 		// Keep their content out of routing and preserve the last real request for extraction.
 		const customStart = "messageType" in event && event.messageType === "custom";

@@ -50,6 +50,8 @@ Ask Pi to do your work. AUTO manages discovery and result size in the background
 - **Tools arrive as needed.** Less relevant definitions sit behind search, while core tools and tools already used in the session stay active within the host's permissions.
 - **Large results remain recoverable.** Shortened output points back to a complete local original that Pi can retrieve. The first large result stays intact when later exact copies are deduplicated.
 
+When pi-persona or another extension preloads selected skill instructions, AUTO preserves that section without adding a discovery catalog or prefetch. Additional skills remain available through `skill_search` when the worker has that tool.
+
 Use `/skill-optimizer` to inspect setup readiness, savings, active tools, provider usage, and what actually happened to the last request (including why, if the skill catalog was left untouched). Use `/skill-optimizer audit` to find description issues in your library without rewriting it.
 
 Start with the defaults; [configuration](docs/CONFIGURATION.md) covers project preferences, output modes, RTK coexistence, and persona restrictions.

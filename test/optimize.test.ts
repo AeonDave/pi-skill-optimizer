@@ -458,3 +458,16 @@ test("session usage hints follow the directory and are dropped before it", () =>
   assert.equal(tight.result.catalogOutcome.mode, "replaced");
   assert.equal(tight.result.catalogOutcome.reason, undefined);
 });
+
+test("an explicit custom skills section remains opaque in both catalog and compatible prefetch modes", () => {
+  const tagged = tagCatalog(largeNames(240));
+  for (const [system, options] of [[catalog(), config()], [tagged.system, config({ profile: tagged.profile })]] as const) {
+    const payload = { system, messages: [{ role: "user", content: "PostgreSQL database migration" }] };
+    const result = optimizePayload(payload, { ...options, customSkillsSection: true });
+    assert.equal(result.next, payload);
+    assert.deepEqual(result.selected, []);
+    assert.equal(result.addedPrefetchChars, 0);
+    assert.equal(result.removedChars, 0);
+    assert.deepEqual(result.catalogOutcome, { mode: "custom" });
+  }
+});
